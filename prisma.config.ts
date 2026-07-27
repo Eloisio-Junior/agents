@@ -21,4 +21,13 @@ export default defineConfig({
   datasource: {
     url: databaseUrl,
   },
+  experimental: {
+    externalTables: true,
+  },
+  // NOTE: knowledge_chunks carries the pgvector column + HNSW index, which Prisma cannot
+  // model — without this, every `migrate dev` diff proposes dropping the index. Externally
+  // managed: schema changes to this table are written by hand in migrations.
+  tables: {
+    external: ["public.knowledge_chunks"],
+  },
 });

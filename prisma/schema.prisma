@@ -557,8 +557,9 @@ model KnowledgeBase {
   @@map("knowledge_bases")
 }
 
-// NOTE: `embedding` is pgvector vector(1536). The HNSW index (vector_cosine_ops) is
-// created in the migration; Prisma cannot model the type or the index.
+// NOTE: `embedding` is pgvector vector(1536) with a manual HNSW index; Prisma cannot model
+// either, so this table is externally managed (prisma.config.ts) and schema changes to it
+// are written by hand in migrations.
 model KnowledgeChunk {
   id              BigInt                       @id @default(autoincrement())
   tenantId        BigInt                       @map("tenant_id")
@@ -575,6 +576,7 @@ model KnowledgeChunk {
 
   @@index([tenantId])
   @@index([knowledgeBaseId])
+  @@index([documentId])
   @@map("knowledge_chunks")
 }
 
