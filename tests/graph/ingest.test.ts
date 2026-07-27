@@ -1,0 +1,204 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { HumanMessage } from "@langchain/core/messages";
+import { FakeListChatModel } from "@langchain/core/utils/testing";
+import { MemorySaver } from "@langchain/langgraph";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient } from "@/../generated/prisma/client";
+import { encryptJson } from "@/api/lib/crypto";
+import { contactInboxThreadId } from "@/graph/checkpointer";
+import { buildAgentGraph } from "@/graph/graph";
+import { ingestMessageIntoThread } from "@/graph/ingest";
+import { seedChatwootInstance } from "../utils/chatwoot";
+
+const appUrl = process.env.TEST_APP_DATABASE_URL;
+const suUrl = process.env.MIGRATION_DATABASE_URL;
+let dbUp = false;
+let su: PrismaClient | undefined;
+let app: PrismaClient | undefined;
+if (appUrl && suUrl) {
+  try {
+    su = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: suUrl }),
+    });
+    await su.$queryRaw`SELECT 1`;
+    app = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: appUrl }),
+    });
+    await app.$queryRaw`SELECT 1`;
+    dbUp = true;
+  } catch {
+    dbUp = false;
+  }
+}
+const appDb = app as PrismaClient;
+const suDb = su as PrismaClient;
+
+let tenantId = 0n;
+let instanceId = 0n;
+
+describe.skipIf(!dbUp)("ingestMessageIntoThread", () => {
+  beforeAll(async () => {
+    const t = await suDb.tenant.create({
+      data: { name: "IN", slug: `in-${process.pid}` },
+    });
+    tenantId = t.id;
+    const inst = await seedChatwootInstance(suDb, {
+      tenantId,
+      accountId: 9,
+      baseUrl: "https://chat.example.com",
+      adminToken: encryptJson("ADMIN"),
+    });
+    instanceId = inst.id;
+  });
+
+  afterAll(async () => {
+    if (tenantId) {
+      for (const table of ["agent_threads", "chatwoot_instances"]) {
+        await suDb.$executeRawUnsafe(
+          `DELETE FROM ${table} WHERE tenant_id = ${tenantId}`,
+        );
+      }
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM tenants WHERE id = ${tenantId}`,
+      );
+    }
+    await suDb.$disconnect();
+    await appDb.$disconnect();
+  });
+
+  test("appends to the same thread a real turn uses; the next turn sees the ingested messages", async () => {
+    const saver = new MemorySaver();
+    const contactInboxId = 12345;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const ingest = (over: {
+      messageId: number;
+      role: "customer" | "human_agent";
+      text: string;
+      agentName?: string;
+      conversationId?: number;
+    }) =>
+      ingestMessageIntoThread({
+        tenantId,
+        instanceId,
+        conversationId: over.conversationId ?? 900,
+        contactInboxId,
+        graphThreadId,
+        base: appDb,
+        checkpointer: saver,
+        ...over,
+      });
+
+    // 1. A real turn seeds the thread (the bot answered "resposta-1" to "oi").
+    const model = new FakeListChatModel({
+      responses: ["resposta-1", "resposta-2"],
+    });
+    const graph = buildAgentGraph({
+      model,
+      systemPrompt: "Você é prestativa.",
+      checkpointer: saver,
+      tools: [],
+    });
+    await graph.invoke(
+      { messages: [new HumanMessage("oi")] },
+      { configurable: { thread_id: graphThreadId } },
+    );
+
+    // 2. While the bot is silent, ingest a human agent's reply then a customer message.
+    expect(
+      await ingest({
+        messageId: 10,
+        role: "human_agent",
+        text: "Aqui é o João, vou te ajudar.",
+        agentName: "João",
+      }),
+    ).toBe("ingested");
+    expect(
+      await ingest({ messageId: 11, role: "customer", text: "obrigado!" }),
+    ).toBe("ingested");
+
+    // 3. Idempotency: the same id (re-delivery) and an older id are both skipped by the watermark.
+    expect(await ingest({ messageId: 11, role: "customer", text: "DUP" })).toBe(
+      "skipped",
+    );
+    expect(await ingest({ messageId: 5, role: "customer", text: "OLD" })).toBe(
+      "skipped",
+    );
+
+    // 4. The next real turn loads the thread (incl. the ingested messages) and runs without error.
+    const result = await graph.invoke(
+      { messages: [new HumanMessage("e agora?")] },
+      { configurable: { thread_id: graphThreadId } },
+    );
+    const contents = result.messages.map((m) => String(m.content));
+    // The human-agent reply is in history, marked so the model never mistakes it for its own output.
+    expect(
+      contents.some((c) => c.includes("<atendente") && c.includes("João")),
+    ).toBe(true);
+    // The customer message the bot stayed silent on is in history.
+    expect(contents.some((c) => c === "obrigado!")).toBe(true);
+    // The de-duplicated text never made it in.
+    expect(contents.some((c) => c === "DUP")).toBe(false);
+
+    // 5. The watermark advanced to the highest ingested id.
+    const at = await suDb.agentThread.findUniqueOrThrow({
+      where: {
+        tenantId_chatwootInstanceId_contactInboxId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId,
+        },
+      },
+      select: { lastSyncedMessageId: true },
+    });
+    expect(at.lastSyncedMessageId).toBe(11);
+  });
+
+  test("a customer message starting a NEW conversation on the thread gets the fresh-attendance divider", async () => {
+    const saver = new MemorySaver();
+    const contactInboxId = 23456;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    // First conversation on this thread → no divider.
+    await ingestMessageIntoThread({
+      tenantId,
+      instanceId,
+      conversationId: 800,
+      contactInboxId,
+      graphThreadId,
+      messageId: 1,
+      role: "customer",
+      text: "primeira",
+      base: appDb,
+      checkpointer: saver,
+    });
+    // A different conversation reusing the thread → divider on the first message.
+    await ingestMessageIntoThread({
+      tenantId,
+      instanceId,
+      conversationId: 801,
+      contactInboxId,
+      graphThreadId,
+      messageId: 2,
+      role: "customer",
+      text: "segunda",
+      base: appDb,
+      checkpointer: saver,
+    });
+    const cp = await saver.get({
+      configurable: { thread_id: graphThreadId },
+    });
+    const messages = ((
+      cp?.channel_values as { messages?: Array<{ content: unknown }> }
+    )?.messages ?? []) as Array<{ content: unknown }>;
+    expect(String(messages[0]?.content)).toBe("primeira");
+    expect(String(messages[1]?.content)).toContain("nova conversa");
+    expect(String(messages[1]?.content)).toContain("segunda");
+  });
+});

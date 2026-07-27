@@ -1,0 +1,253 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient } from "@/../generated/prisma/client";
+import { encryptJson } from "@/api/lib/crypto";
+import { listCatalog } from "@/modules/integrations/service";
+import type { VerifiedToken } from "@/modules/mcp/oauth/tokens";
+import {
+  alertChannelCreate,
+  integrationCreate,
+  webhookCreate,
+  webhookDelete,
+} from "@/modules/mcp/write-webhooks";
+
+// Webhook/alert/integration write tools: gate is DB-free; dry-run, secret-by-reference, and the
+// DB-only apply paths (create/delete) need a real Postgres. External delivery (webhook_test) is
+// exercised live in Fase 8.
+
+function principal(over: Partial<VerifiedToken>): VerifiedToken {
+  return {
+    userId: 1n,
+    tenantId: 1n,
+    role: "TENANT_ADMIN",
+    scopes: ["mcp:read", "mcp:write"],
+    clientId: "c",
+    jti: "j",
+    ...over,
+  };
+}
+
+describe("MCP webhooks/alerts/integrations gate (no DB)", () => {
+  test("webhook_create without mcp:write → insufficient_scope", async () => {
+    const r = await webhookCreate(principal({ scopes: ["mcp:read"] }), {
+      url: "https://x.example.com",
+      events: ["heartbeat"],
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("insufficient_scope");
+  });
+
+  test("webhook_create with unknown event → error", async () => {
+    const r = await webhookCreate(principal({}), {
+      url: "https://x.example.com",
+      events: ["not.a.real.event"],
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("unknown event");
+  });
+
+  test("integration_create with unknown catalog_type → error", async () => {
+    const r = await integrationCreate(principal({}), {
+      catalog_type: "__nope__",
+      name: "x",
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("unknown catalog_type");
+  });
+});
+
+const appUrl = process.env.TEST_APP_DATABASE_URL;
+const suUrl = process.env.MIGRATION_DATABASE_URL;
+let dbUp = false;
+let su: PrismaClient | undefined;
+let app: PrismaClient | undefined;
+if (appUrl && suUrl) {
+  try {
+    su = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: suUrl }),
+    });
+    await su.$queryRaw`SELECT 1`;
+    app = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: appUrl }),
+    });
+    await app.$queryRaw`SELECT 1`;
+    dbUp = true;
+  } catch {
+    dbUp = false;
+  }
+}
+const appDb = app as PrismaClient;
+const suDb = su as PrismaClient;
+
+describe.skipIf(!dbUp)("MCP webhooks/alerts/integrations tools (DB)", () => {
+  let tenantA = 0n;
+  let tenantB = 0n;
+  let secretId = 0n;
+
+  beforeAll(async () => {
+    const a = await suDb.tenant.create({
+      data: { name: "WA", slug: `wh-a-${process.pid}` },
+    });
+    tenantA = a.id;
+    const b = await suDb.tenant.create({
+      data: { name: "WB", slug: `wh-b-${process.pid}` },
+    });
+    tenantB = b.id;
+    const sec = await suDb.vaultEntry.create({
+      data: {
+        tenantId: tenantA,
+        name: "wh-secret",
+        kind: "generic",
+        secret: encryptJson("signing-secret"),
+      },
+      select: { id: true },
+    });
+    secretId = sec.id;
+    await suDb.vaultEntry.create({
+      data: {
+        tenantId: tenantA,
+        name: "discord-url",
+        kind: "generic",
+        secret: encryptJson("https://discord.com/api/webhooks/123/abcdefTOKEN"),
+      },
+    });
+  });
+
+  afterAll(async () => {
+    for (const tid of [tenantA, tenantB]) {
+      if (!tid) continue;
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM audit_logs WHERE tenant_id = ${tid}`,
+      );
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM alert_channels WHERE tenant_id = ${tid}`,
+      );
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM webhook_subscriptions WHERE tenant_id = ${tid}`,
+      );
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM integration_instances WHERE tenant_id = ${tid}`,
+      );
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM vault_entries WHERE tenant_id = ${tid}`,
+      );
+      await suDb.$executeRawUnsafe(`DELETE FROM tenants WHERE id = ${tid}`);
+    }
+    await suDb.$disconnect();
+    await appDb.$disconnect();
+  });
+
+  test("webhook_create resolves secret NAME → vault:<id> on apply", async () => {
+    const p = principal({ tenantId: tenantA });
+    const r = await webhookCreate(
+      p,
+      {
+        url: "https://example.com/in",
+        events: ["conversation.created"],
+        secret_ref: "wh-secret",
+        dry_run: false,
+      },
+      { base: appDb },
+    );
+    expect(r.ok).toBe(true);
+    const row = await suDb.webhookSubscription.findFirst({
+      where: { tenantId: tenantA, url: "https://example.com/in" },
+    });
+    expect(row?.secretRef).toBe(`vault:${secretId}`);
+    const audits = await suDb.auditLog.count({
+      where: { tenantId: tenantA, action: "mcp.webhook_create" },
+    });
+    expect(audits).toBe(1);
+  });
+
+  test("alert_channel_create stores the token-bearing URL encrypted (never echoed)", async () => {
+    const p = principal({ tenantId: tenantA });
+    const r = await alertChannelCreate(
+      p,
+      {
+        name: "ops",
+        type: "discord",
+        url_ref: "discord-url",
+        min_level: "error",
+        dry_run: false,
+      },
+      { base: appDb },
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      // The plaintext token must not appear anywhere in the tool response.
+      expect(JSON.stringify(r.data)).not.toContain("abcdefTOKEN");
+    }
+    const row = await suDb.alertChannel.findFirst({
+      where: { tenantId: tenantA, name: "ops" },
+    });
+    expect(row).not.toBeNull();
+  });
+
+  test("alert_channel_create with unknown url ref → needsCredential (no write)", async () => {
+    const p = principal({ tenantId: tenantA });
+    const r = await alertChannelCreate(
+      p,
+      {
+        name: "broken",
+        type: "webhook",
+        url_ref: "no-such-url",
+        dry_run: false,
+      },
+      { base: appDb },
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.data.needsCredential).toBe(true);
+    const row = await suDb.alertChannel.findFirst({
+      where: { tenantId: tenantA, name: "broken" },
+    });
+    expect(row).toBeNull();
+  });
+
+  test("integration_create applies but never returns the raw route token", async () => {
+    const p = principal({ tenantId: tenantA });
+    const catalogType = listCatalog()[0]?.catalogType;
+    expect(typeof catalogType).toBe("string");
+    const r = await integrationCreate(
+      p,
+      {
+        catalog_type: catalogType as string,
+        name: "my-integration",
+        dry_run: false,
+      },
+      { base: appDb },
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.data.applied).toBe(true);
+      expect(typeof r.data.id).toBe("string");
+      expect(typeof r.data.configureAt).toBe("string");
+      // The generated route token is surfaced via the console, never in the payload.
+      expect(r.data.routeToken).toBeUndefined();
+    }
+  });
+
+  test("webhook_delete cross-tenant → not found", async () => {
+    // Create a webhook in tenantA, then attempt deletion as tenantB.
+    const own = await webhookCreate(
+      principal({ tenantId: tenantA }),
+      {
+        url: "https://example.com/fenced",
+        events: ["heartbeat"],
+        dry_run: false,
+      },
+      { base: appDb },
+    );
+    expect(own.ok).toBe(true);
+    const row = await suDb.webhookSubscription.findFirst({
+      where: { tenantId: tenantA, url: "https://example.com/fenced" },
+    });
+    const r = await webhookDelete(
+      principal({ tenantId: tenantB }),
+      { webhook_id: String(row?.id), dry_run: false },
+      { base: appDb },
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("not found");
+  });
+});

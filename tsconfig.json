@@ -1,0 +1,47 @@
+{
+  "compilerOptions": {
+    // Environment setup & latest features
+    "lib": ["ESNext", "DOM"],
+    "target": "ESNext",
+    "module": "Preserve",
+    "moduleDetection": "force",
+    "jsx": "react-jsx",
+    "allowJs": true,
+
+    // Bundler mode
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+    "incremental": true,
+    // NOTE: the build info must NOT live under node_modules. check-editions.sh
+    // symlinks $ROOT/node_modules into each derived tree, so a path in there is
+    // the SAME file for the master, free and pro trees — same relative paths,
+    // different contents. TypeScript 5.9 tolerated that poisoned build info;
+    // TypeScript 7 fails the pro pass with a bare "TS2589: Type instantiation is
+    // excessively deep and possibly infinite" and no file attached. `.cache` is
+    // gitignored, and the derivation copies untracked-but-not-ignored files
+    // only, so each tree gets its own build info here.
+    "tsBuildInfoFile": "./.cache/tsc/tsbuildinfo",
+
+    // Best practices
+    "strict": true,
+    "skipLibCheck": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+
+    "paths": {
+      "@/*": ["./src/*"],
+      "@/public/*": ["./public/*"],
+      "@/tests/*": ["./tests/*"]
+    },
+
+    // Some stricter flags (disabled by default)
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noPropertyAccessFromIndexSignature": false
+  },
+
+  "exclude": ["dist", "node_modules", "tmp", "workers", "tooling/cli"]
+}

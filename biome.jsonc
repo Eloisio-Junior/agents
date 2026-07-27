@@ -1,0 +1,95 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.5/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "ignoreUnknown": false,
+    "includes": ["src/**/*.{ts,tsx}", "scripts/**/*.ts", "tests/**/*.{ts,tsx}"]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineEnding": "lf"
+  },
+  "linter": {
+    "includes": ["src/**/*.{ts,tsx}", "scripts/**/*.ts", "tests/**/*.{ts,tsx}"],
+    "enabled": true,
+    "rules": {
+      "preset": "recommended",
+      "nursery": {
+        "useSortedClasses": "warn"
+      },
+      "style": {
+        "noJsxLiterals": {
+          "level": "warn",
+          "options": {
+            "noStrings": false,
+            "ignoreProps": true,
+            "allowedStrings": [
+              "·",
+              "•",
+              "×",
+              "→",
+              "/",
+              "|",
+              "?",
+              "*",
+              "(",
+              ")",
+              "%"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double"
+    }
+  },
+  "assist": {
+    "enabled": true,
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["src/client/**/*.{ts,tsx}", "!src/client/lib/env.ts"],
+      "plugins": ["./biome-plugins/no-bun-public-env.grit"]
+    },
+    {
+      "includes": ["src/client/**/*.{ts,tsx}"],
+      "plugins": [
+        "./biome-plugins/no-dynamic-i18n-key.grit",
+        "./biome-plugins/no-t-rename.grit",
+        "./biome-plugins/always-render-modal.grit"
+      ]
+    },
+    {
+      "includes": ["src/api/**/*.ts"],
+      "plugins": ["./biome-plugins/no-dynamic-translate-key.grit"]
+    },
+    {
+      "includes": ["src/client/pages/*.tsx"],
+      "plugins": ["./biome-plugins/require-page-container.grit"]
+    },
+    {
+      "includes": ["tests/**/*.{ts,tsx}"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noJsxLiterals": "off"
+          }
+        }
+      }
+    }
+  ]
+}

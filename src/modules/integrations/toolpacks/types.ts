@@ -1,0 +1,163 @@
+import type { StructuredToolInterface } from "@langchain/core/tools";
+import type { z } from "zod";
+import type { PrismaClient } from "@/../generated/prisma/client";
+import type { SafeUrlOptions } from "@/lib/ssrf";
+import type { WindowSpec } from "@/modules/business-hours/hours";
+import type { ChatwootClient } from "@/modules/chatwoot/client";
+
+// Outbound toolpacks: the per-agent activation of a catalog integration's OUTBOUND tools (the
+// inbound side is the pure mapper). A toolpack is curated code (not a free-form ToolDefinition)
+// because it carries domain wiring the declarative HTTP tool cannot: the credential's
+// environment binding, a fixed origin, and the IntegrationExternalRef side-effect that
+// correlates a future inbound webhook back to this conversation by PK.
+
+// A scoped read produces this; the actual HTTP call happens at tool-invoke time, OUTSIDE any tx.
+// enabledTools is a fail-closed allowlist (a tool the agent was not granted is never exposed; a
+// new upstream tool is not auto-granted).
+export interface IntegrationSelection {
+  instanceId: bigint;
+  catalogType: string;
+  config: Record<string, unknown>;
+  credentialRef: string | null;
+  enabledTools: string[];
+}
+
+export interface ToolpackCtx {
+  tenantId: bigint;
+  base: PrismaClient;
+  threadId: string;
+  // The current customer's DB id (Contact.id), stable per tenant across conversations. Present on a
+  // real turn / nudge (resolved from the conversation), absent on the playground. A toolpack that
+  // must isolate per-customer data (e.g. Google Calendar appointments) stamps/filters by it and
+  // fails closed when absent — it is NEVER a model-controlled arg, so a prompt cannot widen it.
+  contactDbId?: bigint | null;
+  // Resolves a vault secret by reference (short scoped DB read; no network).
+  resolveCredential: (ref: string) => Promise<string | null>;
+  // Injectable for tests; default real fetch.
+  fetchImpl?: typeof fetch;
+  // Injectable for tests; default assertSafeOutboundUrl. The origin is a fixed trusted constant
+  // here, so this is defense-in-depth (and lets tests stay hermetic without DNS).
+  assertSafe?: (url: string, opts?: SafeUrlOptions) => Promise<unknown>;
+  // The live conversation handle, present ONLY on a real inbox turn (conversationId > 0). A tool
+  // that delivers something to the customer (e.g. Drive send_file) uses it; absent on the
+  // playground (conversationId 0 + stub client), so such tools degrade gracefully.
+  chatwoot?: { client: ChatwootClient; conversationId: number };
+  // Resolves an integration's chosen BusinessHours by id → its windows + timezone (short scoped DB
+  // read; no network). The Calendar availability tool uses it to bound bookable slots to the service
+  // hours; null when unset/deleted/other-tenant ⇒ "always on". Injected in prepare.ts; stubbed in tests.
+  resolveBusinessHours?: (
+    id: string,
+  ) => Promise<{ windows: WindowSpec[]; timezone: string } | null>;
+  // Schedules deterministic reminders for an appointment the agent just booked (Calendar create). A
+  // closure bound to the tenant + this conversation's thread; it is a pure MECHANISM (enqueue the
+  // scheduler jobs). The POLICY (offsetsHours + askConfirmationOnLast) lives in the Calendar
+  // integration's config and is read + passed by the toolpack. The credentialRef is the integration's,
+  // never the secret. Undefined on the playground / when no contact is in scope, so the toolpack treats
+  // it as best-effort. NEVER a model arg. Injected in prepare.ts; stubbed in tests.
+  scheduleAppointmentReminders?: (args: {
+    eventId: string;
+    calendarId: string;
+    startISO: string;
+    credentialRef: string | null;
+    offsetsHours: number[];
+    askConfirmationOnLast: boolean;
+  }) => Promise<void>;
+  // Cancels an appointment's pending reminders (Calendar cancel; the toolpack re-arms on reschedule by
+  // calling scheduleAppointmentReminders again). Same gating as scheduleAppointmentReminders.
+  cancelAppointmentReminders?: (eventId: string) => Promise<void>;
+}
+
+export type ToolRisk = "low" | "medium" | "high";
+
+// A single tool argument, projected for the UI (mirrors how MCP tool args are shown): the name, the
+// model-facing description (the zod `.describe()`), and whether it is required.
+export interface ToolArgSpec {
+  name: string;
+  description?: string;
+  required: boolean;
+}
+
+// A tool's declarative spec: name, risk, and input schema. SINGLE SOURCE of truth for a toolpack —
+// the tool names, per-tool risk, and the UI arg list all derive from here. The schema is a ZodObject
+// so argsFromZod can yield the arg list WITHOUT building the tool (no ctx, no side effects).
+export interface ToolSpec {
+  name: string;
+  risk: ToolRisk;
+  schema: z.ZodObject<z.ZodRawShape>;
+}
+
+// One integration's outbound tools. Pure builder: returns StructuredTools filtered to the
+// allowlist; each tool's body does its own network + scoped persistence at invoke time.
+export interface Toolpack {
+  catalogType: string;
+  // Every tool this pack can expose, with its risk + input schema (for UI + fail-closed validation).
+  toolSpecs: readonly ToolSpec[];
+  build(
+    selection: IntegrationSelection,
+    ctx: ToolpackCtx,
+  ): StructuredToolInterface[];
+}
+
+// Derives the UI arg list from a tool's zod schema: each top-level field's name, its `.describe()`
+// text, and whether it is required. Pure (no build, no ctx) — same projection MCP args get.
+export function argsFromZod(schema: z.ZodObject<z.ZodRawShape>): ToolArgSpec[] {
+  return Object.entries(schema.shape).map(([name, field]) => {
+    const f = field as z.ZodTypeAny;
+    return {
+      name,
+      description: f.description,
+      required: !f.isOptional(),
+    };
+  });
+}
+
+// A toolpack tool projected for the UI: name + risk tier + arg specs.
+export interface ToolView {
+  name: string;
+  riskTier: ToolRisk;
+  args: ToolArgSpec[];
+}
+
+const REGISTRY = new Map<string, Toolpack>();
+
+export function registerToolpack(pack: Toolpack): void {
+  REGISTRY.set(pack.catalogType, pack);
+}
+
+export function getToolpack(catalogType: string): Toolpack | undefined {
+  return REGISTRY.get(catalogType);
+}
+
+// Builds the outbound tools for a set of integration selections. Fail-closed: a selection with
+// an empty allowlist or a catalogType without a toolpack (NATIVE/MCP) contributes nothing.
+export function buildToolpackTools(
+  selections: IntegrationSelection[],
+  ctx: ToolpackCtx,
+): StructuredToolInterface[] {
+  const out: StructuredToolInterface[] = [];
+  for (const sel of selections) {
+    if (sel.enabledTools.length === 0) continue;
+    const pack = getToolpack(sel.catalogType);
+    if (!pack) continue;
+    out.push(...pack.build(sel, ctx));
+  }
+  return out;
+}
+
+// Every tool name a catalogType's toolpack can expose (the fail-closed allowlist). Empty for a
+// catalogType without a registered toolpack (NATIVE/MCP).
+export function getToolpackToolNames(catalogType: string): string[] {
+  return getToolpack(catalogType)?.toolSpecs.map((s) => s.name) ?? [];
+}
+
+// The toolpack's tools projected for the UI: name + risk + args (label/description live in the
+// frontend's toolpackToolMeta, keyed by name).
+export function getToolpackToolViews(catalogType: string): ToolView[] {
+  const pack = getToolpack(catalogType);
+  if (!pack) return [];
+  return pack.toolSpecs.map((s) => ({
+    name: s.name,
+    riskTier: s.risk,
+    args: argsFromZod(s.schema),
+  }));
+}

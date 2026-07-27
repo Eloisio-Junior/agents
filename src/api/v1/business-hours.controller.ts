@@ -1,0 +1,161 @@
+import { Elysia, t } from "elysia";
+import { doc, errors } from "@/api/lib/openapi";
+import { tenancyPlugin } from "@/api/middlewares/tenancy";
+import { ForbiddenError, TenantTargetRequiredError } from "@/lib/errors";
+import { instanceIdentity } from "@/lib/instance";
+import type { TenantContext } from "@/lib/tenancy";
+import {
+  type BusinessHoursCreate,
+  type BusinessHoursUpdate,
+  createBusinessHours,
+  deleteBusinessHours,
+  getBusinessHours,
+  listBusinessHours,
+  updateBusinessHours,
+} from "@/modules/business-hours/service";
+
+// Business-hours schedules (per-tenant). TENANT_ADMIN.
+
+function ctxOrThrow(ctx: TenantContext | null): TenantContext {
+  if (!ctx) throw new ForbiddenError();
+  if (ctx.tenantId === null) throw new TenantTargetRequiredError();
+  return ctx;
+}
+
+const windowSchema = t.Object({
+  day: t.Integer({
+    minimum: 0,
+    maximum: 6,
+    description: "Day of week, 0 (Sunday) through 6 (Saturday).",
+  }),
+  start: t.String({
+    description:
+      'Window start time as "HH:mm" (24-hour, in the schedule timezone).',
+  }),
+  end: t.String({
+    description:
+      'Window end time as "HH:mm" (24-hour, in the schedule timezone).',
+  }),
+});
+
+const writeBody = t.Object({
+  name: t.Optional(
+    t.String({ description: "Human-readable name of the schedule." }),
+  ),
+  timezone: t.Optional(
+    t.String({
+      description:
+        "IANA timezone (e.g. America/Sao_Paulo) the windows are evaluated in.",
+    }),
+  ),
+  windows: t.Optional(
+    t.Array(windowSchema, {
+      description: "Open windows that define the schedule.",
+    }),
+  ),
+});
+
+export const businessHoursController = new Elysia({
+  prefix: "/v1/business-hours",
+  tags: ["Resources"],
+})
+  .use(tenancyPlugin)
+  .get(
+    "/",
+    async ({ tenantContext }) => ({
+      instance: instanceIdentity,
+      businessHours: await listBusinessHours(ctxOrThrow(tenantContext)),
+    }),
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "List business hours",
+        "List all business-hours schedules for the current tenant.",
+      ),
+      response: errors(401, 403),
+    },
+  )
+  .get(
+    "/:id",
+    async ({ tenantContext, params }) => ({
+      instance: instanceIdentity,
+      businessHours: await getBusinessHours(
+        ctxOrThrow(tenantContext),
+        BigInt(params.id),
+      ),
+    }),
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "Get business hours",
+        "Fetch a single business-hours schedule by id.",
+      ),
+      response: errors(400, 401, 403, 404),
+      params: t.Object({
+        id: t.String({
+          description: "Business-hours schedule id (BigInt as a string).",
+        }),
+      }),
+    },
+  )
+  .post(
+    "/",
+    async ({ tenantContext, body }) => ({
+      instance: instanceIdentity,
+      businessHours: await createBusinessHours(
+        ctxOrThrow(tenantContext),
+        body as BusinessHoursCreate,
+      ),
+    }),
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "Create business hours",
+        "Create a new business-hours schedule for the current tenant.",
+      ),
+      response: errors(400, 401, 403),
+      body: writeBody,
+    },
+  )
+  .patch(
+    "/:id",
+    async ({ tenantContext, params, body }) => ({
+      instance: instanceIdentity,
+      businessHours: await updateBusinessHours(
+        ctxOrThrow(tenantContext),
+        BigInt(params.id),
+        body as BusinessHoursUpdate,
+      ),
+    }),
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "Update business hours",
+        "Update a business-hours schedule name, timezone, or windows.",
+      ),
+      response: errors(400, 401, 403, 404),
+      params: t.Object({
+        id: t.String({
+          description: "Business-hours schedule id (BigInt as a string).",
+        }),
+      }),
+      body: writeBody,
+    },
+  )
+  .delete(
+    "/:id",
+    async ({ tenantContext, params }) => {
+      await deleteBusinessHours(ctxOrThrow(tenantContext), BigInt(params.id));
+      return { instance: instanceIdentity, success: true };
+    },
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc("Delete business hours", "Delete a business-hours schedule."),
+      response: errors(400, 401, 403, 404),
+      params: t.Object({
+        id: t.String({
+          description: "Business-hours schedule id (BigInt as a string).",
+        }),
+      }),
+    },
+  );

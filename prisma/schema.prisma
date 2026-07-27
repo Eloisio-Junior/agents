@@ -1,0 +1,1302 @@
+// fazer.ai agents — schema base.
+//
+// Multi-tenancy: every tenant-scoped table carries `tenant_id` and is protected by
+// Postgres RLS (defined in the migrations, since Prisma does not model RLS). The
+// runtime connection is a NON-SUPERUSER role; the TenancyProvider sets
+// `app.tenant_id` (transaction-local) so policies scope reads/writes. See docs/tenancy.md.
+//
+// Conventions:
+//   * Secrets at rest are encryptJson() base64 blobs stored in plain String columns
+//     (never Json, never logged). VaultEntry.secret, ChatwootInstance.*Token, etc.
+//   * Opaque tokens (routeToken, quote access token) are stored as SHA-256 hashes for
+//     constant-time unique-index lookup; the plaintext is shown once at creation.
+//   * `catalogType` is a String validated against the in-code integration registry, not a
+//     DB enum, so new integrations need no enum migration.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────────────────────── enums ──
+
+enum UserRole {
+  SUPER_ADMIN
+  TENANT_ADMIN
+  AGENT
+}
+
+enum InboundAuthStrategy {
+  NONE
+  STATIC_HEADER
+  HMAC_SHA256
+}
+
+enum WebhookDeliveryStatus {
+  PENDING
+  SENDING
+  DELIVERED
+  FAILED
+  DEAD
+}
+
+enum InboundDeliveryStatus {
+  PENDING
+  PROCESSING
+  PROCESSED
+  FAILED
+  DEAD
+}
+
+enum SchedulerJobKind {
+  FOLLOWUP
+  FOLLOWUP_SWEEP
+  WEBHOOK_RETRY
+  DEBOUNCE
+  RAG_INGEST
+  HEARTBEAT
+  FLOWLOG_SWEEP
+  APPOINTMENT_REMINDER
+  REDIRECT_FOLLOWUP
+}
+
+enum SchedulerJobStatus {
+  PENDING
+  CLAIMED
+  DONE
+  FAILED
+  DEAD
+}
+
+enum ApprovalStatus {
+  PENDING
+  EDITED
+  APPROVED
+  REJECTED
+}
+
+enum QuoteStatus {
+  PENDING
+  READY
+}
+
+enum AgentToolSource {
+  NATIVE
+  RAG
+  HTTP
+  MCP
+  INTEGRATION
+}
+
+// ──────────────────────────────────────────────────────── identity ──
+
+model Tenant {
+  id        BigInt   @id @default(autoincrement())
+  name      String
+  slug      String   @unique
+  settings  Json     @default("{}")
+  demoMode  Boolean  @default(false) @map("demo_mode")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  users                         User[]
+  invitations                   Invitation[]
+  chatwootDeployments           ChatwootDeployment[]
+  chatwootInstances             ChatwootInstance[]
+  chatwootAgentBots             ChatwootAgentBot[]
+  chatwootWebhookDeliveries     ChatwootWebhookDelivery[]
+  inboxes                       Inbox[]
+  contacts                      Contact[]
+  conversations                 Conversation[]
+  agentThreads                  AgentThread[]
+  agents                        Agent[]
+  businessHours                 BusinessHours[]
+  knowledgeBases                KnowledgeBase[]
+  knowledgeChunks               KnowledgeChunk[]
+  knowledgeDocuments            KnowledgeDocument[]
+  playgroundSessions            PlaygroundSession[]
+  playgroundMedia               PlaygroundMedia[]
+  approvalQueueItems            ApprovalQueueItem[]
+  vaultEntries                  VaultEntry[]
+  toolDefinitions               ToolDefinition[]
+  mcpServerConnections          McpServerConnection[]
+  integrationInstances          IntegrationInstance[]
+  agentToolSelections           AgentToolSelection[]
+  integrationExternalRefs       IntegrationExternalRef[]
+  inboundDeliveries             InboundDelivery[]
+  conversionEvents              ConversionEvent[]
+  webhookSubscriptions          WebhookSubscription[]
+  outboundWebhookDeliveries     OutboundWebhookDelivery[]
+  schedulerJobs                 SchedulerJob[]
+  quotes                        Quote[]
+  experiments                   Experiment[]
+  promptVariantAssignments      PromptVariantAssignment[]
+  llmUsages                     LlmUsage[]
+  executionLogs                 ExecutionLog[]
+  alertChannels                 AlertChannel[]
+  alertDeliveries               AlertDelivery[]
+  auditLogs                     AuditLog[]
+  apiKeys                       ApiKey[]
+  mcpOAuthAuthorizationCodes    McpOAuthAuthorizationCode[]
+  mcpOAuthAccessTokens          McpOAuthAccessToken[]
+  mcpOAuthRefreshTokens         McpOAuthRefreshToken[]
+  mcpOAuthPendingAuthorizations McpOAuthPendingAuthorization[]
+
+  @@map("tenants")
+}
+
+// NOTE: Global app identity/branding — a SINGLE row (id always 1). GLOBAL table, NOT under
+// tenant RLS: it is read publicly, before any tenant/auth context exists (login/setup pages),
+// so RLS would fail-closed. Writes are gated to SUPER_ADMIN at the service layer. Colors:
+// colorMode SIMPLE = one brandColor (the per-theme palette is derived on the client);
+// ADVANCED = explicit token maps per theme (tokensLight/tokensDark, keyed by BRANDABLE_KEYS).
+// Logo/favicon binaries live on disk (BRANDING_STORAGE_DIR); the *_key columns hold the stored
+// filename so the asset endpoint resolves the file + infers its content-type. updatedAt drives
+// cache-busting of the served asset URLs.
+model AppBranding {
+  id              Int      @id @default(1)
+  brandName       String?  @map("brand_name")
+  colorMode       String   @default("SIMPLE") @map("color_mode")
+  brandColor      String?  @map("brand_color")
+  tokensLight     Json     @default("{}") @map("tokens_light")
+  tokensDark      Json     @default("{}") @map("tokens_dark")
+  logoDarkKey     String?  @map("logo_dark_key")
+  logoLightKey    String?  @map("logo_light_key")
+  faviconDarkKey  String?  @map("favicon_dark_key")
+  faviconLightKey String?  @map("favicon_light_key")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@map("app_branding")
+}
+
+// NOTE: Global identity table — NOT under tenant RLS (read before a tenant context
+// exists, e.g. login/bootstrap). Isolation is via the $extends GLOBAL_MODELS allowlist
+// + authorize(). tenant_id is NULL only for SUPER_ADMIN (enforced by a CHECK constraint
+// in the migration). Email uniqueness is per-tenant (case-insensitive) via partial
+// functional indexes in the migration.
+model User {
+  id           BigInt    @id @default(autoincrement())
+  tenantId     BigInt?   @map("tenant_id")
+  email        String
+  passwordHash String?   @map("password_hash")
+  googleId     String?   @unique @map("google_id")
+  name         String?
+  role         UserRole  @default(AGENT)
+  lastLoginAt  DateTime? @map("last_login_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@map("users")
+}
+
+// Tenant-scoped user invitation. GLOBAL table (NO RLS) like `users`: acceptInvite looks it up by
+// token hash with no tenant context (public endpoint), so RLS would fail-closed. Isolation is
+// enforced explicitly in the service (tenantScope), exactly as admin.service does for users. The
+// token is hashed at rest (sha256); the plaintext is returned ONCE as a copyable link. A CHECK
+// (in the migration) forbids role=SUPER_ADMIN (never invitable). One live invite per (tenant,
+// email) — re-invite rotates via upsert.
+model Invitation {
+  id          BigInt    @id @default(autoincrement())
+  tenantId    BigInt    @map("tenant_id")
+  email       String
+  role        UserRole
+  tokenHash   String    @unique @map("token_hash")
+  invitedById BigInt?   @map("invited_by_id")
+  expiresAt   DateTime  @map("expires_at")
+  consumedAt  DateTime? @map("consumed_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, email])
+  @@index([tenantId, createdAt])
+  @@map("invitations")
+}
+
+// ──────────────────────────────────────────────── chatwoot mirror ──
+
+// A Chatwoot DEPLOYMENT (one installation = one base URL + one admin/user access token), registered
+// ONCE per tenant. The admin token lives here so the operator enters it a single time; every account
+// (ChatwootInstance) under this deployment reuses it. `tenant_id` is UNIQUE: "one tenant = one
+// Chatwoot deployment" is a structural invariant (it keeps conversation.id / contact.id / inbox.id —
+// all per-deployment — globally unique within the tenant, killing cross-deployment id collisions).
+model ChatwootDeployment {
+  id         BigInt   @id @default(autoincrement())
+  tenantId   BigInt   @unique @map("tenant_id")
+  // NOT globally unique: one Chatwoot server can back MANY tenants (one client per tenant). The
+  // shared admin token only ever acts on accounts resolved from RLS-scoped rows, so sharing is safe.
+  // Uniqueness lives on the ACCOUNT (ChatwootInstance.serverKey + accountId), not the server.
+  // Stored canonical (lowercase origin, no trailing slash) — see normalizeChatwootBaseUrl.
+  baseUrl    String   @map("base_url")
+  adminToken String   @map("admin_token") // encrypted; the shared user/admin access token
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  tenant    Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  instances ChatwootInstance[]
+
+  @@map("chatwoot_deployments")
+}
+
+// One Chatwoot ACCOUNT (workspace) under a deployment. baseUrl + adminToken now live on the parent
+// ChatwootDeployment (shared across the tenant's accounts); this row only carries the per-account
+// identity (accountId/name) and the soft-disconnect flag. The 5 FK tables below still reference this
+// row's id, so reparenting it under a deployment leaves their keys untouched.
+model ChatwootInstance {
+  id             BigInt    @id @default(autoincrement())
+  tenantId       BigInt    @map("tenant_id")
+  deploymentId   BigInt    @map("deployment_id")
+  accountId      Int       @map("account_id")
+  // Normalized base URL of the parent deployment, denormalized so a Chatwoot ACCOUNT (server +
+  // accountId) is globally unique to ONE tenant — a shared server can back many tenants, but the
+  // same account can't. See normalizeChatwootBaseUrl + @@unique([serverKey, accountId]) below.
+  serverKey      String    @map("server_key")
+  accountName    String?   @map("account_name") // display name, refreshed on sync (Chatwoot can rename)
+  // Soft-disconnect: "remove account" keeps the rows (conversations/inboxes/contacts) for history +
+  // analytics but unbinds agents and makes the webhook/runtime ignore the account. Null = active.
+  disconnectedAt DateTime? @map("disconnected_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  tenant            Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  deployment        ChatwootDeployment        @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+  inboxes           Inbox[]
+  conversations     Conversation[]
+  webhookDeliveries ChatwootWebhookDelivery[]
+  agentBots         ChatwootAgentBot[]
+  agentThreads      AgentThread[]
+
+  @@unique([tenantId, accountId])
+  // Global (no tenantId): one Chatwoot account belongs to a single tenant across the whole fleet.
+  @@unique([serverKey, accountId])
+  @@index([tenantId])
+  @@index([deploymentId])
+  @@map("chatwoot_instances")
+}
+
+// One Chatwoot Agent Bot per (instance, our Agent persona). The bot IS the message sender shown in
+// Chatwoot, so each persona gets its own identity (name = the persona's name, kept in sync on
+// rename). Provisioned lazily when the persona is first bound to an inbox (ensureAgentBot). Each bot
+// carries its own outgoing_url (route token), HMAC secret, and access token (used to post the
+// persona's replies). Tokens/secret are encrypted; the route token lives only as its SHA-256 hash.
+model ChatwootAgentBot {
+  id                    BigInt   @id @default(autoincrement())
+  tenantId              BigInt   @map("tenant_id")
+  chatwootInstanceId    BigInt   @map("chatwoot_instance_id")
+  agentId               BigInt   @map("agent_id")
+  // The numeric Agent Bot id on Chatwoot (the gate's "our bot" identity).
+  chatwootAgentBotId    Int      @map("chatwoot_agent_bot_id")
+  accessToken           String   @map("access_token") // encrypted
+  webhookSecret         String   @map("webhook_secret") // encrypted
+  // SHA-256 of the opaque per-bot route token embedded in this bot's outgoing_url. Resolves the bot
+  // (tenant+instance+persona+secret) in constant time on the receiver; plaintext lives only on Chatwoot.
+  webhookRouteTokenHash String   @unique @map("webhook_route_token_hash")
+  name                  String
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  instance ChatwootInstance @relation(fields: [chatwootInstanceId], references: [id], onDelete: Cascade)
+  agent    Agent            @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, chatwootInstanceId, agentId])
+  @@index([tenantId])
+  @@map("chatwoot_agent_bots")
+}
+
+// Idempotency ledger for the dedicated Chatwoot Agent Bot webhook receiver. Keyed by the
+// X-Chatwoot-Delivery UUID (reused across the upstream's 429/500 retries, fresh per distinct
+// event) → dedupes transport retries; semantic dedup (no double reply) is the per-conversation
+// advisory lock + attribution re-read in the runtime, not this row.
+model ChatwootWebhookDelivery {
+  id                 BigInt                @id @default(autoincrement())
+  tenantId           BigInt                @map("tenant_id")
+  chatwootInstanceId BigInt                @map("chatwoot_instance_id")
+  deliveryId         String                @map("delivery_id")
+  event              String
+  status             InboundDeliveryStatus @default(PENDING)
+  attempts           Int                   @default(0)
+  receivedAt         DateTime              @default(now()) @map("received_at")
+  processedAt        DateTime?             @map("processed_at")
+
+  tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  instance ChatwootInstance @relation(fields: [chatwootInstanceId], references: [id], onDelete: Cascade)
+
+  @@unique([chatwootInstanceId, deliveryId])
+  @@index([tenantId])
+  @@map("chatwoot_webhook_deliveries")
+}
+
+model Inbox {
+  id                 BigInt   @id @default(autoincrement())
+  tenantId           BigInt   @map("tenant_id")
+  chatwootInstanceId BigInt   @map("chatwoot_instance_id")
+  chatwootInboxId    Int      @map("chatwoot_inbox_id")
+  name               String
+  channelType        String?  @map("channel_type")
+  // WhatsApp provider (whatsapp_cloud | default(=360dialog) | baileys | zapi) when channelType is
+  // Channel::Whatsapp; null for other channels or until an inbox sync populates it. Drives the 24h
+  // service-window gate (only the official providers have a window). Captured from the inbox-list sync.
+  provider           String?
+  agentId            BigInt?  @map("agent_id")
+  workingHours       Json?    @map("working_hours")
+  // Channel::WebWidget provisioning blob (encryptJson of { websiteToken, hmacToken, hmacMandatory,
+  // websiteUrl }) for the WhatsApp→chat redirect feature. The hmac_token is secret (used to compute the
+  // per-lead identifier_hash), so the whole blob is encrypted at rest. NULL for non-web-widget inboxes.
+  webWidget          String?  @map("web_widget")
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  tenant        Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  instance      ChatwootInstance @relation(fields: [chatwootInstanceId], references: [id], onDelete: Cascade)
+  conversations Conversation[]
+
+  @@unique([tenantId, chatwootInstanceId, chatwootInboxId])
+  @@index([tenantId])
+  @@map("inboxes")
+}
+
+model Contact {
+  id                BigInt   @id @default(autoincrement())
+  tenantId          BigInt   @map("tenant_id")
+  chatwootContactId Int?     @map("chatwoot_contact_id")
+  name              String?
+  email             String?
+  phone             String?
+  attributes        Json     @default("{}")
+  // Per-contact audio-reply preference (TTS mode "preference"): true = wants audio, false = wants
+  // text, null = unknown (falls back to mirroring what the customer sent). Set by the agent's
+  // set_voice_preference native tool. RLS-scoped column — NOT a Chatwoot custom attribute.
+  voiceReply        Boolean? @map("voice_reply")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversations Conversation[]
+
+  @@unique([tenantId, chatwootContactId])
+  @@index([tenantId])
+  @@map("contacts")
+}
+
+model Conversation {
+  id                     BigInt    @id @default(autoincrement())
+  tenantId               BigInt    @map("tenant_id")
+  chatwootInstanceId     BigInt    @map("chatwoot_instance_id")
+  inboxId                BigInt?   @map("inbox_id")
+  contactId              BigInt?   @map("contact_id")
+  chatwootConversationId Int       @map("chatwoot_conversation_id")
+  // The Chatwoot ContactInbox id (native: one contact on one inbox/channel). This is the discriminator
+  // for the agent's graph memory thread — keying by contact-inbox keeps a contact's parallel channels
+  // (WhatsApp vs Instagram, …) in SEPARATE memories instead of mixing them. Mirrored from the webhook
+  // payload (conversation.contact_inbox.id), always present for real traffic. NULL only on legacy rows.
+  contactInboxId         Int?      @map("contact_inbox_id")
+  status                 String // mirror: open|pending|resolved|snoozed
+  assigneeId             Int?      @map("assignee_id")
+  assigneeType           String?   @map("assignee_type") // User|AgentBot
+  // Display name of the current human assignee (meta.assignee.name), mirrored so the console shows a
+  // real name instead of "Human #id". NULL when unassigned or assigned to a bot.
+  assigneeName           String?   @map("assignee_name")
+  threadId               String    @map("thread_id") // tenantId:instanceId:convId
+  lastEventAt            DateTime? @map("last_event_at")
+  // Debounce watermark: the Chatwoot message id of the last inbound message already handled
+  // (responded to or deliberately skipped). The flush re-fetches and answers only ids beyond it,
+  // so re-arm / retry / a concurrent claim cannot produce a duplicate reply. NULL = nothing handled.
+  lastHandledMessageId   Int?      @map("last_handled_message_id")
+  // Timestamp of the last INCOMING customer message — the WhatsApp 24h service-window anchor. A
+  // proactive (follow-up/nudge) free-form send is only allowed within the window; outside it, an
+  // approved template (HSM) is required. NULL = no inbound seen yet.
+  lastInboundAt          DateTime? @map("last_inbound_at")
+  // Watermark for follow-up single-shot semantics: set after each follow-up (sent or silenced).
+  // Another follow-up can only fire once the client speaks again (lastInboundAt > lastFollowUpAt).
+  // NULL = no follow-up has ever been attempted for this conversation.
+  lastFollowUpAt         DateTime? @map("last_follow_up_at")
+  // Last agent-turn failure for this conversation, surfaced to the operator with a manual
+  // "re-engage" action. Sanitized (no PII/secret in the clear); cleared on a successful turn.
+  // NULL = the last turn was fine (or none ran yet).
+  lastError              String?   @map("last_error")
+  lastErrorAt            DateTime? @map("last_error_at")
+  // When the customer activated test mode in this conversation by sending /teste (item 1). NULL =
+  // not activated; a "test" agent stays silent until this is set. /reset deliberately does NOT clear
+  // it (the conversation keeps answering after a reset).
+  testActivatedAt        DateTime? @map("test_activated_at")
+  // When the one-shot "this agent is in test mode, send /teste to activate" private note was posted
+  // to a silenced conversation. Anti-spam: posted at most once per conversation (NULL = not yet).
+  // /reset clears it so a fresh note can be posted on the next silenced message.
+  testNoticeSentAt       DateTime? @map("test_notice_sent_at")
+  // When the one-shot "message received outside business hours" private note was posted. Same anti-spam
+  // one-shot as testNoticeSentAt: the agent stays silent outside its configured business hours and the
+  // operator is notified once per conversation (NULL = not yet). /reset clears it.
+  outOfHoursNoticeSentAt DateTime? @map("out_of_hours_notice_sent_at")
+  // WhatsApp→chat redirect gate watermarks (only on the entry WhatsApp conversation). redirectSentAt =
+  // when the redirect link was last sent (one-shot + cooldown anchor); redirectCount = how many times it
+  // has been sent (bounded by maxResends). NULL/0 = never redirected.
+  redirectSentAt         DateTime? @map("redirect_sent_at")
+  redirectCount          Int       @default(0) @map("redirect_count")
+  // Cross-link watermark (only on the widget conversation). Set once, when the redirect merge is linked
+  // to the WhatsApp sibling: test-mode activation propagated + the cross-link private notes posted. NULL
+  // = not yet linked; a non-null value stops the one-shot from re-running / re-spamming.
+  redirectLinkedAt       DateTime? @map("redirect_linked_at")
+  // Closing watermark (only on the widget conversation). Set once, via a CAS, by whichever fires first:
+  // the follow-up ladder's terminal "closing" stage OR the widget conversation being resolved. Guarantees
+  // the closing message + resolve is delivered at most once per redirect episode. NULL = not yet closed.
+  redirectClosedAt       DateTime? @map("redirect_closed_at")
+  createdAt              DateTime  @default(now()) @map("created_at")
+  updatedAt              DateTime  @updatedAt @map("updated_at")
+
+  tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  instance ChatwootInstance @relation(fields: [chatwootInstanceId], references: [id], onDelete: Cascade)
+  inbox    Inbox?           @relation(fields: [inboxId], references: [id], onDelete: SetNull)
+  contact  Contact?         @relation(fields: [contactId], references: [id], onDelete: SetNull)
+
+  @@unique([tenantId, chatwootInstanceId, chatwootConversationId])
+  @@index([tenantId])
+  @@index([threadId])
+  @@map("conversations")
+}
+
+// Per-graph-thread state, one row per (tenant, instance, contactInboxId) — the same key the graph
+// checkpointer threads on (`tenant:instance:ci:<contactInboxId>`). A contact's parallel channels each
+// get their own thread, so this is per-channel-per-contact, NOT per-contact. Holds:
+//   - lastConversationId: the Chatwoot display_id of the last conversation a turn/nudge ran on this
+//     thread, so a NEW conversation reusing the thread gets the "fresh attendance" divider. Tracking
+//     this per-thread (not per-contact) is what stops a multi-channel contact from getting spurious
+//     dividers mid-conversation when they speak on another channel.
+//   - lastSyncedMessageId: (Fase 2) the ingestion watermark — highest message id already folded into
+//     the thread by the continuous-sync path, so turns and the sync never double-append a message.
+model AgentThread {
+  id                  BigInt   @id @default(autoincrement())
+  tenantId            BigInt   @map("tenant_id")
+  chatwootInstanceId  BigInt   @map("chatwoot_instance_id")
+  contactInboxId      Int      @map("contact_inbox_id")
+  threadId            String   @map("thread_id")
+  lastConversationId  Int?     @map("last_conversation_id")
+  lastSyncedMessageId Int?     @map("last_synced_message_id")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  instance ChatwootInstance @relation(fields: [chatwootInstanceId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, chatwootInstanceId, contactInboxId])
+  @@index([tenantId])
+  @@map("agent_threads")
+}
+
+// ──────────────────────────────────────────────── agent config ──
+
+model Agent {
+  id                  BigInt   @id @default(autoincrement())
+  tenantId            BigInt   @map("tenant_id")
+  name                String
+  systemPrompt        String   @map("system_prompt")
+  modelConfig         Json     @default("{}") @map("model_config")
+  businessHoursId     BigInt?  @map("business_hours_id")
+  followUpHoursId     BigInt?  @map("follow_up_hours_id")
+  transferWithSummary Boolean  @default(true) @map("transfer_with_summary")
+  enabled             Boolean  @default(true)
+  // Test vs production mode (item 1). A "test" agent stays silent in a conversation until the
+  // customer sends /teste (which sets Conversation.testActivatedAt); "production" answers normally.
+  // New agents are created in "test"; existing rows default to "production" so live agents keep
+  // answering after the migration.
+  mode                String   @default("production")
+  settings            Json     @default("{}")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  tenant         Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  toolSelections AgentToolSelection[]
+  chatwootBots   ChatwootAgentBot[]
+
+  @@index([tenantId])
+  @@map("agents")
+}
+
+model BusinessHours {
+  id        BigInt   @id @default(autoincrement())
+  tenantId  BigInt   @map("tenant_id")
+  name      String
+  timezone  String   @default("America/Sao_Paulo")
+  windows   Json     @default("[]")
+  source    String   @default("LOCAL") // LOCAL|CHATWOOT_MIRROR
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@map("business_hours")
+}
+
+// ──────────────────────────────────────────────── knowledge (RAG) ──
+
+model KnowledgeBase {
+  id             BigInt   @id @default(autoincrement())
+  tenantId       BigInt   @map("tenant_id")
+  name           String
+  description    String?
+  embeddingModel String   @default("text-embedding-3-small") @map("embedding_model")
+  chunkSize      Int      @default(1000) @map("chunk_size")
+  chunkOverlap   Int      @default(200) @map("chunk_overlap")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  tenant    Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  chunks    KnowledgeChunk[]
+  documents KnowledgeDocument[]
+
+  @@index([tenantId])
+  @@map("knowledge_bases")
+}
+
+// NOTE: `embedding` is pgvector vector(1536). The HNSW index (vector_cosine_ops) is
+// created in the migration; Prisma cannot model the type or the index.
+model KnowledgeChunk {
+  id              BigInt                       @id @default(autoincrement())
+  tenantId        BigInt                       @map("tenant_id")
+  knowledgeBaseId BigInt                       @map("knowledge_base_id")
+  documentId      BigInt                       @map("document_id")
+  content         String
+  embedding       Unsupported("vector(1536)")?
+  metadata        Json                         @default("{}")
+  createdAt       DateTime                     @default(now()) @map("created_at")
+
+  tenant   Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  kb       KnowledgeBase     @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+  document KnowledgeDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([knowledgeBaseId])
+  @@map("knowledge_chunks")
+}
+
+model KnowledgeDocument {
+  id              BigInt   @id @default(autoincrement())
+  tenantId        BigInt   @map("tenant_id")
+  knowledgeBaseId BigInt   @map("knowledge_base_id")
+  title           String
+  sourceType      String   @map("source_type")
+  fileName        String?  @map("file_name")
+  mimeType        String?  @map("mime_type")
+  content         String
+  status          String   @default("PENDING")
+  error           String?
+  chunkCount      Int      @default(0) @map("chunk_count")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  kb     KnowledgeBase    @relation(fields: [knowledgeBaseId], references: [id], onDelete: Cascade)
+  chunks KnowledgeChunk[]
+
+  @@index([tenantId, knowledgeBaseId])
+  @@map("knowledge_documents")
+}
+
+// Playground session history: metadata only. The conversation itself lives in the LangGraph
+// checkpointer (langgraph schema) keyed by threadId; this table just lets us list/title past test
+// sessions per agent. The transcript is reconstructed from the checkpointer (see modules/playground).
+model PlaygroundSession {
+  id        BigInt   @id @default(autoincrement())
+  tenantId  BigInt   @map("tenant_id")
+  agentId   BigInt   @map("agent_id")
+  threadId  String   @map("thread_id")
+  title     String   @default("")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, threadId])
+  @@index([tenantId, agentId, updatedAt])
+  @@map("playground_sessions")
+}
+
+// Binary media (recorded voice notes, generated TTS replies, uploaded files) for playground replay.
+// Linked to a turn by the LangChain message id (messageId) it belongs to, with a creation-order
+// fallback. The conversation transcript lives in the checkpointer; only the bytes live here.
+model PlaygroundMedia {
+  id        BigInt   @id @default(autoincrement())
+  tenantId  BigInt   @map("tenant_id")
+  agentId   BigInt   @map("agent_id")
+  threadId  String   @map("thread_id")
+  // The BaseMessage id this media belongs to (user audio/file = the HumanMessage id we set; TTS =
+  // the AIMessage id captured post-invoke).
+  messageId String   @map("message_id")
+  // user_audio | tts_audio | user_file
+  kind      String
+  mime      String
+  fileName  String?  @map("file_name")
+  bytes     Bytes
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, threadId])
+  @@map("playground_media")
+}
+
+model ApprovalQueueItem {
+  id              BigInt         @id @default(autoincrement())
+  tenantId        BigInt         @map("tenant_id")
+  knowledgeBaseId BigInt         @map("knowledge_base_id")
+  threadId        String?        @map("thread_id")
+  interruptKey    String?        @map("interrupt_key")
+  proposedTitle   String?        @map("proposed_title")
+  proposedContent String         @map("proposed_content")
+  rationale       String?
+  status          ApprovalStatus @default(PENDING)
+  createdAt       DateTime       @default(now()) @map("created_at")
+  updatedAt       DateTime       @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@map("approval_queue_items")
+}
+
+// ──────────────────────────────────── tools, vault & integrations ──
+
+model VaultEntry {
+  id        BigInt   @id @default(autoincrement())
+  tenantId  BigInt   @map("tenant_id")
+  name      String
+  secret    String // encryptJson base64 blob — never Json, never logged
+  // Predefined secret type id (see src/modules/vault/secret-types.ts). Drives auto-injection
+  // (header/bearer/basic/query) when referenced by a tool, and credential-ref filtering by
+  // compatible kind. Normalized to "generic" at write time.
+  kind      String   @default("generic")
+  // Base URL associated with the credential (not a secret). Used for self-hosted/configurable
+  // services where the operator's API root must travel with the credential (e.g. openai_compatible,
+  // chatwoot). Stored as-is (trailing slash stripped at write time).
+  baseUrl   String?  @map("base_url")
+  // For generic injection types (header/query) the operator names the parameter here. Required
+  // when the secret type has needsParamName; drives the effective header/query name at runtime.
+  paramName String?  @map("param_name")
+  // Lifecycle: "active" = a real secret is stored; "pending" = only the reference exists (the secret
+  // has not been filled yet). A pending entry stores encryptJson({}) as a placeholder and is resolved
+  // as "missing" (resolve* throw errors.credentialPending; try* return null) until the operator fills
+  // it in the UI. Created e.g. via the MCP `credential_create` tool, which never receives a secret.
+  status    String   @default("active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, name, kind])
+  @@index([tenantId])
+  @@map("vault_entries")
+}
+
+model ToolDefinition {
+  id            BigInt   @id @default(autoincrement())
+  tenantId      BigInt   @map("tenant_id")
+  name          String
+  // Human-friendly display name as the operator typed it (accents/spaces preserved); `name` is the
+  // normalized identifier the model calls, derived from `label`. Required: the editor only exposes the
+  // display name and derives `name` from it (legacy null rows were backfilled with `name`).
+  label         String
+  description   String?
+  method        String   @default("POST")
+  urlTemplate   String   @map("url_template")
+  allowedHosts  String[] @map("allowed_hosts")
+  headers       Json     @default("{}")
+  // AI-filled contract ONLY (the z.object the model receives): { [name]: { type, description?,
+  // required?, enumValues?, itemType? } }. type ∈ string|integer|number|boolean|enum|array|object.
+  // Fixed values live in body/query/headers as literal templates, NOT here. Legacy rows may still
+  // carry source:"fixed"+value (the runtime honors both until the tool is re-saved).
+  inputSchema   Json     @default("{}") @map("input_schema")
+  outputSchema  Json     @default("{}") @map("output_schema")
+  // Query-string params, applied for ANY method: Record<string,string> of templates
+  // (fixed/context/{{secret}}/{{aiField}}), interpolated and added to searchParams.
+  query         Json     @default("{}")
+  // Request body shape: { mode: "kv", rows: [{key,value}] } | { mode: "raw", raw }. "kv" assembles
+  // JSON from explicit key/value rows (a row whose value is a lone {{aiField}} keeps the AI's type);
+  // "raw" sends the interpolated template. Legacy: { mode: "fields" } assembles from the non-path
+  // input fields (still honored by the runtime; converted to "kv" when the tool is re-saved).
+  body          Json     @default("{}")
+  credentialRef String?  @map("credential_ref")
+  enabled       Boolean  @default(true)
+  // NOTE: low|medium|high. Surfaced in the tool-selection UI so granting a write/financial tool
+  // is a deliberate, visible act; default medium for a custom HTTP tool of unknown impact.
+  riskTier      String   @default("medium") @map("risk_tier")
+  // Optional "I'll look into that for you…" acknowledgement: when ackEnabled is true, the agent
+  // posts ackMessage to the customer (with a typing indicator) BEFORE invoking this — typically
+  // slow — tool. Per-tool, opt-in; only fires on a real conversation, never in the playground.
+  ackEnabled    Boolean  @default(false) @map("ack_enabled")
+  ackMessage    String?  @map("ack_message")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  tenant         Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  toolSelections AgentToolSelection[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("tool_definitions")
+}
+
+model McpServerConnection {
+  id            BigInt   @id @default(autoincrement())
+  tenantId      BigInt   @map("tenant_id")
+  name          String
+  transport     String // streamableHttp|stdio|sse
+  url           String?
+  command       String?
+  credentialRef String?  @map("credential_ref")
+  enabled       Boolean  @default(true)
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  tenant         Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  toolSelections AgentToolSelection[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("mcp_server_connections")
+}
+
+// NOTE: routeToken is stored as a SHA-256 hash for constant-time unique-index lookup;
+// inbound auth secret lives in the vault by reference. See docs/integrations.md.
+model IntegrationInstance {
+  id                  BigInt              @id @default(autoincrement())
+  tenantId            BigInt              @map("tenant_id")
+  catalogType         String              @map("catalog_type")
+  name                String
+  enabled             Boolean             @default(true)
+  config              Json                @default("{}")
+  credentialRef       String?             @map("credential_ref")
+  inboundAuthStrategy InboundAuthStrategy @default(NONE) @map("inbound_auth_strategy")
+  inboundSecretRef    String?             @map("inbound_secret_ref")
+  routeTokenHash      String?             @unique @map("route_token_hash")
+  createdAt           DateTime            @default(now()) @map("created_at")
+  updatedAt           DateTime            @updatedAt @map("updated_at")
+
+  tenant            Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  toolSelections    AgentToolSelection[]
+  inboundDeliveries InboundDelivery[]
+  externalRefs      IntegrationExternalRef[]
+
+  @@unique([tenantId, catalogType, name])
+  @@index([tenantId])
+  @@map("integration_instances")
+}
+
+// NOTE: the single per-agent tool-grant table. `source` discriminates the tool origin
+// (NATIVE/RAG built-in, HTTP=ToolDefinition, MCP=McpServerConnection, INTEGRATION=
+// IntegrationInstance); exactly the matching target is set (CHECK in the migration).
+// Fail-closed for HTTP/MCP/INTEGRATION/RAG (a tool not granted is never exposed; a new
+// upstream tool is not auto-granted). NATIVE is the one permissive default: empty
+// enabledTools — or no row — means ALL native conversation-scoped tools. enabledTools is the
+// sub-tool allowlist (NATIVE/RAG/MCP/INTEGRATION); knowledgeBaseIds scopes RAG (empty = all
+// tenant KBs). Partial unique indexes (in the migration) cap NATIVE/RAG at one row per agent.
+model AgentToolSelection {
+  id                    BigInt          @id @default(autoincrement())
+  tenantId              BigInt          @map("tenant_id")
+  agentId               BigInt          @map("agent_id")
+  source                AgentToolSource
+  toolDefinitionId      BigInt?         @map("tool_definition_id")
+  mcpServerConnectionId BigInt?         @map("mcp_server_connection_id")
+  integrationInstanceId BigInt?         @map("integration_instance_id")
+  knowledgeBaseIds      BigInt[]        @map("knowledge_base_ids")
+  enabledTools          String[]        @map("enabled_tools")
+  createdAt             DateTime        @default(now()) @map("created_at")
+  updatedAt             DateTime        @updatedAt @map("updated_at")
+
+  tenant              Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  agent               Agent                @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  toolDefinition      ToolDefinition?      @relation(fields: [toolDefinitionId], references: [id], onDelete: Cascade)
+  mcpServerConnection McpServerConnection? @relation(fields: [mcpServerConnectionId], references: [id], onDelete: Cascade)
+  integrationInstance IntegrationInstance? @relation(fields: [integrationInstanceId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([agentId])
+  @@map("agent_tool_selections")
+}
+
+// NOTE: the outbound→inbound correlation key. Created at outbound (e.g. payment link),
+// matched deterministically by externalId at inbound to recover the thread.
+model IntegrationExternalRef {
+  id                    BigInt   @id @default(autoincrement())
+  tenantId              BigInt   @map("tenant_id")
+  integrationInstanceId BigInt   @map("integration_instance_id")
+  externalId            String   @map("external_id")
+  threadId              String   @map("thread_id")
+  kind                  String
+  metadata              Json     @default("{}")
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  tenant              Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  integrationInstance IntegrationInstance @relation(fields: [integrationInstanceId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, externalId])
+  @@index([tenantId])
+  @@index([threadId])
+  @@map("integration_external_refs")
+}
+
+model InboundDelivery {
+  id                    BigInt                @id @default(autoincrement())
+  tenantId              BigInt                @map("tenant_id")
+  integrationInstanceId BigInt                @map("integration_instance_id")
+  externalId            String?               @map("external_id")
+  dedupeKey             String                @map("dedupe_key")
+  payload               Json                  @default("{}")
+  status                InboundDeliveryStatus @default(PENDING)
+  attempts              Int                   @default(0)
+  receivedAt            DateTime              @default(now()) @map("received_at")
+  processedAt           DateTime?             @map("processed_at")
+
+  tenant              Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  integrationInstance IntegrationInstance @relation(fields: [integrationInstanceId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, integrationInstanceId, dedupeKey])
+  @@index([tenantId])
+  @@map("inbound_deliveries")
+}
+
+model ConversionEvent {
+  id         BigInt   @id @default(autoincrement())
+  tenantId   BigInt   @map("tenant_id")
+  threadId   String   @map("thread_id")
+  source     String
+  value      Decimal? @db.Decimal(14, 2)
+  currency   String?
+  metadata   Json     @default("{}")
+  occurredAt DateTime @default(now()) @map("occurred_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, threadId, source])
+  @@index([tenantId])
+  @@map("conversion_events")
+}
+
+// ──────────────────────────────────────────────── webhooks (out) ──
+
+model WebhookSubscription {
+  id        BigInt   @id @default(autoincrement())
+  tenantId  BigInt   @map("tenant_id")
+  url       String
+  secretRef String?  @map("secret_ref")
+  events    String[]
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant     Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  deliveries OutboundWebhookDelivery[]
+
+  @@index([tenantId])
+  @@map("webhook_subscriptions")
+}
+
+model OutboundWebhookDelivery {
+  id             BigInt                @id @default(autoincrement())
+  tenantId       BigInt                @map("tenant_id")
+  subscriptionId BigInt                @map("subscription_id")
+  event          String
+  payload        Json                  @default("{}")
+  status         WebhookDeliveryStatus @default(PENDING)
+  attempts       Int                   @default(0)
+  nextAttemptAt  DateTime?             @map("next_attempt_at")
+  deliveredAt    DateTime?             @map("delivered_at")
+  lastError      String?               @map("last_error")
+  createdAt      DateTime              @default(now()) @map("created_at")
+  updatedAt      DateTime              @updatedAt @map("updated_at")
+
+  tenant       Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  subscription WebhookSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([status, nextAttemptAt])
+  @@map("outbound_webhook_deliveries")
+}
+
+// ──────────────────────────────────────────────────── scheduler ──
+
+model SchedulerJob {
+  id        BigInt             @id @default(autoincrement())
+  tenantId  BigInt             @map("tenant_id")
+  kind      SchedulerJobKind
+  dedupeKey String             @map("dedupe_key")
+  payload   Json               @default("{}")
+  status    SchedulerJobStatus @default(PENDING)
+  runAt     DateTime           @map("run_at")
+  attempts  Int                @default(0)
+  claimedAt DateTime?          @map("claimed_at")
+  lastError String?            @map("last_error")
+  createdAt DateTime           @default(now()) @map("created_at")
+  updatedAt DateTime           @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, kind, dedupeKey])
+  @@index([status, runAt])
+  @@index([tenantId])
+  @@map("scheduler_jobs")
+}
+
+// ──────────────────────────────────────────────────────── quotes ──
+
+// NOTE: accessTokenHash is the SHA-256 of the public-link token (constant-time lookup).
+model Quote {
+  id              BigInt      @id @default(autoincrement())
+  tenantId        BigInt      @map("tenant_id")
+  conversationId  BigInt?     @map("conversation_id")
+  threadId        String?     @map("thread_id")
+  idempotencyKey  String      @map("idempotency_key")
+  status          QuoteStatus @default(PENDING)
+  snapshot        Json        @default("{}")
+  pdfStorageKey   String?     @map("pdf_storage_key")
+  accessTokenHash String?     @unique @map("access_token_hash")
+  expiresAt       DateTime?   @map("expires_at")
+  revoked         Boolean     @default(false)
+  createdAt       DateTime    @default(now()) @map("created_at")
+  updatedAt       DateTime    @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId])
+  @@map("quotes")
+}
+
+// ───────────────────────────────────────────────── A/B testing ──
+
+model Experiment {
+  id        BigInt   @id @default(autoincrement())
+  tenantId  BigInt   @map("tenant_id")
+  name      String
+  agentId   BigInt?  @map("agent_id")
+  variants  Json     @default("[]")
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant      Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  assignments PromptVariantAssignment[]
+
+  @@index([tenantId])
+  @@map("experiments")
+}
+
+model PromptVariantAssignment {
+  id           BigInt   @id @default(autoincrement())
+  tenantId     BigInt   @map("tenant_id")
+  experimentId BigInt   @map("experiment_id")
+  threadId     String   @map("thread_id")
+  variantKey   String   @map("variant_key")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  experiment Experiment @relation(fields: [experimentId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, threadId, experimentId])
+  @@index([tenantId])
+  @@map("prompt_variant_assignments")
+}
+
+// ─────────────────────────────────────── observability & audit ──
+
+// NOTE: captured at the source (LangChain callback / model wrapper), not mirrored from
+// Langfuse. Substrate for the per-agent/per-conversation cost dashboard.
+model LlmUsage {
+  id                  BigInt   @id @default(autoincrement())
+  tenantId            BigInt   @map("tenant_id")
+  agentId             BigInt?  @map("agent_id")
+  conversationId      BigInt?  @map("conversation_id")
+  // The DB Inbox.id this usage was attributed to (null in the playground and for legacy rows).
+  // Granularity for the per-inbox dashboard break-down.
+  inboxId             BigInt?  @map("inbox_id")
+  threadId            String?  @map("thread_id")
+  model               String
+  node                String?
+  // "inbox" (real customer traffic) | "playground" (operator test turns). Lets the dashboard
+  // keep test usage from polluting the real figures.
+  source              String   @default("inbox")
+  promptTokens        Int      @default(0) @map("prompt_tokens")
+  completionTokens    Int      @default(0) @map("completion_tokens")
+  // Cached-input accounting (a discounted SUBSET of promptTokens, never additive):
+  // cachedReadTokens = prompt tokens served from the provider cache (OpenAI/Anthropic/Google);
+  // cacheCreationTokens = tokens written to the cache this call (Anthropic, billed at a premium).
+  cachedReadTokens    Int      @default(0) @map("cached_read_tokens")
+  cacheCreationTokens Int      @default(0) @map("cache_creation_tokens")
+  createdAt           DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, agentId])
+  @@index([tenantId, inboxId])
+  @@map("llm_usage")
+}
+
+// Per-stage execution-flow log (verbose operational telemetry): one row per pipeline stage per turn
+// (stt/embed/generate/tts/split/handoff), plus errors. High-write, retention-bounded. NEVER carries
+// message text/PII — `detail` is allowlisted ids/counts/enums, redacted at write.
+model ExecutionLog {
+  id             BigInt   @id @default(autoincrement())
+  tenantId       BigInt   @map("tenant_id")
+  // Correlates every stage of one turn; generated once per turn.
+  turnId         String   @map("turn_id")
+  conversationId BigInt?  @map("conversation_id")
+  agentId        BigInt?  @map("agent_id")
+  inboxId        BigInt?  @map("inbox_id")
+  threadId       String?  @map("thread_id")
+  // Validated String, NEVER a Prisma enum (FLOW_STAGES): stt|embed|generate|tts|split|handoff.
+  stage          String
+  // info|warn|error.
+  level          String   @default("info")
+  // ok|error|skipped.
+  status         String?
+  provider       String?
+  model          String?
+  durationMs     Int?     @map("duration_ms")
+  // inbox|playground.
+  source         String   @default("inbox")
+  // Allowlisted ids/counts/enums only (redactSecretsDeep at write) — never message text/PII.
+  detail         Json?
+  errorMessage   String?  @map("error_message")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, turnId])
+  @@index([tenantId, level, createdAt])
+  @@index([tenantId, conversationId])
+  @@index([tenantId, stage, createdAt])
+  @@map("execution_logs")
+}
+
+// External alert sink (Discord / generic webhook) for execution-flow warnings/errors. `url` is an
+// encryptJson blob (a Discord URL embeds a token) — never stored or returned in the clear.
+model AlertChannel {
+  id        BigInt   @id @default(autoincrement())
+  tenantId  BigInt   @map("tenant_id")
+  name      String
+  // discord|webhook.
+  type      String
+  // encryptJson blob — masked in every DTO/log, decrypted only at delivery.
+  url       String
+  enabled   Boolean  @default(true)
+  // warn|error: the minimum level that triggers this channel.
+  minLevel  String   @default("error") @map("min_level")
+  // Stage allowlist; empty = all stages.
+  stages    String[] @default([])
+  // Vault ref for the HMAC signing secret (webhook type only).
+  secretRef String?  @map("secret_ref")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant     Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  deliveries AlertDelivery[]
+
+  @@index([tenantId])
+  @@map("alert_channels")
+}
+
+// Alert dispatch ledger — NO PII (precedent ChatwootWebhookDelivery): only stage/level/summary +
+// a coalesced burst count. Drained by the alert worker (claim/retry/DEAD with debounced coalescing).
+model AlertDelivery {
+  id            BigInt                @id @default(autoincrement())
+  tenantId      BigInt                @map("tenant_id")
+  channelId     BigInt                @map("channel_id")
+  stage         String?
+  level         String
+  // One sanitized line (never message text) — the alert body.
+  summary       String
+  // Coalesced burst size (incremented while PENDING for the same channel/stage/level).
+  count         Int                   @default(1)
+  status        WebhookDeliveryStatus @default(PENDING)
+  attempts      Int                   @default(0)
+  nextAttemptAt DateTime?             @map("next_attempt_at")
+  deliveredAt   DateTime?             @map("delivered_at")
+  lastError     String?               @map("last_error")
+  createdAt     DateTime              @default(now()) @map("created_at")
+  updatedAt     DateTime              @updatedAt @map("updated_at")
+
+  tenant  Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  channel AlertChannel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([status, nextAttemptAt])
+  @@map("alert_deliveries")
+}
+
+// NOTE: tenant_id is NULL for fleet/global actions (visible only to SUPER_ADMIN via the
+// RLS policy). before/after are allowlist-sanitized (never secrets/PII in the clear).
+model AuditLog {
+  id        BigInt   @id @default(autoincrement())
+  tenantId  BigInt?  @map("tenant_id")
+  actorId   BigInt?  @map("actor_id")
+  actorType String   @default("user") @map("actor_type")
+  action    String
+  target    String?
+  before    Json?
+  after     Json?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, createdAt])
+  @@map("audit_logs")
+}
+
+// Bearer API key for external clients of the REST v1 API and the MCP transport. Per-tenant,
+// RLS-scoped. Only the SHA-256 hash of the full token is stored (key_hash, unique); the plaintext
+// is shown once at creation. `role` is fixed on the key (TENANT_ADMIN), independent of the
+// creator's current role; revocation is a soft `revoked_at`. `created_by_user_id` records who
+// created it (used as the principal's userId for audit) without a hard relation, so deleting the
+// user leaves the key intact.
+model ApiKey {
+  id              BigInt    @id @default(autoincrement())
+  tenantId        BigInt    @map("tenant_id")
+  displayName     String    @map("display_name")
+  keyHash         String    @unique @map("key_hash")
+  keyPrefix       String    @map("key_prefix")
+  role            UserRole
+  createdByUserId BigInt?   @map("created_by_user_id")
+  lastUsedAt      DateTime? @map("last_used_at")
+  revokedAt       DateTime? @map("revoked_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@map("api_keys")
+}
+
+// ───────────────────────────────── MCP OAuth 2.1 (global, no RLS) ──
+
+model McpOAuthClient {
+  id                    BigInt   @id @default(autoincrement())
+  clientId              String   @unique @map("client_id")
+  clientSecretHash      String?  @map("client_secret_hash")
+  name                  String
+  redirectUris          String[] @map("redirect_uris")
+  grantTypes            String[] @map("grant_types")
+  scopes                String[]
+  // firstParty clients skip the consent screen at /authorize (trusted, set by SUPER_ADMIN).
+  // Default false → consent is the default for every client (the opposite of the old auto-grant).
+  firstParty            Boolean  @default(false) @map("first_party")
+  // true when self-registered via RFC 7591 DCR (provenance, not trust). A dynamically-registered,
+  // non-firstParty client is shown as "unverified" on the consent screen (anyone could self-register
+  // under a known name with their own redirect_uri). Promotion to trusted is the explicit firstParty flag.
+  dynamicallyRegistered Boolean  @default(false) @map("dynamically_registered")
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  @@map("mcp_oauth_clients")
+}
+
+model McpOAuthAuthorizationCode {
+  id                  BigInt    @id @default(autoincrement())
+  codeHash            String    @unique @map("code_hash")
+  clientId            String    @map("client_id")
+  userId              BigInt    @map("user_id")
+  tenantId            BigInt?   @map("tenant_id")
+  redirectUri         String    @map("redirect_uri")
+  scopes              String[]
+  codeChallenge       String?   @map("code_challenge")
+  codeChallengeMethod String?   @map("code_challenge_method")
+  resource            String?
+  consumedAt          DateTime? @map("consumed_at")
+  expiresAt           DateTime  @map("expires_at")
+  createdAt           DateTime  @default(now()) @map("created_at")
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("mcp_oauth_authorization_codes")
+}
+
+// NOTE: persisted with jti + revokedAt — revocation is a mandatory denylist, not a
+// future toggle (cross-tenant write tools cannot wait ≤15min for token expiry).
+model McpOAuthAccessToken {
+  id        BigInt    @id @default(autoincrement())
+  jti       String    @unique
+  clientId  String    @map("client_id")
+  userId    BigInt    @map("user_id")
+  tenantId  BigInt?   @map("tenant_id")
+  role      UserRole
+  scopes    String[]
+  resource  String?
+  revokedAt DateTime? @map("revoked_at")
+  expiresAt DateTime  @map("expires_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("mcp_oauth_access_tokens")
+}
+
+model McpOAuthRefreshToken {
+  id        BigInt    @id @default(autoincrement())
+  tokenHash String    @unique @map("token_hash")
+  jti       String    @unique
+  clientId  String    @map("client_id")
+  userId    BigInt    @map("user_id")
+  tenantId  BigInt?   @map("tenant_id")
+  scopes    String[]
+  familyId  String    @map("family_id")
+  revokedAt DateTime? @map("revoked_at")
+  rotatedTo String?   @map("rotated_to")
+  expiresAt DateTime  @map("expires_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("mcp_oauth_refresh_tokens")
+}
+
+// A pending /authorize awaiting the user's consent. Mirrors the auth-code security model: the
+// opaque request id is HASHED at rest (request_hash), SINGLE-USE (CAS on consumed_at), 10-min TTL,
+// and bound to the user. The OAuth params are stored here so the code is later minted from THIS
+// record, never from the consent POST body (anti-tamper). The CSRF synchronizer token is minted
+// when the consent page is fetched and stored hashed (csrf_token_hash).
+model McpOAuthPendingAuthorization {
+  id                  BigInt    @id @default(autoincrement())
+  requestHash         String    @unique @map("request_hash")
+  csrfTokenHash       String?   @map("csrf_token_hash")
+  clientId            String    @map("client_id")
+  userId              BigInt    @map("user_id")
+  tenantId            BigInt?   @map("tenant_id")
+  redirectUri         String    @map("redirect_uri")
+  scopes              String[]
+  codeChallenge       String    @map("code_challenge")
+  codeChallengeMethod String    @map("code_challenge_method")
+  resource            String?
+  state               String?
+  consumedAt          DateTime? @map("consumed_at")
+  expiresAt           DateTime  @map("expires_at")
+  createdAt           DateTime  @default(now()) @map("created_at")
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("mcp_oauth_pending_authorizations")
+}
+
+// A remembered, revocable consent: this user approved this client for these scopes. /authorize
+// skips the consent screen when a sufficient (requested ⊆ approved) approval exists. Revoking the
+// row (admin UI) forces the next /authorize to prompt again.
+model McpOAuthClientApproval {
+  id        BigInt   @id @default(autoincrement())
+  userId    BigInt   @map("user_id")
+  clientId  String   @map("client_id")
+  scopes    String[]
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([userId, clientId])
+  @@map("mcp_oauth_client_approvals")
+}

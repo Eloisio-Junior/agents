@@ -1,0 +1,166 @@
+# MCP server + OAuth 2.1 (the third transport)
+
+The MCP server is the third of the "one core, three transports" surfaces: it projects the **same tenant-scoped services** the REST API and UI use. An external MCP client (Claude, an IDE, an agent) authenticates with its own OAuth 2.1 Bearer token and calls tools that are fenced to the token's tenant and gated by its scopes. Nothing here re-implements business logic — every tool calls a `*/service.ts` function.
+
+**Two tiers of surface.** The transport, OAuth grant, discovery, consent screen and the per-user self-service surface (`/v1/mcp/me`) are the base, available to every authenticated role. The **fleet-wide management** layer is `oauth/admin.ts`, `mcp-admin.controller.ts`, the `<McpAdminSections>` block of the `/mcp` page, and the API-key→MCP principal seam in `oauth/tokens.ts`.
+
+Three moving parts:
+
+1. **Discovery** at the issuer root — `src/modules/mcp/oauth/metadata.ts`, registered in `src/app.ts`.
+2. **OAuth 2.1 grant** — `src/modules/mcp/oauth/{tokens,grant,dcr}.ts` + `src/api/v1/mcp-oauth.controller.ts`.
+3. **Transport** — `src/modules/mcp/{server,write}.ts` + `src/api/v1/mcp.controller.ts`.
+
+## Discovery (RFC 8414 / RFC 9728), at the ROOT
+
+Clients fetch `GET /.well-known/oauth-authorization-server` and `.../oauth-protected-resource` **at the issuer root**, not under `/api`. These are registered in `src/app.ts` **before** the SPA catch-all `/*`, so they return JSON — if they fell through to the catch-all they'd return `index.html` and the client's `JSON.parse` would fail. `protected-resource` points at `/api/v1/mcp` and lists the authorization server; `authorization-server` advertises the authorize/token endpoints (always) and `registration_endpoint` **only when `MCP_DCR_ENABLED`**. Both are public (no auth). There is a regression test asserting they are JSON, not the HTMLBundle (`tests/api/v1/mcp.test.ts`).
+
+## Access token (`oauth/tokens.ts`) — the security core
+
+- **Fixed algorithm + issuer.** Signed `HS256` with a check on issuer (`secretaria-v4:mcp`) and the `algorithms: ['HS256']` allowlist on verify → anti algorithm/key confusion.
+- **Separate key from the app cookie JWT** (`config.mcpJwtSecret`, default `${JWT_SECRET}:mcp`). An app-session JWT must not validate as an MCP token and vice-versa.
+- **Audience binding (RFC 8707), enforced.** Every token is minted with `aud` = our canonical resource id (`mcpResourceId()` = `${publicUrl}/api/v1/mcp`, the same `resource` the protected-resource metadata advertises), and `verifyAccessToken` passes `audience` to `jwtVerify`, so a token issued for a different audience does not validate (→ 401). The token is bound to us regardless of whatever `resource` a client sends; the raw `resource` is persisted only for audit. `mcpResourceId` lives in `oauth/metadata.ts` (single source, also used by `protectedResourceMetadata`).
+- **`jti` denylist is mandatory, not optional.** Every access token is persisted (`McpOAuthAccessToken` with `jti` + `revokedAt`). Revocation is **immediate** (a row flip), never "wait ≤15min for expiry" — unacceptable for cross-tenant write tools. Access TTL is 15 min.
+- **Verify RE-RESOLVES the user from the DB** every request: a promotion/demotion/tenant-move/ deletion since issuance invalidates the token (stale role/tenant in the row → reject). `verify` returns `null` on any failure and **never throws** (the caller maps `null` → 401).
+- The `mcp_oauth_*` tables are **GLOBAL** (outside RLS) — always accessed via the base client, never scoped. A consequence: any admin listing of tokens/clients **must filter `tenant_id` manually** (the auto-scope safety net is absent for these tables).
+
+## Grant (`oauth/grant.ts` + `mcp-oauth.controller.ts`)
+
+- `/authorize` is **behind the app session** (`requireAuth` via `tenancyPlugin`): the user is already logged in. It issues a code only for a `redirect_uri` in the client's **exact** allowlist (no wildcard, no open redirect — an unregistered URI returns 400, never a redirect) and only for scopes the principal's role may hold (`filterScopes`: `mcp:admin`→SUPER_ADMIN, `mcp:write`→ TENANT_ADMIN+). PKCE S256 is required.
+- The **authorization code is hashed at rest** (never a PK in clear) and **single-use** (CAS consume: a replay sees count 0 → reject). The code is bound to `client_id` + `redirect_uri` + the PKCE challenge; the verifier is checked timing-safe.
+- `/token` is public (PKCE is the public-client proof). **Refresh rotation with family-wide reuse detection**: presenting an already-rotated or revoked refresh token revokes the whole `familyId` (a leaked token can't mint a new access token; the legitimate holder is forced to re-authorize). Rotation is atomic (CAS) so a concurrent double-refresh can't issue two access tokens.
+- **Resource indicator (RFC 8707).** Both `/authorize` and `/token` accept an optional `resource`; if present it must designate our canonical resource id (trailing-slash insensitive) or the request is rejected with `400 invalid_target` (on `/authorize`, without a redirect — same anti-open-redirect rule as a bad client). Absent → tolerated and assumed canonical (older clients). The minted token's `aud` is the canonical id either way (see the access-token section).
+
+## Consent screen (`oauth/consent.ts` + `OAuthConsentPage`)
+
+`/authorize` does **not** auto-approve: unless the client is `firstParty` (trusted, admin-set) or the user has a prior approval covering every requested scope, it parks a hashed, single-use, user-bound `McpOAuthPendingAuthorization` (10-min TTL, CSRF synchronizer token) and redirects to the SPA consent screen (`/oauth/consent?req=`). The screen shows the client, the redirect host, the scopes, and an **"unverified application" warning** when the client self-registered via DCR and is not trusted (`unverified = dynamicallyRegistered && !firstParty`). On approve, the code is minted **from the stored record** (never the POST body) and the approval is remembered (revocable). `iss` (RFC 9207) is on every redirect — but the AS metadata deliberately does **not** advertise `authorization_response_iss_parameter_supported`, so rmcp-based clients that require-then-drop the callback `iss` (OpenAI Codex, [openai/codex#31573](https://github.com/openai/codex/issues/31573)) can still complete login; we emit `iss` regardless, so compliant clients keep mix-up protection.
+
+## Transport + tools (`server.ts`, `write.ts`)
+
+The server is **built per request, bound to the verified principal** — there is no shared mutable state across requests. Tools are registered conditionally on the token's scopes:
+
+- `whoami` (always) — tenant (`null` for a fleet-level SUPER_ADMIN), role, scopes.
+- `list_conversations` (`mcp:read`) — metadata only, no message bodies; fenced to the token's tenant.
+- `branding_get` (`mcp:read`) — the GLOBAL app identity (brand name + colors + which logo/favicon variants exist); fleet-level, no tenant.
+- `agent_list` (`mcp:read`) — the tenant's agents (id, name, enabled); fenced to the token's tenant. Discovers the `agent_id` the settings tools target.
+- `agent_settings_get` (`mcp:read`, args: `agent_id`) — the agent's normalized **behavior** config (`debounce`/`stt`/`tts`/`split`/`serviceWindow`/`grounding`), read through the same typed readers the runtime uses (defaults + clamps applied). Credentials are stored as stable `vault:<id>` refs; the MCP transport translates each `credentialRef` to/from the entry **name** at its boundary (agent-friendly), never the secret.
+- `agent_playground` (`mcp:read`, args: `agent_id`, `message`, `thread_id?`) — chat with an agent in an isolated playground thread (no Chatwoot). Returns `{ reply, threadId, trace, sources }`: a sanitized execution trace (tool calls/results, never secrets) + the KB sources the answer grounded on. Read, but **not a simulation** — the agent's HTTP/integration tools execute for real (a write tool writes). See [`playground.md`](playground.md).
+- `prompt_set`, `agent_settings_set`, `tenant_update`, `branding_set`, `branding_asset_set` (`mcp:write`) — see below.
+
+**Tenant targeting.** How a per-tenant tool learns which tenant to act on depends on the token:
+
+- A **tenant-scoped** token (TENANT_ADMIN, or any API-key principal) carries its tenant in the token. The tenant is **implicit/transparent**: per-tenant tools take no `tenant` argument and the fence is the token's own tenant.
+- A **fleet-level SUPER_ADMIN** token is minted **tenant-less** (`whoami` → `tenantId: null`) and selects the target **explicitly, per call**: every per-tenant tool gains a **required** `tenant` argument (a slug or numeric id — `tenant_list` enumerates them), so one session drives many tenants without re-authenticating or creating a tenant.
+
+The `registerTenantTool` wrapper (`server.ts`) implements this: it augments the input schema with the `tenant` field **for SUPER_ADMIN only**, then resolves an **effective principal** (`{...principal, tenantId}`, via `resolveEffectivePrincipal` → `resolveTenantSelector`, in [`tenant-target.ts`](../src/modules/mcp/tenant-target.ts)) before the handler runs — so every gate and service below it sees one tenant, **identical in shape to an ordinary tenant token** (the change reduces to the already-handled "SUPER_ADMIN with a tenant" case). Fleet/global tools (`whoami`, `branding_*`, `tenant_*`) have no tenant target and are registered directly (no `tenant` argument).
+
+**Anti-IDOR.** A tenant-scoped token's `tenant` argument is **ignored** — it can never cross to another tenant; only a SUPER_ADMIN's selection is honored (and a SUPER_ADMIN may legitimately reach every tenant). A missing/unknown `tenant` (SUPER_ADMIN only) returns a clear `isError`, never a thrown 500. The underlying fence is unchanged: a foreign id is invisible under RLS → "not found", never a cross-tenant read/write.
+
+### Write tools — guardrails (`write.ts`)
+
+Every write tool enforces, in order:
+
+1. **Scope:** `mcp:write` required (already role-filtered at `/authorize`).
+2. **Tenant target:** the call must resolve to a tenant — implicit for a tenant-scoped token, or the per-call `tenant` selector for a fleet-level SUPER_ADMIN (see *Tenant targeting* above). The wrapper resolves it before the service runs; the `gate`/`readGate`/`adminGate` tenant-less check in `write.ts` remains as a defense-in-depth backstop should a tenant-less principal ever reach a service directly.
+3. **Dry-run by DEFAULT:** the tool previews a field-level diff and applies **nothing** unless the caller passes `dry_run: false` explicitly.
+4. **Audit on apply:** a successful apply appends an `AuditLog` row (`actorType: "mcp"`), with `before`/`after` **allowlist-projected and length-bounded** (never the raw model config / secrets), written in a tx where the RLS `WITH CHECK` passes (`asSuperAdmin` for a SUPER_ADMIN token, the scoped tenant tx otherwise).
+5. **Tenant-fenced writes:** a foreign `agent_id` is invisible under RLS → "agent not found", never a cross-tenant write (verified by a DB test in `tests/modules/mcp-write.test.ts`).
+
+Beyond these, a tool may surface a missing **prerequisite** as a non-error `blocked` result carrying an out-of-band fix pointer, rather than mutating or failing. `knowledge_reindex` (bulk-index a base) returns `{ queued: 0, blocked, fillAt? }` when the tenant's embedding credential is unconfigured or its secret is not filled yet, so the agent points the operator at the console fill (the same `fillAt`/`createAt` console-URL pattern `credential_create` uses) instead of running every document into a FAILED it didn't earn. `include_failed` also re-queues FAILED docs (a batched `knowledge_document_retry`).
+
+Errors become MCP `isError` text, never a thrown 500 (`AppError` is caught and mapped).
+
+**`agent_settings_set` (the behavior config).** Args: `agent_id` + a **partial patch** over the behavior blocks (`debounce`, `stt`, `tts`, `split`, `serviceWindow`, `grounding`). Each block is itself partial: only the sub-keys you send are **merged** into the agent's existing `settings` bag (untouched keys — and untouched blocks — preserved verbatim, exactly like the REST `PATCH /v1/agents/:id` and the UI editor's spread-then-overwrite), then **re-read through the runtime's typed readers** (`readDebounceConfig`/`readSttConfig`/`readTtsConfig`/`readSplitConfig`/`readServiceWindowConfig`) so the persisted value is always clamped/validated — a bad value collapses to a safe default, never a raw write. The merge + normalization live in `src/modules/agents/behavior-settings.ts`, shared by the get and set tools. The diff/audit project only the touched blocks. `credentialRef` is accepted as a vault entry **name** or a stable `vault:<id>` ref (use `vault:<id>` when multiple entries share the same name — a plain name that matches more than one type returns an error listing the conflicting types). Read paths return the entry **name**. Never the secret. Dry-run by default; audited (`mcp.agent_settings_set`) on apply.
+
+**`branding_set` is the fleet-level exception.** App identity/branding is GLOBAL (not per-tenant), so `branding_set` is registered **outside** the per-tenant wrapper (no `tenant` argument, even for a SUPER_ADMIN) and does **not** require/accept a tenant target — it requires `mcp:admin` + a **SUPER_ADMIN** token instead of rule 2. It updates the brand name (`brand_name`, the white-label display name) and colors (`color_mode` + `brand_color` or the per-theme `tokens_light`/`tokens_dark`); logo/favicon are uploaded by the sibling `branding_asset_set` (base64 over MCP, same `mcp:admin`+SUPER_ADMIN gate; cropping/preview stays in the UI at `/admin/branding`). The apply is audited at the **fleet level** (`tenant_id` NULL, visible only to a SUPER_ADMIN) under `asSuperAdmin`. Dry-run by default, like the others.
+
+## Full admin surface (the operator administers the whole tenant from an MCP client)
+
+Beyond the original handful, the server now projects **the whole tenant** so an operator's MCP client (Claude Desktop/Cursor) can configure agents, channels, webhooks, knowledge, and operate conversations — the same services REST/UI use, "one core, three transports". Implementations live in `src/modules/mcp/read.ts` and `write-{agents,channels,webhooks,knowledge,settings,conversations,fleet}.ts`; `server.ts` only registers (scope-gated). All writes follow the same spine as above (gate → dry-run by default → diff → apply → audit). The map below is the source of truth for **which scope unlocks what**:
+
+- **`mcp:read`** (read-only tokens, e.g. an AGENT/USER): the `*_list`/`*_get` projections — `agent_get`/`agent_tools_get`, `tool_list`/`tool_get`, `mcp_connection_list`, `integration_list`/`integration_catalog`, `knowledge_list`/`knowledge_search`/`knowledge_documents_list`/`knowledge_approvals_list`, `instance_list`/`instance_get`/`inbox_list`, `webhook_list`/`webhook_events_list`, `alert_channel_list`/`alert_stage_list`, `business_hours_list`, `experiment_list`/`experiment_get`/`experiment_results`, `tenant_settings_get`, `vault_list`/`vault_references`, `api_key_list`, `audit_list`, `logs_query`/`logs_export`, `metrics_get`/`metrics_timeseries`, `conversation_get`/`conversation_messages` (+ the originals `whoami`/`list_conversations`/`branding_get`/`agent_list`/`agent_settings_get`/`agent_playground`/`agent_export`).
+- **`mcp:write`** (TENANT_ADMIN): the per-tenant CRUD/actions — agents (`agent_create`/`update`/`clone`/`delete`, `agent_tools_set`), HTTP tools (`tool_*`), MCP connections (`mcp_connection_*` incl. `discover`), Chatwoot (`instance_create`/`update`/`delete`/`list_accounts`/`sync_inboxes`, `inbox_bind`/`reconnect`/`reconcile`), outbound webhooks (`webhook_create`/`update`/`delete`/`test`), alert channels (`alert_channel_*`), integrations (`integration_*`), knowledge bases/documents/approvals (`knowledge_*`), A/B experiments (`experiment_*`), business hours (`business_hours_*`), `tenant_settings_update`, `langfuse_connect`, `api_key_revoke`, and conversation control (`conversation_reply`/`handoff`/`return`/`status`/`reengage`).
+- **`mcp:admin`** (SUPER_ADMIN only): the fleet tier — `branding_set`, `branding_asset_set` (logo/favicon upload), `tenant_list`/`tenant_get` (cross-tenant), `tenant_create` (provision a new tenant). Not tenant-fenced; runs `asSuperAdmin`.
+
+**Secret-by-reference is a hard rule (binding decision), with two narrow documented exceptions (the Chatwoot deployment admin token and the Langfuse project keys; see the end of this section).** Other than that, no tool accepts a raw secret as an argument nor returns one. A credential is named by its **vault entry name**; the server resolves it server-side: `resolveSecretRef` (name → the stable `vault:<id>` ref a `credentialRef`/`secretRef` column stores) or `resolveSecretValue` (name → the plaintext, used only where a service needs the raw value, e.g. a token-bearing alert `url_ref`; the value is consumed in the service call and never returned). A missing credential is **not** an error: the tool returns `{ needsCredential: true, createAt: <console URL> }` so the operator creates it out of band. Generated secrets we mint (an integration's inbound route token) are **never returned raw**: the tool returns a console URL to reveal them. API-key **creation** stays UI-only for the same reason (its plaintext token cannot cross the model); only `api_key_revoke` is exposed. Rationale: a raw secret in a tool argument is sent to the model provider and retained in the MCP client's tool-call logs, an egress path REST/UI do not have. (Helpers + the rule live in `write.ts`; verified by the per-phase DB tests, which assert no plaintext appears in any tool **response** payload or audit row.)
+
+**The exceptions (infra secrets the agent holds in-band).** Exactly two tools accept a raw secret; no other does.
+
+*Chatwoot deployment admin token.* `deployment_connect` and `deployment_rotate_token` accept the token RAW as `admin_token`, and `instance_list_accounts` takes the raw probe token. This is the one infra secret the caller already holds in-band during provisioning: the agent extracts it from the freshly-deployed Chatwoot over SSH (Rails runner), so the model-provider egress the rule guards against has already happened, and the ref-based alternative would only push the token through the vault as a one-shot courier (created, snapshotted onto the deployment row, then orphaned) for no gain. The raw token is still **redacted in the audit** (metadata only) and **never returned**. When the agent does NOT hold the token (bring-your-own Chatwoot, where only the user has it), the deployment is connected from the `/channels` UI instead, so the token never reaches the model.
+
+*Langfuse project keys.* `langfuse_connect` (`mcp:write`) accepts the project `public_key` + `secret_key` RAW (+ `base_url`): the agent GENERATED that key pair and seeded it into Langfuse itself (`LANGFUSE_INIT` at deploy), so it is an in-band infra secret it already holds, not a user secret behind a deeplink. The single call stores them as a FILLED `kind:langfuse` vault credential and enables tracing on the tenant — dry-run by default (the preview redacts both keys), idempotent (a re-connect updates the stored pair), the keys kept out of the audit (metadata only) and never returned. The by-hand path (create the credential via UI/deeplink, then `tenant_settings_update`) stays available; `langfuse_connect` just collapses it for the deploy agent. The carve-out is deliberately narrow: those two are the only tools that accept a raw secret.
+
+**Conversation control has external effect.** `conversation_reply`/`handoff`/`return`/`status`/`reengage` post real messages to / change the state of a live customer conversation in Chatwoot. `conversation_reply`'s dry-run previews the **exact text** that would be sent; applying is not reversible — the guard is the MCP client's per-call approval plus the audit row. The network reconciliation actions (`instance_sync_inboxes`, `inbox_reconnect`/`reconcile`) and `webhook_test`/`mcp_connection_discover` call out to the relevant service immediately; their descriptions say so.
+
+**Tool count / curation.** A `mcp:write` (TENANT_ADMIN) token now sees ~93 tools; a read-only token ~39; a SUPER_ADMIN ~104. This is the cost of "the whole tenant". Mitigations in place: scope-gating (a read-only token never sees the ~64 write tools), curation (`*_list` is rich; `*_get` exists only where the detail is materially larger; dashboard metrics are consolidated into `metrics_get`/`metrics_timeseries`), and the `recurso_verbo` naming convention. If a real client's tool-selection degrades at this size, the next lever is **multiplexing** (collapse a resource's verbs into one `resource({action, …})` tool) — deferred until observed, since it trades discoverability for a smaller list. `scripts/mcp-tools-check.ts` asserts the scope-gating + that no tool name looks secret-bearing (`bun scripts/mcp-tools-check.ts`).
+
+## Rate limit
+
+The transport `/api/v1/mcp` gets its **own looser per-IP bucket** (`mcpTransportRateLimitMiddleware`
++ `isMcpTransport` in `middlewares/rateLimit.ts`): every JSON-RPC call from one client shares one IP, so the global 100/min bucket would throttle a legitimate client mid-task. The dedicated bucket is **240/min per IP** — a runaway-guard ceiling, not a tight throttle; the real credential gate is the Bearer (re-resolved per request, `jti` denylist for revoke). The OAuth subpaths `/api/v1/mcp/oauth/*` keep the global limit so `/token` brute-force stays bounded. A per-token bucket was considered but would be single-replica (in-memory) for the MVP, so this keys by IP like the rest.
+
+## Dynamic Client Registration (RFC 7591, `oauth/dcr.ts`)
+
+**Closed by default, but meant to be opened.** With `MCP_DCR_ENABLED` unset, `POST /api/v1/mcp/oauth/register` returns **404** (no signal the route exists). Real MCP clients (Claude, Cursor, mcp-remote) self-register, so the operator is expected to set `MCP_DCR_ENABLED=true` on a deployment that serves external clients. When opened, it registers a **public PKCE client** (`token_endpoint_auth_method: "none"`); `redirect_uris` pass `validateRedirectUris` (exact https, or http loopback for native/dev clients per RFC 8252 — no wildcard, no fragment). Requested scopes are intersected with `MCP_SCOPES`, but the **effective grant is still role-gated at `/authorize`**, so an open-registration client cannot escalate privilege.
+
+**Provenance, not trust.** A self-registered client is persisted with `McpOAuthClient.dynamicallyRegistered = true` and `firstParty = false`. The accepted DCR threat (a malicious app self-registering under a known name with its own redirect_uri) is mitigated, not eliminated, by: the **"unverified" consent warning** (above) with the redirect host shown, the **RFC 8707 resource validation** (above), a **dedicated rate limit** on `/register` (`registerRateLimitMiddleware`, 10/min/IP), and the rule that a DCR client **never auto-skips consent**. An admin can promote a client it trusts by setting `firstParty` (which then skips consent); provenance (`dynamicallyRegistered`) stays a fact and is shown as an "Unverified" badge in the admin client list until promoted.
+
+## Self-service connections (`oauth/connections.ts` + `/v1/mcp/me`)
+
+Any authenticated role can authorize an MCP client (`/authorize` is only `requireAuth`), so any role can revoke. `/v1/mcp/me` is the per-user surface, everything fenced to `tenantContext.userId` on the global tables:
+
+- `GET /connections` — the caller's connected apps (their remembered approvals enriched with the client name, trust/provenance flags, live-token count).
+- `DELETE /connections/:clientId` — **disconnect**: forgets the approval AND revokes the caller's live access + refresh tokens for that client, so existing sessions die immediately (not just future consent). Idempotent and strictly `userId`-scoped — disconnecting a client another user connected is a no-op for them.
+- `GET /info` — how to connect this account: the MCP URL, the scopes the caller's role can hold, and whether DCR is open.
+
+## One page for everyone (`/mcp`, role-aware)
+
+The MCP UI is a single top-level page `/mcp` (in the nav for every role), not under `/admin`. `McpPage` always renders the user's own connections (with disconnect) + how-to-connect (from `/v1/mcp/me/*`). A SUPER_ADMIN additionally sees `<McpAdminSections>`: the fleet-wide Clients / Active tokens / Approvals management (from `/v1/mcp/admin/*`), with the "Unverified" badge on DCR clients. There is no `/admin/mcp` route anymore.
+
+## Checkpointer tenant fence (related)
+
+The LangGraph checkpointer (`langgraph` schema) is **not under RLS** — the `PostgresSaver` pool does not carry `app.tenant_id`, so FORCE RLS would zero out the checkpointer. The `thread_id` tenant prefix IS the fence; any REST/UI/MCP-triggerable entry point must assert `threadBelongsToTenant(threadId, tenantId)` before invoking the graph (`src/graph/checkpointer.ts`, used by the nudge path). Table-level RLS on the `langgraph` tables is deferred for this reason; the application-level assertion is the enforced control.
+
+## Shipped since the MVP
+
+- **Consent screen** — see the Consent section above (replaces the old auto-grant).
+- **RFC 8707 audience binding** — minted + verified; `/authorize` and `/token` validate the resource.
+- **DCR openable** with the "unverified" provenance model + `/register` rate limit.
+- **Self-service revocation** (`/v1/mcp/me`) and **admin revoke UI** — both live on the single `/mcp` page (service layer: `disconnectClient`, `revokeToken`, family revoke on refresh reuse).
+- **Full admin surface** — read coverage + per-tenant CRUD/actions + fleet, all scope-gated and dry-run-by-default, with the secret-by-reference rule (see "Full admin surface" above).
+
+## Open items (deferred, not gaps in the security model)
+
+- **Durable per-token rate limit** (cross-replica). Single-replica in-memory for the MVP, consistent with the declared single-replica invariant (`docs/deploy.md`).
+- **GC of unused DCR clients.** A self-registered client that never completes an authorization stays in the table; a periodic sweep of stale, never-used `dynamicallyRegistered` clients is deferred.
+
+## Consumer side: connecting to an external OAuth-protected MCP server (`mcp_oauth`)
+
+Everything above is the **provider** side — this app *being* an OAuth 2.1 authorization + resource server (`src/modules/mcp/oauth/*`, `mcpOAuthController`, `mcpController`). The **consumer** side is the mirror image: this app acting as an OAuth **client** of an external MCP server so an agent can use that server's tools. The two never share code or names — keep them straight:
+
+| | Provider (this app is the server) | Consumer (this app is the client) |
+| --- | --- | --- |
+| Module | `src/modules/mcp/oauth/*` | `src/modules/vault/mcp-oauth.ts` (+ shared `oauth-core.ts`) |
+| Controller | `mcpOAuthController` (`/v1/mcp/oauth/*`) | `oauthMcpVaultController` / `oauthMcpCallbackController` (`/v1/oauth/mcp/*`) |
+| Stored where | `McpOAuthClient` + tokens table | a `VaultEntry` of kind `mcp_oauth` |
+
+The MCP-client substrate (`McpServerConnection` + `AgentToolSelection source=MCP`, loaded per turn by `loadMcpToolsForAgent`) already supported a static Bearer secret and the Google-specific `google_oauth` kind. The **`mcp_oauth`** vault kind generalizes that to any spec-compliant OAuth-protected MCP server (discovery RFC 8414/9728 + DCR RFC 7591 + PKCE + RFC 8707 `resource` + refresh-token rotation).
+
+- **Create** an `mcp_oauth` credential with ONLY the MCP server URL (`VaultEntry.baseUrl`); the value blob starts empty (the kind is `managedBlob`, exempt from `validateVaultValue`). `clientId` comes from DCR at Connect time.
+- **Connect** (`POST /v1/vault/:id/oauth/mcp/authorize`, TENANT_ADMIN): discovers the auth server from the base origin's `.well-known`, registers a public PKCE client via DCR if none exists, persists endpoints/issuer/resource/clientId into the blob, then builds the authorize URL with PKCE
+  + the `resource` indicator + a signed `state` that **binds the discovered token endpoint / issuer / resource / client** (mix-up defense, complements the RFC 9207 `iss` check). The popup opens on the provider — the operator must already be **signed into that provider** to approve consent.
+- **Callback** (`GET /v1/oauth/mcp/callback`, cookie-auth, outside the tenancy plugin): validates the state + `iss`, exchanges the code at the state-bound token endpoint, and merges the tokens into the blob (via `asSuperAdmin`, like the Google callback).
+- **Consume**: `prepare.ts`'s `resolveInjectableCredential` routes `mcp_oauth` (alongside `google_oauth`, via `isManagedOAuthKind`) to `ensureFreshMcpAccessToken`, which refreshes the access token before the MCP client connects and injects it as a Bearer header. Refresh runs under an **in-process single-flight per credential** (`entryId`) so a rotating refresh token is never spent twice concurrently (which would trip the provider's family-wide reuse detection) — sound under the single-replica invariant.
+- **SSRF**: every operator-derived fetch (the two `.well-known`, DCR, token) is guarded; in dev `SSRF_ALLOW_PRIVATE_TARGETS` (auto-true) lets you target a local hub (`http://localhost:…`).
+- **CSP**: the consent-popup callback reuses the single shared, CSP-pinned `OAUTH_CALLBACK_SCRIPT` (`oauth-core.ts`); the BroadcastChannel name + message type ride in the non-executable `cfg` JSON, so one pinned hash serves both the google and mcp popups.
+
+UI: the `mcp_oauth` secret type in the Vault, with an `McpOAuthSection` Connect/Disconnect card (mirrors `GoogleOAuthSection`, no scope picker — scopes come from discovery). Selecting an `mcp_oauth` credential on an `McpServerConnection` makes its `baseUrl` the connection's effective transport URL.
+
+**Out of scope (v1):** manual endpoint/client entry for servers without discovery/DCR (the blob is shaped to add it later), the SDK `authProvider` re-auth path, and RFC 7009 revoke on disconnect.
+
+### Consumer side: stdio MCP servers + the `mcp_env` credential
+
+A `McpServerConnection` with `transport: "stdio"` spawns a **local process** (`command`), so it is RCE on the host and gated by `MCP_STDIO_ENABLED` (default **off**; the flag rides to the client on `/auth/me` so the MCP form flags a stdio connection and **disables the Save** when it is off — the backend `assertTransportValid` rejects a stdio connection while disabled, so the form stays consistent).
+
+**Launcher allowlist.** The `command` is not free-form: its first token must be a launcher we ship in the image (`src/lib/mcp-launchers.ts` → `MCP_STDIO_LAUNCHERS = ["bunx", "uvx"]`, validated in `assertTransportValid`), the rest is its args. The editor splits this into a launcher `Select` + an args field (`parseStdioCommand`/`composeStdioCommand`). `bunx` (native to the Bun image) runs npm-published servers — the drop-in for any doc that says `npx` (`bunx <pkg>`, or `bunx -p <pkg> <bin>` when the bin name differs); `uvx` (from `uv`, a static binary `COPY`'d from `ghcr.io/astral-sh/uv`, with a pre-installed musl CPython) runs Python servers. `npx` is intentionally absent (no Node in the image; bunx already runs npm packages). The runtime `buildConnConfig` still just splits `command` on whitespace into `command` + `args`, so `bunx`/`uvx` resolve via the spawned process's `PATH`.
+
+**Credential = env var.** Many stdio servers authenticate purely via an **environment variable** (e.g. a Hostinger server reads `HOSTINGER_API_TOKEN`). The **`mcp_env`** vault kind models exactly that: `value` = the token (plain string), `paramName` = the env var name (`needsParamName`, `injection: "none"`). `buildConnConfig`'s stdio branch reads `paramName` + `secret` and returns `{ transport: "stdio", command, args, env: { [paramName]: secret } }`; the SDK **merges** that single var over the default-safe env (`HOME`/`PATH`/… — `stdio.js`: `{ ...getDefaultEnvironment(), ...env }`), so `PATH` survives and the secret never appears in the `command` string. A non-`mcp_env` credential (or none) injects no env. The MCP form's credential picker offers `mcp_env`/`bearer_token` for stdio (vs `mcp_oauth` + header/basic for network transports).

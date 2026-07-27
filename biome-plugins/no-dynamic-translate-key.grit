@@ -1,0 +1,15 @@
+// Backend counterpart to `no-dynamic-i18n-key.grit`. The API layer uses a
+// wrapper named `translate(...)` (see `src/api/lib/i18n.ts`) instead of `t`,
+// so the extractor config at `i18next-parser.api.config.cjs` looks for
+// `translate(...)` calls. Same rationale: dynamic keys escape extraction and
+// need magic comments like `// translate('key.path', 'Default')` to be
+// included in the locale files.
+language js;
+
+`translate($first, $...)` where {
+    $first <: not `"$_"`,
+    register_diagnostic(
+        span = $first,
+        message = "Dynamic i18n key: `i18next-parser` won't extract this. Add `// translate('key.path', 'Default')` magic comments nearby (same file or any file listed in `i18next-parser.api.config.cjs`), then `// biome-ignore lint/plugin/no-dynamic-translate-key: extracted via magic comments` on this call."
+    )
+}

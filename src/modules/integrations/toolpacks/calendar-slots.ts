@@ -1,0 +1,104 @@
+import {
+  fitsWithinWindows,
+  type WindowSpec,
+} from "@/modules/business-hours/hours";
+
+// Pure appointment-slot generator (n8n secretária v3 parity). Turns a time range + the professional's
+// business hours + the calendar's busy intervals into a list of BOOKABLE start times, server-side and
+// deterministic — the model never does the date arithmetic (which it does badly). The v3 recipe:
+//   1. step from the range start by `granularityMinutes` (the overlap grain: 15min ⇒ 09:00 and 09:15
+//      are both valid starts), each candidate `slotMinutes` long, dropping any that overrun the range;
+//   2. keep only candidates that fit ENTIRELY inside a business-hours window (same day, no midnight
+//      crossing) — when no windows are configured the schedule is "always on" and this is skipped;
+//   3. drop candidates overlapping any busy interval (freeBusy), and any already in the past.
+// Returns EVERY bookable slot in the range, in chronological order (no sampling) — the caller bounds the
+// range to <= 24h so the list stays small. No I/O, no Date.now() — `now` is injected, so it is
+// unit-testable with fixed instants (incl. DST).
+
+export interface SlotInput {
+  timeMin: string;
+  timeMax: string;
+  now: Date;
+  // Empty ⇒ no business-hours restriction ("always on"); otherwise the slot must fit inside a window.
+  scheduleWindows: WindowSpec[];
+  // Timezone the windows are expressed in AND the label is rendered in.
+  scheduleTz: string;
+  busy: { start: string; end: string }[];
+  slotMinutes: number;
+  granularityMinutes: number;
+  minLeadMinutes: number;
+}
+
+export interface Slot {
+  start: string;
+  end: string;
+  label: string;
+}
+
+// Backstop for a pathological range (e.g. a year at 5-minute grain): bound the candidates scanned.
+const MAX_CANDIDATES = 5000;
+
+export function computeAvailableSlots(input: SlotInput): Slot[] {
+  const min = Date.parse(input.timeMin);
+  const max = Date.parse(input.timeMax);
+  if (Number.isNaN(min) || Number.isNaN(max) || max <= min) return [];
+  const slotMs = input.slotMinutes * 60_000;
+  const stepMs = input.granularityMinutes * 60_000;
+  if (slotMs <= 0 || stepMs <= 0) return [];
+  const lead = input.now.getTime() + Math.max(0, input.minLeadMinutes) * 60_000;
+  // Align the first candidate UP to the granularity grid so slots land on clean wall-clock times
+  // (09:00, 09:15…). Without this, stepping starts at `now`+lead and inherits its odd minute and
+  // seconds — e.g. now 00:16:31.660 with a 15-min grain yields 09:01, 09:16, … :31.660Z. stepMs is a
+  // whole number of minutes and real tz offsets are multiples of it, so aligning on the epoch grid
+  // produces clean LOCAL times (and zeroes the sub-minute component).
+  const startFrom = Math.ceil(Math.max(min, lead) / stepMs) * stepMs;
+  const busy = input.busy
+    .map((b) => ({ s: Date.parse(b.start), e: Date.parse(b.end) }))
+    .filter((b) => !Number.isNaN(b.s) && !Number.isNaN(b.e) && b.e > b.s);
+
+  const out: Slot[] = [];
+  let scanned = 0;
+  for (let t = startFrom; t + slotMs <= max; t += stepMs) {
+    if (++scanned > MAX_CANDIDATES) break;
+    const slotStart = new Date(t);
+    const slotEnd = new Date(t + slotMs);
+    if (
+      input.scheduleWindows.length > 0 &&
+      !fitsWithinWindows(
+        input.scheduleWindows,
+        input.scheduleTz,
+        slotStart,
+        slotEnd,
+      )
+    ) {
+      continue;
+    }
+    const slotEndMs = t + slotMs;
+    const overlapsBusy = busy.some((b) => t < b.e && slotEndMs > b.s);
+    if (overlapsBusy) continue;
+    out.push({
+      start: slotStart.toISOString(),
+      end: slotEnd.toISOString(),
+      label: formatLabel(slotStart, input.scheduleTz),
+    });
+  }
+
+  return out;
+}
+
+// A human-friendly local label (e.g. "ter 24/06 09:00") to anchor the model's phrasing, rendered in
+// the schedule's timezone. The ISO start/end remain the source of truth.
+function formatLabel(d: Date, tz: string): string {
+  const parts = new Intl.DateTimeFormat("pt-BR", {
+    timeZone: tz,
+    weekday: "short",
+    day: "2-digit",
+    month: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(d);
+  const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
+  const weekday = get("weekday").replace(/\.$/, "");
+  return `${weekday} ${get("day")}/${get("month")} ${get("hour")}:${get("minute")}`;
+}

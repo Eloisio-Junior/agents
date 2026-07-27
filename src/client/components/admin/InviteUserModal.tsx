@@ -1,0 +1,219 @@
+import { Check, Copy } from "lucide-react";
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
+import { Button } from "@/client/components/Button";
+import { Input } from "@/client/components/Input";
+import {
+  Modal,
+  type ModalController,
+  useOnModalOpen,
+} from "@/client/components/Modal";
+import { api } from "@/client/lib/api";
+import type { ApiErrorPayload } from "@/client/lib/types";
+
+// Admin "invite user" modal. A SUPER_ADMIN picks the target tenant (pre-filled with the Users-tab
+// filter selection); a TENANT_ADMIN invites into its own tenant (no tenant field). There is no
+// mailer, so on success the modal shows the one-time accept link to copy and send.
+const selectCls =
+  "w-full rounded-lg border border-border bg-bg-tertiary px-3 py-2 text-text-primary focus:border-border-focus focus:outline-none";
+const labelCls = "mb-1 block font-medium text-sm text-text-primary";
+
+export function InviteUserModal({
+  modal,
+  isSuperAdmin,
+  tenants,
+  defaultTenantId,
+  onInvited,
+}: {
+  modal: ModalController;
+  isSuperAdmin: boolean;
+  // Selectable tenants (SUPER_ADMIN only); empty for a TENANT_ADMIN.
+  tenants: { id: string; name: string }[];
+  // Pre-selected tenant (the active Users-tab filter), or "" when "All tenants" is selected.
+  defaultTenantId: string;
+  onInvited: () => void;
+}) {
+  const { t } = useTranslation();
+  const [email, setEmail] = useState("");
+  const [role, setRole] = useState<"AGENT" | "TENANT_ADMIN">("AGENT");
+  const [tenantId, setTenantId] = useState("");
+  const [link, setLink] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  // A SUPER_ADMIN must target a tenant; block submit until one is chosen.
+  const noTarget = isSuperAdmin && !tenantId;
+
+  // NOTE: once the invite link is shown the work is saved, so the form is no longer dirty.
+  const isDirty =
+    !link &&
+    (email.trim() !== "" || role !== "AGENT" || tenantId !== defaultTenantId);
+
+  useOnModalOpen(modal, () => {
+    setEmail("");
+    setRole("AGENT");
+    setTenantId(defaultTenantId);
+    setLink(null);
+    setCopied(false);
+    setError("");
+  });
+
+  const handleSubmit = async () => {
+    setError("");
+    setLoading(true);
+    try {
+      const { data, error: apiError } = await api.api.admin.invitations.post({
+        email,
+        role,
+        tenantId: isSuperAdmin ? tenantId : undefined,
+      });
+      if (apiError) {
+        setError(
+          (apiError.value as ApiErrorPayload)?.error ||
+            t("invite.failed", "Could not create the invitation"),
+        );
+        return;
+      }
+      if (data?.invite) {
+        setLink(data.invite.acceptUrl);
+        onInvited();
+      }
+    } catch {
+      setError(t("invite.failed", "Could not create the invitation"));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const copyLink = async () => {
+    if (!link) return;
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopied(true);
+    } catch {
+      // Clipboard may be unavailable (insecure context); the link stays selectable.
+    }
+  };
+
+  return (
+    <Modal
+      modal={modal}
+      title={t("invite.title", "Invite user")}
+      size="md"
+      unsavedChanges={isDirty}
+    >
+      {link ? (
+        <div className="space-y-4">
+          <p className="text-sm text-text-secondary">
+            {t(
+              "invite.linkHint",
+              "Send this one-time link to the invitee. It is shown only once.",
+            )}
+          </p>
+          <div className="flex items-center gap-2">
+            <code className="flex-1 truncate rounded-lg border border-border bg-bg-tertiary px-3 py-2 text-text-primary text-xs">
+              {link}
+            </code>
+            <Button size="sm" variant="secondary" onClick={copyLink}>
+              {copied ? (
+                <Check className="h-4 w-4" aria-hidden="true" />
+              ) : (
+                <Copy className="h-4 w-4" aria-hidden="true" />
+              )}
+              {copied ? t("common.copied", "Copied") : t("common.copy", "Copy")}
+            </Button>
+          </div>
+          <div className="flex justify-end">
+            <Button onClick={modal.close}>{t("common.done", "Done")}</Button>
+          </div>
+        </div>
+      ) : (
+        <form
+          className="space-y-4"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!loading && !noTarget) void handleSubmit();
+          }}
+        >
+          {error && (
+            <div className="rounded-lg border border-error bg-error-soft px-4 py-2 text-error text-sm">
+              {error}
+            </div>
+          )}
+          {isSuperAdmin && (
+            <div>
+              <label htmlFor="invite-tenant" className={labelCls}>
+                {t("invite.tenant", "Tenant")}
+              </label>
+              <select
+                id="invite-tenant"
+                className={selectCls}
+                value={tenantId}
+                disabled={loading}
+                onChange={(e) => setTenantId(e.target.value)}
+              >
+                <option value="">{t("tenant.select", "Select tenant")}</option>
+                {tenants.map((tn) => (
+                  <option key={tn.id} value={tn.id}>
+                    {tn.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+          <div>
+            <label htmlFor="invite-email" className={labelCls}>
+              {t("invite.email", "Email")}
+            </label>
+            <Input
+              id="invite-email"
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              required
+              disabled={loading}
+              placeholder={t("auth.emailPlaceholder", "you@example.com")}
+            />
+          </div>
+          <div>
+            <label htmlFor="invite-role" className={labelCls}>
+              {t("invite.role", "Role")}
+            </label>
+            <select
+              id="invite-role"
+              className={selectCls}
+              value={role}
+              disabled={loading}
+              onChange={(e) =>
+                setRole(e.target.value as "AGENT" | "TENANT_ADMIN")
+              }
+            >
+              <option value="AGENT">{t("role.agent", "Agent")}</option>
+              <option value="TENANT_ADMIN">
+                {t("role.tenantAdmin", "Tenant admin")}
+              </option>
+            </select>
+          </div>
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={modal.close}
+              disabled={loading}
+            >
+              {t("common.cancel", "Cancel")}
+            </Button>
+            <Button
+              type="submit"
+              loading={loading}
+              disabled={loading || noTarget}
+            >
+              {t("invite.submit", "Create invitation")}
+            </Button>
+          </div>
+        </form>
+      )}
+    </Modal>
+  );
+}

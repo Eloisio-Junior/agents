@@ -1,0 +1,307 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient } from "@/../generated/prisma/client";
+import { encryptJson } from "@/api/lib/crypto";
+import {
+  AGENT_EXPORT_KIND,
+  AGENT_EXPORT_VERSION,
+} from "@/modules/agents/transfer";
+import type { VerifiedToken } from "@/modules/mcp/oauth/tokens";
+import {
+  agentCreate,
+  agentDelete,
+  agentImport,
+  agentToolsSet,
+  agentUpdate,
+  toolCreate,
+} from "@/modules/mcp/write-agents";
+
+// Agent-builder write tools: gate (scope + tenant target) is DB-free; dry-run/apply/audit, the
+// credential-by-NAME resolution and tenant fencing need a real Postgres (skipIf).
+
+function principal(over: Partial<VerifiedToken>): VerifiedToken {
+  return {
+    userId: 1n,
+    tenantId: 1n,
+    role: "TENANT_ADMIN",
+    scopes: ["mcp:read", "mcp:write"],
+    clientId: "c",
+    jti: "j",
+    ...over,
+  };
+}
+
+describe("MCP agent-builder gate (no DB)", () => {
+  test("agent_create without mcp:write → insufficient_scope", async () => {
+    const r = await agentCreate(principal({ scopes: ["mcp:read"] }), {
+      name: "x",
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("insufficient_scope");
+  });
+
+  test("agent_update invalid agent_id → error", async () => {
+    const r = await agentUpdate(principal({}), {
+      agent_id: "nope",
+      name: "x",
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("invalid agent_id");
+  });
+
+  test("agent_update with no fields → error", async () => {
+    const r = await agentUpdate(principal({}), { agent_id: "1" });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("no updatable fields");
+  });
+
+  test("agent_import without mcp:write → insufficient_scope", async () => {
+    const r = await agentImport(principal({ scopes: ["mcp:read"] }), {
+      export: {},
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("insufficient_scope");
+  });
+
+  test("agent_import invalid export → error", async () => {
+    const r = await agentImport(principal({}), { export: { not: "valid" } });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("invalid agent export");
+  });
+
+  test("agent_import dry-run (default) previews without writing", async () => {
+    const exp = {
+      version: AGENT_EXPORT_VERSION,
+      kind: AGENT_EXPORT_KIND,
+      agent: {
+        name: "Imported",
+        systemPrompt: "hi",
+        modelConfig: {},
+        settings: {},
+        transferWithSummary: false,
+        businessHours: null,
+        followUpHours: null,
+        tools: [],
+        credentials: [{ name: "OpenAI", kind: "openai" }],
+      },
+    };
+    const r = await agentImport(principal({}), { export: exp });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.data.dryRun).toBe(true);
+      expect(r.data.agentName).toBe("Imported");
+      expect(r.data.willCreate).toEqual({ enabled: false, mode: "test" });
+      expect(r.data.credentialsNeeded).toEqual([
+        { name: "OpenAI", kind: "openai" },
+      ]);
+    }
+  });
+});
+
+const appUrl = process.env.TEST_APP_DATABASE_URL;
+const suUrl = process.env.MIGRATION_DATABASE_URL;
+let dbUp = false;
+let su: PrismaClient | undefined;
+let app: PrismaClient | undefined;
+if (appUrl && suUrl) {
+  try {
+    su = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: suUrl }),
+    });
+    await su.$queryRaw`SELECT 1`;
+    app = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: appUrl }),
+    });
+    await app.$queryRaw`SELECT 1`;
+    dbUp = true;
+  } catch {
+    dbUp = false;
+  }
+}
+const appDb = app as PrismaClient;
+const suDb = su as PrismaClient;
+
+describe.skipIf(!dbUp)("MCP agent-builder tools (DB)", () => {
+  let tenantA = 0n;
+  let tenantB = 0n;
+  let agentA = 0n;
+  let credId = 0n;
+
+  beforeAll(async () => {
+    const a = await suDb.tenant.create({
+      data: { name: "GA", slug: `g-a-${process.pid}` },
+    });
+    tenantA = a.id;
+    const b = await suDb.tenant.create({
+      data: { name: "GB", slug: `g-b-${process.pid}` },
+    });
+    tenantB = b.id;
+    const ag = await suDb.agent.create({
+      data: { tenantId: tenantA, name: "Builder", systemPrompt: "p" },
+    });
+    agentA = ag.id;
+    const cred = await suDb.vaultEntry.create({
+      data: {
+        tenantId: tenantA,
+        name: "my-api",
+        kind: "generic",
+        secret: encryptJson("sk-secret"),
+      },
+      select: { id: true },
+    });
+    credId = cred.id;
+  });
+
+  afterAll(async () => {
+    for (const tid of [tenantA, tenantB]) {
+      if (!tid) continue;
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM audit_logs WHERE tenant_id = ${tid}`,
+      );
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM agent_tool_selections WHERE tenant_id = ${tid}`,
+      );
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM tool_definitions WHERE tenant_id = ${tid}`,
+      );
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM vault_entries WHERE tenant_id = ${tid}`,
+      );
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM agents WHERE tenant_id = ${tid}`,
+      );
+      await suDb.$executeRawUnsafe(`DELETE FROM tenants WHERE id = ${tid}`);
+    }
+    await suDb.$disconnect();
+    await appDb.$disconnect();
+  });
+
+  test("agent_create dry-run creates nothing; apply creates + audits", async () => {
+    const p = principal({ tenantId: tenantA });
+    const dry = await agentCreate(p, { name: "Dryrun Agent" }, { base: appDb });
+    expect(dry.ok).toBe(true);
+    if (dry.ok) expect(dry.data.dryRun).toBe(true);
+    const before = await suDb.agent.count({
+      where: { tenantId: tenantA, name: "Dryrun Agent" },
+    });
+    expect(before).toBe(0);
+
+    const applied = await agentCreate(
+      p,
+      { name: "Real Agent", dry_run: false },
+      { base: appDb },
+    );
+    expect(applied.ok).toBe(true);
+    const row = await suDb.agent.findFirst({
+      where: { tenantId: tenantA, name: "Real Agent" },
+    });
+    expect(row).not.toBeNull();
+    const audits = await suDb.auditLog.count({
+      where: { tenantId: tenantA, action: "mcp.agent_create" },
+    });
+    expect(audits).toBe(1);
+  });
+
+  test("tool_create resolves credential NAME → vault:<id> on apply", async () => {
+    const p = principal({ tenantId: tenantA });
+    const r = await toolCreate(
+      p,
+      {
+        name: "lookup",
+        url_template: "https://api.example.com/x",
+        allowed_hosts: ["api.example.com"],
+        method: "GET",
+        credential_ref: "my-api",
+        dry_run: false,
+      },
+      { base: appDb },
+    );
+    expect(r.ok).toBe(true);
+    const row = await suDb.toolDefinition.findFirst({
+      where: { tenantId: tenantA, name: "lookup" },
+    });
+    expect(row?.credentialRef).toBe(`vault:${credId}`);
+  });
+
+  test("tool_create with unknown credential → needsCredential + console URL (no write)", async () => {
+    const p = principal({ tenantId: tenantA });
+    const r = await toolCreate(
+      p,
+      {
+        name: "nope-tool",
+        url_template: "https://api.example.com/y",
+        allowed_hosts: ["api.example.com"],
+        credential_ref: "does-not-exist",
+        dry_run: false,
+      },
+      { base: appDb },
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.data.needsCredential).toBe(true);
+      expect(typeof r.data.createAt).toBe("string");
+    }
+    const row = await suDb.toolDefinition.findFirst({
+      where: { tenantId: tenantA, name: "nope-tool" },
+    });
+    expect(row).toBeNull();
+  });
+
+  test("agent_tools_set replace (empty set) applies + audits", async () => {
+    const p = principal({ tenantId: tenantA });
+    const r = await agentToolsSet(
+      p,
+      { agent_id: String(agentA), grants: [], dry_run: false },
+      { base: appDb },
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.data.applied).toBe(true);
+      expect((r.data.grants as unknown[]).length).toBe(0);
+    }
+    const audits = await suDb.auditLog.count({
+      where: { tenantId: tenantA, action: "mcp.agent_tools_set" },
+    });
+    expect(audits).toBe(1);
+  });
+
+  test("agent_update cross-tenant agent_id → not found, no write", async () => {
+    const p = principal({ tenantId: tenantB });
+    const r = await agentUpdate(
+      p,
+      { agent_id: String(agentA), name: "evil", dry_run: false },
+      { base: appDb },
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("not found");
+    const row = await suDb.agent.findUnique({ where: { id: agentA } });
+    expect(row?.name).toBe("Builder");
+  });
+
+  test("agent_delete dry-run keeps the agent; apply removes it", async () => {
+    const p = principal({ tenantId: tenantA });
+    const victim = await suDb.agent.create({
+      data: { tenantId: tenantA, name: "Victim", systemPrompt: "p" },
+    });
+    const dry = await agentDelete(
+      p,
+      { agent_id: String(victim.id) },
+      { base: appDb },
+    );
+    expect(dry.ok).toBe(true);
+    if (dry.ok) expect(dry.data.dryRun).toBe(true);
+    expect(
+      await suDb.agent.findUnique({ where: { id: victim.id } }),
+    ).not.toBeNull();
+
+    const applied = await agentDelete(
+      p,
+      { agent_id: String(victim.id), dry_run: false },
+      { base: appDb },
+    );
+    expect(applied.ok).toBe(true);
+    expect(
+      await suDb.agent.findUnique({ where: { id: victim.id } }),
+    ).toBeNull();
+  });
+});

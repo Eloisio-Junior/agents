@@ -1,0 +1,153 @@
+import type { PrismaClient } from "@/../generated/prisma/client";
+import logger from "@/api/lib/logger";
+import basePrisma from "@/api/lib/prisma";
+import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import {
+  emitFlowEvent,
+  type FlowContext,
+  withFlowStage,
+} from "@/modules/flowlog/service";
+import { tryResolveVaultEntry } from "@/modules/vault/service";
+import { getTtsProvider, type TtsResult } from "./providers";
+import type { TtsConfig } from "./settings";
+
+// Text-to-speech orchestration: normalize the reply for speech, synthesize via the configured
+// provider (key from the vault), and return the audio for the Chatwoot voice-note upload. The
+// audio-vs-text DECISION lives in settings.shouldReplyWithAudio (pure); this module only renders the
+// audio once that decision is yes. All network I/O is outside transactions; deps injectable for tests.
+
+function sysCtx(tenantId: bigint): TenantContext {
+  return { tenantId, userId: null, role: "TENANT_ADMIN" };
+}
+
+// Emoji ranges + an optional trailing variation selector (FE0F kept OUTSIDE the class — a combining
+// char inside a class is a lint/correctness hazard).
+const EMOJI =
+  /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2190}-\u{21FF}\u{2B00}-\u{2BFF}\u{1F1E6}-\u{1F1FF}]\u{FE0F}?/gu;
+
+// Light text-for-speech normalization (no LLM): drop markdown formatting, links→label, emojis, and
+// collapse whitespace so the TTS engine reads clean prose. Full SSML/number-spelling is a future
+// enhancement (modern multilingual voices handle most of it).
+export function prepareSpeechText(input: string): string {
+  return input
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1") // [label](url) → label
+    .replace(/`+/g, "") // inline/code-fence backticks
+    .replace(/(\*\*|\*|__|_|~~)/g, "") // bold / italic / strike markers
+    .replace(/^#{1,6}\s+/gm, "") // heading markers
+    .replace(/^[-*+]\s+/gm, "") // bullet markers
+    .replace(EMOJI, "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{2,}/g, "\n")
+    .trim();
+}
+
+export interface SynthesizeReplyParams {
+  tenantId: bigint;
+  cfg: TtsConfig;
+  text: string;
+  base?: PrismaClient;
+  deps?: {
+    fetchImpl?: typeof fetch;
+    // Opt-in LLM text-for-speech normalizer (built by the runtime from the agent's model). Best-effort:
+    // a throw/timeout here falls back to the un-normalized speech text. Only invoked when cfg.normalize.
+    normalizeSpeech?: (text: string) => Promise<string>;
+  };
+  // Optional execution-flow context: when present, the provider synth is logged as a `tts` stage.
+  flow?: FlowContext;
+}
+
+// Returns the synthesized audio, or null when TTS is not runnable (no key / misconfigured / empty
+// text). Throws only on a hard provider error so the caller can fall back to a text reply.
+export async function synthesizeReply(
+  params: SynthesizeReplyParams,
+): Promise<TtsResult | null> {
+  const { cfg } = params;
+  const base = params.base ?? basePrisma;
+  let speech = prepareSpeechText(params.text);
+  if (!speech) return null;
+  // Opt-in LLM normalization for natural speech (currency/dates/abbreviations → spoken words, in the
+  // reply's own language). Best-effort: any failure falls back to the raw speech text. Plain text still
+  // reaches the provider (no SSML), and the Chatwoot transcribedText keeps the ORIGINAL reply — only
+  // the synth input is normalized.
+  if (cfg.normalize && params.deps?.normalizeSpeech) {
+    try {
+      const normalized = (await params.deps.normalizeSpeech(speech)).trim();
+      if (normalized) speech = normalized;
+    } catch (e) {
+      logger.warn(
+        "tts: speech normalization failed, using raw text: %s",
+        e instanceof Error ? e.message : String(e),
+      );
+    }
+  }
+
+  // Surface a misconfig skip on the turn trail / Logs (warn + skipped), so a TTS that silently does
+  // nothing is visible to the operator instead of just falling back to text with no trace.
+  const skip = (reason: string): null => {
+    if (params.flow) {
+      emitFlowEvent(params.flow, {
+        stage: "tts",
+        level: "warn",
+        status: "skipped",
+        provider: cfg.provider,
+        detail: { reason },
+      });
+    }
+    return null;
+  };
+
+  const provider = getTtsProvider(cfg.provider);
+  if (!provider) {
+    logger.warn("tts: unknown provider %s", cfg.provider);
+    return skip("unknown_provider");
+  }
+  const voice = cfg.voice || provider.defaultVoice;
+  if (provider.requiresVoice && !voice) {
+    logger.warn("tts: provider %s requires a voice — skipping", cfg.provider);
+    return skip("no_voice");
+  }
+  if (!cfg.credentialRef) {
+    logger.warn("tts: no credentialRef configured — skipping");
+    return skip("no_credential");
+  }
+  const entry = await runScopedOn(base, sysCtx(params.tenantId), (db) =>
+    tryResolveVaultEntry<string>(db, cfg.credentialRef as string),
+  );
+  if (!entry) {
+    logger.warn(
+      "tts: credential %s not found in the vault — skipping",
+      cfg.credentialRef,
+    );
+    return skip("credential_not_found");
+  }
+  // NOTE: credential baseUrl takes precedence over the agent config baseURL (config is a fallback).
+  // The requiresBaseURL check uses the effective value so a credential-stored URL satisfies the guard.
+  const effectiveBaseURL = entry.baseUrl ?? cfg.baseURL;
+  if (provider.requiresBaseURL && !effectiveBaseURL) {
+    logger.warn("tts: provider %s requires a baseURL — skipping", cfg.provider);
+    return skip("no_base_url");
+  }
+
+  return withFlowStage(
+    params.flow,
+    "tts",
+    {
+      provider: cfg.provider,
+      model: cfg.model || provider.defaultModel,
+      detail: { normalized: cfg.normalize },
+      // TTS is best-effort: the runtime falls back to a text reply on a synth error, so log a warn
+      // (advisory), not a red error, on the conversation/Logs.
+      errorLevel: "warn",
+    },
+    () =>
+      provider.synthesize({
+        text: speech,
+        voice,
+        model: cfg.model || provider.defaultModel,
+        language: "",
+        apiKey: entry.secret,
+        baseURL: effectiveBaseURL,
+        fetchImpl: params.deps?.fetchImpl ?? fetch,
+      }),
+  );
+}

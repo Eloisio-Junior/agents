@@ -1,0 +1,14 @@
+// Bans `process.env.BUN_PUBLIC_*` access in client code outside of
+// `src/client/lib/env.ts`. The `define` substitution in `build.ts` replaces
+// the literal `process.env.BUN_PUBLIC_X` at build time, but in dev the
+// browser has no `process` global, so a bare read throws. `env.ts`
+// centralizes the try/catch wrapper; everything else must import from there.
+language js;
+
+`process.env.$key` where {
+    $key <: r"BUN_PUBLIC_.*",
+    register_diagnostic(
+        span = $key,
+        message = "Reads of `process.env.BUN_PUBLIC_*` must live in `src/client/lib/env.ts`. Import the typed value from there instead."
+    )
+}

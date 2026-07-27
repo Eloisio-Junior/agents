@@ -1,0 +1,83 @@
+// Flags the modal-mount anti-pattern: `{flag && <FooModal .../>}`, its
+// ternary twin `{flag ? <FooModal .../> : null}`, and the inverted form
+// `{flag ? null : <FooModal .../>}`.
+//
+// Radix Dialog's exit animation relies on `data-[state=closed]:animate-out`
+// on its Content node while `Dialog.Root` stays mounted. When a caller gates
+// the wrapper with `{flag && <FooModal/>}`, the entire Radix tree unmounts
+// synchronously and the close animation is skipped: the modal just
+// disappears.
+//
+// Correct pattern: always render the wrapper, drive visibility via a
+// controller from `useModalController()`:
+//
+//   const contact = useModalController();
+//   <Button onClick={() => contact.open()}>Contact</Button>
+//   <ContactModal modal={contact} />
+//
+// Inside the modal component, forward `modal` to `<Modal modal={modal}>`.
+// Wrap `controller.open` in an arrow so the MouseEvent does not leak in as
+// the payload argument.
+//
+// Scope (configured in `biome.jsonc`):
+//   - `src/client/**`. Only components whose tag name matches `*Modal` —
+//     narrow enough to spare Tooltip / Popover / etc., while still catching
+//     every intentional modal wrapper.
+//
+// Limitations:
+//   - Namespaced elements (`<Foo.Modal>`) are not matched. The convention in
+//     this repo is to export wrappers directly.
+//   - GritQL has no scope analysis, so the plugin only inspects the
+//     syntactic shape of the call site. Hiding the anti-pattern behind a
+//     helper component escapes detection.
+//
+// Suppress with `// biome-ignore lint/plugin/always-render-modal: <reason>`
+// on the line above the expression. Only genuine exceptions — e.g. a
+// `*Modal`-named component that does not render a Radix Dialog.Root
+// internally (consider renaming instead).
+language js;
+
+or {
+    `$cond && <$name $... />` where {
+        $name <: r".*Modal",
+        register_diagnostic(
+            span = $name,
+            message = "Conditionally rendering a `*Modal` component with `{flag && <...>}` unmounts the Radix Dialog before its exit animation can play. Create the controller at the component top level with `const modal = useModalController()` and always render the wrapper with that variable (e.g. `<FooModal modal={modal} />`, forwarded to `<Modal modal={modal}>` inside). See `src/client/components/Modal.tsx` for the API."
+        )
+    },
+    `$cond && <$name $...>$_</$name>` where {
+        $name <: r".*Modal",
+        register_diagnostic(
+            span = $name,
+            message = "Conditionally rendering a `*Modal` component with `{flag && <...>}` unmounts the Radix Dialog before its exit animation can play. Create the controller at the component top level with `const modal = useModalController()` and always render the wrapper with that variable (e.g. `<FooModal modal={modal} />`, forwarded to `<Modal modal={modal}>` inside). See `src/client/components/Modal.tsx` for the API."
+        )
+    },
+    `$cond ? <$name $... /> : null` where {
+        $name <: r".*Modal",
+        register_diagnostic(
+            span = $name,
+            message = "Conditionally rendering a `*Modal` component with `{flag ? <...> : null}` unmounts the Radix Dialog before its exit animation can play. Create the controller at the component top level with `const modal = useModalController()` and always render the wrapper with that variable (e.g. `<FooModal modal={modal} />`, forwarded to `<Modal modal={modal}>` inside). See `src/client/components/Modal.tsx` for the API."
+        )
+    },
+    `$cond ? <$name $...>$_</$name> : null` where {
+        $name <: r".*Modal",
+        register_diagnostic(
+            span = $name,
+            message = "Conditionally rendering a `*Modal` component with `{flag ? <...> : null}` unmounts the Radix Dialog before its exit animation can play. Create the controller at the component top level with `const modal = useModalController()` and always render the wrapper with that variable (e.g. `<FooModal modal={modal} />`, forwarded to `<Modal modal={modal}>` inside). See `src/client/components/Modal.tsx` for the API."
+        )
+    },
+    `$cond ? null : <$name $... />` where {
+        $name <: r".*Modal",
+        register_diagnostic(
+            span = $name,
+            message = "Conditionally rendering a `*Modal` component with `{flag ? null : <...>}` unmounts the Radix Dialog before its exit animation can play. Create the controller at the component top level with `const modal = useModalController()` and always render the wrapper with that variable (e.g. `<FooModal modal={modal} />`, forwarded to `<Modal modal={modal}>` inside). See `src/client/components/Modal.tsx` for the API."
+        )
+    },
+    `$cond ? null : <$name $...>$_</$name>` where {
+        $name <: r".*Modal",
+        register_diagnostic(
+            span = $name,
+            message = "Conditionally rendering a `*Modal` component with `{flag ? null : <...>}` unmounts the Radix Dialog before its exit animation can play. Create the controller at the component top level with `const modal = useModalController()` and always render the wrapper with that variable (e.g. `<FooModal modal={modal} />`, forwarded to `<Modal modal={modal}>` inside). See `src/client/components/Modal.tsx` for the API."
+        )
+    }
+}

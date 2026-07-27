@@ -1,0 +1,196 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient } from "@/../generated/prisma/client";
+import { encryptJson } from "@/api/lib/crypto";
+import type { VerifiedToken } from "@/modules/mcp/oauth/tokens";
+import {
+  agentGet,
+  apiKeyList,
+  instanceList,
+  toolList,
+  vaultList,
+} from "@/modules/mcp/read";
+import { seedChatwootInstance } from "../utils/chatwoot";
+
+// MCP read tools: the read gate (mcp:read scope + tenant target) is DB-free and always runs; the
+// projections + tenant fencing + secret redaction need a real Postgres (skipIf).
+
+function principal(over: Partial<VerifiedToken>): VerifiedToken {
+  return {
+    userId: 1n,
+    tenantId: 1n,
+    role: "TENANT_ADMIN",
+    scopes: ["mcp:read", "mcp:write"],
+    clientId: "c",
+    jti: "j",
+    ...over,
+  };
+}
+
+describe("MCP read gate (no DB)", () => {
+  test("missing mcp:read scope → insufficient_scope before any DB access", async () => {
+    const r = await agentGet(principal({ scopes: [] }), { agent_id: "1" });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("insufficient_scope");
+  });
+
+  test("tenant-less SUPER_ADMIN → no tenant target", async () => {
+    const r = await toolList(
+      principal({ tenantId: null, role: "SUPER_ADMIN" }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("no tenant target");
+  });
+
+  test("invalid agent_id → error", async () => {
+    const r = await agentGet(principal({}), { agent_id: "not-a-number" });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("invalid agent_id");
+  });
+});
+
+const appUrl = process.env.TEST_APP_DATABASE_URL;
+const suUrl = process.env.MIGRATION_DATABASE_URL;
+let dbUp = false;
+let su: PrismaClient | undefined;
+let app: PrismaClient | undefined;
+if (appUrl && suUrl) {
+  try {
+    su = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: suUrl }),
+    });
+    await su.$queryRaw`SELECT 1`;
+    app = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: appUrl }),
+    });
+    await app.$queryRaw`SELECT 1`;
+    dbUp = true;
+  } catch {
+    dbUp = false;
+  }
+}
+const appDb = app as PrismaClient;
+const suDb = su as PrismaClient;
+
+describe.skipIf(!dbUp)("MCP read tools (DB)", () => {
+  let tenantA = 0n;
+  let tenantB = 0n;
+  let agentA = 0n;
+
+  beforeAll(async () => {
+    const a = await suDb.tenant.create({
+      data: { name: "RA", slug: `r-a-${process.pid}` },
+    });
+    tenantA = a.id;
+    const b = await suDb.tenant.create({
+      data: { name: "RB", slug: `r-b-${process.pid}` },
+    });
+    tenantB = b.id;
+    const ag = await suDb.agent.create({
+      data: { tenantId: tenantA, name: "Reader", systemPrompt: "hi" },
+    });
+    agentA = ag.id;
+    await suDb.vaultEntry.create({
+      data: {
+        tenantId: tenantA,
+        name: "openai-key",
+        kind: "generic",
+        secret: encryptJson("sk-super-secret"),
+      },
+    });
+    await seedChatwootInstance(suDb, {
+      tenantId: tenantA,
+      accountId: 7,
+      baseUrl: "https://chat.example.com",
+      adminToken: encryptJson("cw-admin-token"),
+      accountName: "Acct",
+    });
+  });
+
+  afterAll(async () => {
+    for (const tid of [tenantA, tenantB]) {
+      if (!tid) continue;
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM chatwoot_instances WHERE tenant_id = ${tid}`,
+      );
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM vault_entries WHERE tenant_id = ${tid}`,
+      );
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM agents WHERE tenant_id = ${tid}`,
+      );
+      await suDb.$executeRawUnsafe(`DELETE FROM tenants WHERE id = ${tid}`);
+    }
+    await suDb.$disconnect();
+    await appDb.$disconnect();
+  });
+
+  test("agent_get returns the agent for its tenant", async () => {
+    const r = await agentGet(
+      principal({ tenantId: tenantA }),
+      { agent_id: String(agentA) },
+      { base: appDb },
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      const agent = r.data.agent as { id: string; name: string };
+      expect(agent.id).toBe(String(agentA));
+      expect(agent.name).toBe("Reader");
+    }
+  });
+
+  test("agent_get is tenant-fenced (other tenant → not found)", async () => {
+    const r = await agentGet(
+      principal({ tenantId: tenantB }),
+      { agent_id: String(agentA) },
+      { base: appDb },
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("not found");
+  });
+
+  test("instance_list redacts the admin token (hasAdminToken, never adminToken)", async () => {
+    const r = await instanceList(principal({ tenantId: tenantA }), {
+      base: appDb,
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      // Token presence is deployment-level now (one deployment, N accounts); accounts carry no token.
+      const deployment = r.data.deployment as Record<string, unknown>;
+      expect(deployment.hasAdminToken).toBe(true);
+      expect(deployment.adminToken).toBeUndefined();
+      const accounts = r.data.accounts as Record<string, unknown>[];
+      expect(accounts.length).toBe(1);
+      // The plaintext token must not leak anywhere in the payload.
+      expect(JSON.stringify(r.data)).not.toContain("cw-admin-token");
+    }
+  });
+
+  test("vault_list returns names/kinds but never the secret value", async () => {
+    const r = await vaultList(principal({ tenantId: tenantA }), {
+      base: appDb,
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      const entries = r.data.entries as Record<string, unknown>[];
+      const mine = entries.find((e) => e.name === "openai-key");
+      expect(mine).toBeDefined();
+      expect(mine?.kind).toBe("generic");
+      expect(JSON.stringify(r.data)).not.toContain("sk-super-secret");
+    }
+  });
+
+  test("tool_list is empty + tenant-fenced for a fresh tenant", async () => {
+    const r = await toolList(principal({ tenantId: tenantB }), { base: appDb });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect((r.data.tools as unknown[]).length).toBe(0);
+  });
+
+  test("api_key_list returns no secrets for a fresh tenant", async () => {
+    const r = await apiKeyList(principal({ tenantId: tenantB }), {
+      base: appDb,
+    });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(Array.isArray(r.data.apiKeys)).toBe(true);
+  });
+});

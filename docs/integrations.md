@@ -1,0 +1,58 @@
+# Integrations: catalog, generic inbound receptor & mappers
+
+Integrations that are "tools the agent uses" present themselves at the **data/config layer**, not in source, whenever possible. Chatwoot is the justified exception (core, high volume, deep domain wiring; its own dedicated module). Asaas, Calendar and similar are **not** modules: they are catalog entries + (outbound) declarative toolpacks + one (inbound) pure mapper over the generic substrate built here.
+
+## Catalog (`src/modules/integrations/catalog.ts`)
+
+A catalog entry is data, one of three `kind`s:
+
+- `TOOLPACK` — declarative HTTP tools (the `ToolDefinition` mechanism). The path for Asaas outbound (`payment_link_create`, `status`). Not MCP, not a module. **n8n-style model** (`src/graph/tools/http.ts`): each `inputSchema` field has a `source` — `ai` (the model fills it; in the tool schema) or `fixed` (a constant / `{{context}}` template sent without the model). Context (`conversation_id`, `contact_name`, …) and the credential (`{{secret}}`) are interpolated into fixed values, headers, the URL path/query and a raw body, all server-side — the secret never enters the model schema/return or a trace (the origin pin keeps `{{secret}}` out of the host). `ToolDefinition.body` (`{mode:"fields"|"raw", raw?}`) picks JSON-from-fields vs a hand-written body. When an ack is configured the tool exposes an optional `__wait_message` the model may fill (consumed for the ack, never sent). The structured editor lives in `resources/ToolsPanel.tsx`.
+- `MCP` — an external MCP server we **consume** (`McpServerConnection` + `@langchain/mcp-adapters`).
+- `NATIVE` — a source module. Only when justified (Chatwoot; deep-domain integrations).
+
+`IntegrationInstance.catalogType` is a plain `String` validated against this in-code registry (`isKnownCatalogType`), **not** a DB enum — a new integration needs no enum migration. Seeded entries: `GENERIC`, `ASAAS`, `GOOGLE_CALENDAR`. An entry may exist before its mapper ships; until then inbound for it fails closed (durable `FAILED` record + log).
+
+## Generic inbound receptor (`src/modules/webhooks/inbound/`)
+
+The n8n-style webhook node, generalized — but the **mapping lands in a CLOSED set of our domain events** (`conversion`, `status_update`, `agent_nudge`), never arbitrary action. We are an app; `n8n-export` covers arbitrary automation.
+
+Endpoint: `POST /api/v1/integrations/inbound/:routeToken` (`integrations.controller.ts`). **JWT-less by design** — not behind `tenancyPlugin`/`requireAuth`; the route token resolves the tenant and the per-instance strategy authenticates. POST only, so the GET 404 guards and the SPA catch-all never apply (smoke-tested in `tests/api/v1/carveout.test.ts`).
+
+Flow (`receiveInbound` → ack; `processInboundDelivery` → detached async):
+
+1. **Resolve tenant by route token.** The token is an opaque 256-bit value; only its SHA-256 hash is stored (`IntegrationInstance.routeTokenHash`, unique), so lookup is a constant-time B-tree probe (no linear scan / timing oracle) and a DB dump yields no usable token. The plaintext is returned **once** at creation (`createIntegrationInstance`) and never logged. Resolution is cross-tenant → `asSuperAdmin`.
+2. **Verify auth AFTER resolving the tenant** (so the secret read is tenant-scoped). Strategies: `NONE` | `STATIC_HEADER` | `HMAC_SHA256` (secret from the vault by `inboundSecretRef`; header names overridable per instance via `config`, because providers dictate their own). Unknown token, disabled instance, and bad auth all return the **same uniform 401** (no oracle for which tokens are live).
+3. **Ack fast (<5s), process async.** A slow/non-2xx ack makes some providers (Chatwoot) auto-escalate `pending→open`. `receiveInbound` does the cheap work (resolve, auth, normalize, persist) and returns; the controller fires `processInboundDelivery` detached.
+4. **Normalize via the integration's pure mapper** (below). `null` → ignored (no persistence).
+5. **Persist an idempotent `InboundDelivery`** — unique `(tenantId, integrationInstanceId, dedupeKey)`. The stored `payload` is the mapper's **allowlisted** projection (PII-bearing; never the raw external JSON, never echoed in logs/audit). A duplicate returns the existing id.
+6. **Dispatch** (`processInboundDelivery`) under a status CAS (`PENDING→PROCESSING→PROCESSED`, re-entry is a no-op). `conversion` → correlate `externalId`→thread via `IntegrationExternalRef` then record `ConversionEvent` idempotently (`ON CONFLICT DO NOTHING`, so the surrounding tx stays alive); an uncorrelated/duplicate conversion is dropped with a log, never invented. `status_update`/`agent_nudge` are declared **seams** (Fases 3/4), no-op for now.
+
+## Mappers (`src/modules/integrations/mappers.ts`)
+
+A mapper is a **pure translator**: `(raw: unknown) => NormalizedInboundEvent | null`. No DB, no network, no LLM (correlation/idempotency/dispatch happen in the receptor around it). It returns `{ kind, externalId, dedupeKey, occurredAt?, ...allowlisted fields }` or `null` to ignore. Shape validated with zod per integration.
+
+- **Correlation is by primary key, not LLM.** `externalId` (created at outbound time in `IntegrationExternalRef`) is looked up to recover the thread. An agent-as-mapper was rejected: hallucinated correlation of financial data is a privacy incident, breaks idempotency, taxes the <5s ack, and turns an untrusted external payload → LLM → tools into a prompt-injection vector. The LLM is never in the correlation critical path.
+- **Why code, not a runtime DSL:** inbound processes untrusted external bytes (larger attack surface than outbound); the long tail of providers resists a DSL (inner-platform); and the set of real mapper authors is small and is us. ~15 lines, type-safe, unit-testable, injection-bounded. A future sandboxed `declarativeMapper(config)` can slot in behind the same `InboundMapper` interface if a non-us author ever needs it — not built now.
+- **Registry**, keyed by `catalogType`. Adding an integration = a catalog entry + a mapper + a zod schema + a `registerMapper` line; the core (route-token, auth, ack/async, idempotency, correlation, dispatch) is untouched. `GENERIC` ships now (accepts our normalized shape); Asaas/Calendar mappers ship when those integrations land.
+
+## Known limitations
+
+- **No inbound reprocessor yet.** Dispatch is detached after the ack; if the process crashes before it runs, or `processInboundDelivery` throws (the scoped tx rolls back to `PENDING`, logged via the controller's `.catch`), the `InboundDelivery` row stays `PENDING` with nothing retrying it. The row is durable; a sweep that re-dispatches stranded `PENDING`/`PROCESSING` rows (owned by the scheduler, or a tick mirroring the outbound reaper) is the planned fix. Not silent — it logs — but not yet self-healing.
+- **One `ConversionEvent` per `(tenant, threadId, source)`.** This is the plan's idempotency key. A second *genuine* conversion on the same thread from the same source (e.g. a renewal) is dropped by `skipDuplicates`. Acceptable for the MVP; revisit (add a discriminator) if multi-conversion threads become a real funnel case.
+- **Auth timing oracle (low).** An unknown/disabled token returns after one lookup; a bad-auth attempt does an extra scoped read + HMAC, so response timing differs. The 256-bit token space makes candidate enumeration infeasible, so the oracle's value is marginal; uniform-work hardening is deferred.
+
+## `agentNudge` (declared seam)
+
+After the deterministic core (resolve → PK correlation → status CAS → mechanical effects), a domain event of kind `agent_nudge` will inject a **normalized, sanitized** system event into the conversation's LangGraph thread, where the agent decides whether to follow up. Guardrails to be enforced when wired: assignment gate (human handling ⇒ private note, not a customer message), idempotent on the transition (CAS before the nudge), the LLM sees our normalized enum/value (never raw external JSON), a suspended `interrupt()` defers the nudge, and proactive output passes follow-up + business-hours policy. The injection must happen **outside** the processing transaction (network/async).
+
+## Google Calendar toolpack — per-customer isolation (`src/modules/integrations/toolpacks/google-calendar.ts`)
+
+One clinic calendar serves MANY WhatsApp contacts, so every event the agent creates is stamped with `extendedProperties.private.secv4Contact = "<tenantId>:<contactDbId>"` — **injected from the trusted context, never a model arg**. Reads/writes are isolated three ways, **fail-closed**:
+
+- **List** filters server-side by `privateExtendedProperty=secv4Contact=<stamp>` AND re-verifies each returned event's stamp client-side (`eventStamp(e) === stamp`). The re-verify is defense in depth; when it drops an event the server fence already should have excluded, it logs `gcal: list re-verify dropped events…` (a non-zero `dropped` count is a signal the fence is leaking). With no contact in scope (playground) the per-contact tools refuse outright.
+- **Update / cancel** re-fetch the event (`?fields=extendedProperties`) and refuse with `FOREIGN_EVENT` unless the stamp matches, so an id-guess can never touch another contact's (or a staff-created) appointment.
+- **Availability** is `freeBusy` (busy windows only, zero details) → another contact's bookings count as busy without leaking anything; it returns EVERY bookable slot in a range capped to 24h.
+
+**Legacy/staff events without a stamp are invisible to the agent by design** (the list fence and the re-verify both exclude them; update/cancel refuse them) — not a bug, the cost of fail-closed.
+
+**Deploy gotcha:** `registerToolpack` runs at **import time**, so a hot-reload may keep an old toolpack build in memory. A stale process (pre-isolation code still running) is what masked the isolation in an early live test — **restart the process on deploy**, do not rely on hot-reload for toolpack changes (see `docs/deploy.md`).

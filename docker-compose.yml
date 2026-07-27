@@ -1,0 +1,24 @@
+services:
+  postgres:
+    # pgvector image (NOT plain postgres): the schema needs CREATE EXTENSION vector. pg17 matches
+    # the validated isolation spike.
+    image: pgvector/pgvector:pg17
+    container_name: agents-postgres
+    restart: unless-stopped
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: secretaria_v4_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d secretaria_v4_db']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+    driver: local

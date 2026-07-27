@@ -1,0 +1,578 @@
+import basePrisma from "@/api/lib/prisma";
+import { AppError } from "@/lib/errors";
+import {
+  createDocument,
+  deleteDocument,
+  getDocument,
+  reindexKnowledgeBase,
+  retryDocument,
+} from "@/modules/rag/documents";
+import {
+  approveApprovalItem,
+  createKnowledgeBase,
+  deleteKnowledgeBase,
+  editApprovalItem,
+  getKnowledgeBase,
+  listPendingApprovals,
+  rejectApprovalItem,
+  updateKnowledgeBase,
+} from "@/modules/rag/service";
+import type { VerifiedToken } from "./oauth/tokens";
+import {
+  consoleUrl,
+  diffFields,
+  err,
+  gate,
+  ok,
+  recordMcpAudit,
+  truncForAudit,
+  type WriteDeps,
+  type WriteResult,
+} from "./write";
+
+// MCP knowledge write tools: knowledge bases, document ingestion (by TEXT — binary upload
+// stays UI-only), and the suggestion-approval queue. Spine: gate (mcp:write + tenant) → dry-run
+// preview by default → apply + audit. No secrets here, so no credential resolution.
+
+function failOf(e: unknown): WriteResult {
+  if (e instanceof AppError) return err(e.message);
+  throw e;
+}
+
+function parseId(raw: string, label: string): bigint | WriteResult {
+  try {
+    return BigInt(raw);
+  } catch {
+    return err(`invalid ${label}`);
+  }
+}
+
+// ── knowledge bases ──
+
+export async function knowledgeCreate(
+  principal: VerifiedToken,
+  args: {
+    name: string;
+    description?: string;
+    embedding_model?: string;
+    dry_run?: boolean;
+  },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = gate(principal);
+  if ("ok" in ctx) return ctx;
+  const tenantId = ctx.tenantId as bigint;
+  try {
+    if (args.dry_run !== false) {
+      return ok({
+        dryRun: true,
+        action: "create",
+        resource: "knowledge_base",
+        preview: {
+          name: args.name,
+          description: args.description ?? null,
+          embeddingModel: args.embedding_model ?? "(tenant default)",
+        },
+      });
+    }
+    const created = await createKnowledgeBase({
+      tenantId,
+      name: args.name,
+      description: args.description,
+      embeddingModel: args.embedding_model,
+      base,
+    });
+    const target = `knowledge_base:${created.id}`;
+    await recordMcpAudit(ctx, base, {
+      actorId: principal.userId,
+      actorType: "mcp",
+      action: "mcp.knowledge_create",
+      target,
+      before: null,
+      after: truncForAudit({ id: String(created.id), name: args.name }),
+    });
+    return ok({ dryRun: false, applied: true, id: String(created.id), target });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+export async function knowledgeUpdate(
+  principal: VerifiedToken,
+  args: {
+    knowledge_base_id: string;
+    name?: string;
+    description?: string | null;
+    chunk_size?: number;
+    chunk_overlap?: number;
+    dry_run?: boolean;
+  },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = gate(principal);
+  if ("ok" in ctx) return ctx;
+  const tenantId = ctx.tenantId as bigint;
+  const id = parseId(args.knowledge_base_id, "knowledge_base_id");
+  if (typeof id !== "bigint") return id;
+  const patch: {
+    name?: string;
+    description?: string | null;
+    chunkSize?: number;
+    chunkOverlap?: number;
+  } = {};
+  if (args.name !== undefined) patch.name = args.name;
+  if (args.description !== undefined) patch.description = args.description;
+  if (args.chunk_size !== undefined) patch.chunkSize = args.chunk_size;
+  if (args.chunk_overlap !== undefined) patch.chunkOverlap = args.chunk_overlap;
+  if (Object.keys(patch).length === 0) {
+    return err(
+      "no updatable fields provided (name, description, chunk_size, chunk_overlap)",
+    );
+  }
+  try {
+    const current = await getKnowledgeBase({ tenantId, id, base });
+    const target = `knowledge_base:${id}`;
+    const beforeProj = {
+      name: current.name,
+      description: current.description,
+    };
+    if (args.dry_run !== false) {
+      const previewAfter = {
+        name: patch.name ?? current.name,
+        description:
+          patch.description === undefined
+            ? current.description
+            : patch.description,
+      };
+      return ok({
+        dryRun: true,
+        target,
+        diff: diffFields(beforeProj, previewAfter),
+      });
+    }
+    await updateKnowledgeBase({ tenantId, id, ...patch, base });
+    const after = await getKnowledgeBase({ tenantId, id, base });
+    await recordMcpAudit(ctx, base, {
+      actorId: principal.userId,
+      actorType: "mcp",
+      action: "mcp.knowledge_update",
+      target,
+      before: truncForAudit(beforeProj),
+      after: truncForAudit({
+        name: after.name,
+        description: after.description,
+      }),
+    });
+    return ok({ dryRun: false, applied: true, target });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+export async function knowledgeDelete(
+  principal: VerifiedToken,
+  args: { knowledge_base_id: string; dry_run?: boolean },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = gate(principal);
+  if ("ok" in ctx) return ctx;
+  const tenantId = ctx.tenantId as bigint;
+  const id = parseId(args.knowledge_base_id, "knowledge_base_id");
+  if (typeof id !== "bigint") return id;
+  try {
+    const current = await getKnowledgeBase({ tenantId, id, base });
+    const target = `knowledge_base:${id}`;
+    const beforeProj = { id: String(current.id), name: current.name };
+    if (args.dry_run !== false) {
+      return ok({
+        dryRun: true,
+        action: "delete",
+        target,
+        current: beforeProj,
+      });
+    }
+    await deleteKnowledgeBase({ tenantId, id, base });
+    await recordMcpAudit(ctx, base, {
+      actorId: principal.userId,
+      actorType: "mcp",
+      action: "mcp.knowledge_delete",
+      target,
+      before: truncForAudit(beforeProj),
+      after: null,
+    });
+    return ok({ dryRun: false, applied: true, target });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+// ── documents (text ingestion; binary upload stays UI-only) ──
+
+export async function knowledgeDocumentCreate(
+  principal: VerifiedToken,
+  args: {
+    knowledge_base_id: string;
+    title: string;
+    text: string;
+    dry_run?: boolean;
+  },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = gate(principal);
+  if ("ok" in ctx) return ctx;
+  const tenantId = ctx.tenantId as bigint;
+  const kbId = parseId(args.knowledge_base_id, "knowledge_base_id");
+  if (typeof kbId !== "bigint") return kbId;
+  try {
+    if (args.dry_run !== false) {
+      return ok({
+        dryRun: true,
+        action: "create",
+        resource: "knowledge_document",
+        preview: {
+          knowledgeBaseId: String(kbId),
+          title: args.title,
+          textChars: args.text.length,
+        },
+      });
+    }
+    const created = await createDocument({
+      tenantId,
+      knowledgeBaseId: kbId,
+      title: args.title,
+      text: args.text,
+      sourceType: "text",
+      base,
+    });
+    const target = `knowledge_document:${created.id}`;
+    await recordMcpAudit(ctx, base, {
+      actorId: principal.userId,
+      actorType: "mcp",
+      action: "mcp.knowledge_document_create",
+      target,
+      before: null,
+      after: truncForAudit({
+        id: String(created.id),
+        knowledgeBaseId: String(kbId),
+        title: args.title,
+      }),
+    });
+    return ok({
+      dryRun: false,
+      applied: true,
+      id: String(created.id),
+      status: created.status,
+      note: "Document queued for embedding (async); poll knowledge_documents_list for status.",
+    });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+export async function knowledgeDocumentDelete(
+  principal: VerifiedToken,
+  args: { document_id: string; dry_run?: boolean },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = gate(principal);
+  if ("ok" in ctx) return ctx;
+  const tenantId = ctx.tenantId as bigint;
+  const id = parseId(args.document_id, "document_id");
+  if (typeof id !== "bigint") return id;
+  try {
+    const current = await getDocument(tenantId, id, base);
+    const target = `knowledge_document:${id}`;
+    const beforeProj = { id: String(current.id), title: current.title };
+    if (args.dry_run !== false) {
+      return ok({
+        dryRun: true,
+        action: "delete",
+        target,
+        current: beforeProj,
+      });
+    }
+    await deleteDocument(tenantId, id, base);
+    await recordMcpAudit(ctx, base, {
+      actorId: principal.userId,
+      actorType: "mcp",
+      action: "mcp.knowledge_document_delete",
+      target,
+      before: truncForAudit(beforeProj),
+      after: null,
+    });
+    return ok({ dryRun: false, applied: true, target });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+export async function knowledgeDocumentRetry(
+  principal: VerifiedToken,
+  args: { document_id: string; dry_run?: boolean },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = gate(principal);
+  if ("ok" in ctx) return ctx;
+  const tenantId = ctx.tenantId as bigint;
+  const id = parseId(args.document_id, "document_id");
+  if (typeof id !== "bigint") return id;
+  try {
+    const current = await getDocument(tenantId, id, base);
+    const target = `knowledge_document:${id}`;
+    if (args.dry_run !== false) {
+      return ok({
+        dryRun: true,
+        action: "retry",
+        target,
+        currentStatus: current.status,
+        note: "Re-queues a FAILED document for embedding.",
+      });
+    }
+    await retryDocument(tenantId, id, base);
+    await recordMcpAudit(ctx, base, {
+      actorId: principal.userId,
+      actorType: "mcp",
+      action: "mcp.knowledge_document_retry",
+      target,
+      before: truncForAudit({ status: current.status }),
+      after: truncForAudit({ status: "PENDING" }),
+    });
+    return ok({ dryRun: false, applied: true, target });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+// Bulk re-index a whole base in one call (the "index all" for an imported base). If the tenant's
+// embedding credential is unconfigured or its secret is not filled yet, nothing is queued and the
+// result is `blocked` (with a fillAt deeplink for a pending credential) — a missing prerequisite, not
+// an error. include_failed also recovers genuine FAILED docs (a batched per-document retry).
+export async function knowledgeReindex(
+  principal: VerifiedToken,
+  args: {
+    knowledge_base_id: string;
+    include_failed?: boolean;
+    dry_run?: boolean;
+  },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = gate(principal);
+  if ("ok" in ctx) return ctx;
+  const tenantId = ctx.tenantId as bigint;
+  const id = parseId(args.knowledge_base_id, "knowledge_base_id");
+  if (typeof id !== "bigint") return id;
+  const target = `knowledge_base:${id}`;
+  try {
+    const dryRun = args.dry_run !== false;
+    const result = await reindexKnowledgeBase(tenantId, id, base, {
+      includeFailed: args.include_failed === true,
+      dryRun,
+    });
+    if (result.blocked) {
+      const fillAt =
+        result.blocked.vaultId != null
+          ? consoleUrl(`/resources/vault?fill=${result.blocked.vaultId}`)
+          : undefined;
+      return ok({
+        dryRun,
+        applied: false,
+        target,
+        queued: 0,
+        blocked: result.blocked.reason,
+        credentialRef: result.blocked.credentialRef,
+        fillAt,
+        note:
+          result.blocked.reason === "embedding_not_configured"
+            ? "Embedding is not configured for this tenant. Set tenant embedding settings (provider/model/credential) via tenant_settings_update, then re-run."
+            : "The embedding credential's secret is not filled yet. Open fillAt in the console to paste it, then re-run.",
+      });
+    }
+    if (dryRun) {
+      return ok({
+        dryRun: true,
+        target,
+        wouldQueue: result.queued,
+        note: "Re-queues UNINDEXED documents (add include_failed to also recover FAILED). Acts ONLY when dry_run is false.",
+      });
+    }
+    await recordMcpAudit(ctx, base, {
+      actorId: principal.userId,
+      actorType: "mcp",
+      action: "mcp.knowledge_reindex",
+      target,
+      before: {},
+      after: truncForAudit({
+        queued: result.queued,
+        includeFailed: args.include_failed === true,
+      }),
+    });
+    return ok({ dryRun: false, applied: true, target, queued: result.queued });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+// ── suggestion approval queue ──
+
+async function findApproval(
+  tenantId: bigint,
+  id: bigint,
+  base: Parameters<typeof listPendingApprovals>[1],
+) {
+  const all = await listPendingApprovals(tenantId, base);
+  return all.find((a) => a.id === String(id)) ?? null;
+}
+
+export async function knowledgeApprove(
+  principal: VerifiedToken,
+  args: { approval_id: string; dry_run?: boolean },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = gate(principal);
+  if ("ok" in ctx) return ctx;
+  const tenantId = ctx.tenantId as bigint;
+  const id = parseId(args.approval_id, "approval_id");
+  if (typeof id !== "bigint") return id;
+  const target = `approval:${id}`;
+  try {
+    if (args.dry_run !== false) {
+      const item = await findApproval(tenantId, id, base);
+      if (!item) return err("approval not found or not pending");
+      return ok({
+        dryRun: true,
+        action: "approve",
+        target,
+        proposedTitle: item.proposedTitle,
+        knowledgeBaseId: item.knowledgeBaseId,
+      });
+    }
+    const result = await approveApprovalItem({ tenantId, id, base });
+    if (result.outcome === "approved") {
+      await recordMcpAudit(ctx, base, {
+        actorId: principal.userId,
+        actorType: "mcp",
+        action: "mcp.knowledge_approve",
+        target,
+        before: null,
+        after: truncForAudit({
+          outcome: result.outcome,
+          chunks: result.chunks,
+        }),
+      });
+    }
+    return ok({ dryRun: false, applied: true, target, result });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+export async function knowledgeReject(
+  principal: VerifiedToken,
+  args: { approval_id: string; dry_run?: boolean },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = gate(principal);
+  if ("ok" in ctx) return ctx;
+  const tenantId = ctx.tenantId as bigint;
+  const id = parseId(args.approval_id, "approval_id");
+  if (typeof id !== "bigint") return id;
+  const target = `approval:${id}`;
+  try {
+    if (args.dry_run !== false) {
+      const item = await findApproval(tenantId, id, base);
+      if (!item) return err("approval not found or not pending");
+      return ok({
+        dryRun: true,
+        action: "reject",
+        target,
+        proposedTitle: item.proposedTitle,
+      });
+    }
+    const outcome = await rejectApprovalItem({ tenantId, id, base });
+    if (outcome === "rejected") {
+      await recordMcpAudit(ctx, base, {
+        actorId: principal.userId,
+        actorType: "mcp",
+        action: "mcp.knowledge_reject",
+        target,
+        before: null,
+        after: truncForAudit({ outcome }),
+      });
+    }
+    return ok({ dryRun: false, applied: true, target, outcome });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+export async function knowledgeEdit(
+  principal: VerifiedToken,
+  args: {
+    approval_id: string;
+    title?: string;
+    content?: string;
+    rationale?: string;
+    dry_run?: boolean;
+  },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = gate(principal);
+  if ("ok" in ctx) return ctx;
+  const tenantId = ctx.tenantId as bigint;
+  const id = parseId(args.approval_id, "approval_id");
+  if (typeof id !== "bigint") return id;
+  if (
+    args.title === undefined &&
+    args.content === undefined &&
+    args.rationale === undefined
+  ) {
+    return err("no updatable fields provided (title, content, rationale)");
+  }
+  const target = `approval:${id}`;
+  try {
+    if (args.dry_run !== false) {
+      const item = await findApproval(tenantId, id, base);
+      if (!item) return err("approval not found or not pending");
+      return ok({
+        dryRun: true,
+        action: "edit",
+        target,
+        next: {
+          title: args.title ?? item.proposedTitle,
+          rationale: args.rationale ?? item.rationale,
+        },
+      });
+    }
+    const outcome = await editApprovalItem({
+      tenantId,
+      id,
+      proposedTitle: args.title,
+      proposedContent: args.content,
+      rationale: args.rationale,
+      base,
+    });
+    if (outcome === "updated") {
+      await recordMcpAudit(ctx, base, {
+        actorId: principal.userId,
+        actorType: "mcp",
+        action: "mcp.knowledge_edit",
+        target,
+        before: null,
+        after: truncForAudit({ outcome, title: args.title }),
+      });
+    }
+    return ok({ dryRun: false, applied: true, target, outcome });
+  } catch (e) {
+    return failOf(e);
+  }
+}

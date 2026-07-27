@@ -1,0 +1,187 @@
+import { describe, expect, test } from "bun:test";
+import { computeConfigIssues } from "@/client/lib/configHealth";
+
+// Phase E: detect features turned on without the credential they need (the import that strips
+// secrets is the common trigger), each carrying a deep-link target (tab + section anchor).
+const base = {
+  modelProvider: "openai",
+  modelCredentialRef: "vault:1",
+  sttEnabled: false,
+  sttCredentialRef: "",
+  ttsMode: "never",
+  ttsCredentialRef: "",
+  visionEnabled: false,
+  visionCredentialRef: "",
+};
+
+describe("computeConfigIssues", () => {
+  test("a fully-credentialed agent has no issues", () => {
+    expect(computeConfigIssues(base)).toEqual([]);
+  });
+
+  test("flags a model with no credential, deep-linking to general/general-model", () => {
+    const issues = computeConfigIssues({ ...base, modelCredentialRef: "" });
+    expect(issues).toEqual([
+      { key: "model", tab: "general", sectionId: "general-model" },
+    ]);
+  });
+
+  test("does NOT flag an openai-compatible model without a credential (base URL auth)", () => {
+    const issues = computeConfigIssues({
+      ...base,
+      modelProvider: "openai-compatible",
+      modelCredentialRef: "",
+    });
+    expect(issues).toEqual([]);
+  });
+
+  test("flags STT/TTS/vision enabled without a credential, each to its behavior section", () => {
+    const issues = computeConfigIssues({
+      ...base,
+      sttEnabled: true,
+      ttsMode: "mirror",
+      visionEnabled: true,
+    });
+    expect(issues.map((i) => i.key).sort()).toEqual(["stt", "tts", "vision"]);
+    expect(issues.every((i) => i.tab === "behavior")).toBe(true);
+    expect(issues.find((i) => i.key === "tts")?.sectionId).toBe("tts");
+  });
+
+  test("does NOT flag an enabled feature that already has a credential", () => {
+    const issues = computeConfigIssues({
+      ...base,
+      sttEnabled: true,
+      sttCredentialRef: "vault:9",
+      ttsMode: "mirror",
+      ttsCredentialRef: "vault:8",
+    });
+    expect(issues).toEqual([]);
+  });
+
+  test("flags a referenced-but-pending model credential as pending, with its vaultId", () => {
+    const issues = computeConfigIssues({
+      ...base,
+      pendingRefs: new Set(["vault:1"]),
+    });
+    expect(issues).toEqual([
+      {
+        key: "model",
+        tab: "general",
+        sectionId: "general-model",
+        pending: true,
+        vaultId: "1",
+      },
+    ]);
+  });
+
+  test("flags an enabled feature wired to a pending credential (stt/tts)", () => {
+    const issues = computeConfigIssues({
+      ...base,
+      sttEnabled: true,
+      sttCredentialRef: "vault:9",
+      ttsMode: "mirror",
+      ttsCredentialRef: "vault:8",
+      pendingRefs: new Set(["vault:8", "vault:9"]),
+    });
+    const stt = issues.find((i) => i.key === "stt");
+    const tts = issues.find((i) => i.key === "tts");
+    expect(stt).toMatchObject({ pending: true, vaultId: "9" });
+    expect(tts).toMatchObject({ pending: true, vaultId: "8" });
+  });
+
+  test("a filled credential not in pendingRefs is not flagged", () => {
+    const issues = computeConfigIssues({
+      ...base,
+      pendingRefs: new Set(["vault:999"]),
+    });
+    expect(issues).toEqual([]);
+  });
+});
+
+describe("computeConfigIssues — knowledge indexing gated by embedding", () => {
+  const needsIndex = { knowledgeBasesNeedingIndex: [{ id: "5", name: "FAQ" }] };
+
+  test("no embedding issue when no base needs indexing", () => {
+    const issues = computeConfigIssues({ ...base, embeddingCredentialRef: "" });
+    expect(issues).toEqual([]);
+  });
+
+  test("a base needing index with embedding UNCONFIGURED raises one embedding issue", () => {
+    const issues = computeConfigIssues({
+      ...base,
+      ...needsIndex,
+      embeddingCredentialRef: "",
+    });
+    expect(issues).toEqual([{ key: "embedding" }]);
+  });
+
+  test("a base needing index with a PENDING embedding credential raises a pending embedding issue", () => {
+    const issues = computeConfigIssues({
+      ...base,
+      ...needsIndex,
+      embeddingCredentialRef: "vault:7",
+      pendingRefs: new Set(["vault:7"]),
+    });
+    expect(issues).toEqual([{ key: "embedding", pending: true, vaultId: "7" }]);
+  });
+
+  test("a base needing index with USABLE embedding raises the per-base knowledge issue, not embedding", () => {
+    const issues = computeConfigIssues({
+      ...base,
+      ...needsIndex,
+      embeddingCredentialRef: "vault:7",
+    });
+    expect(issues).toEqual([
+      { key: "knowledge", knowledgeBaseId: "5", knowledgeBaseName: "FAQ" },
+    ]);
+  });
+});
+
+describe("computeConfigIssues — redirect enabled but incomplete", () => {
+  test("no issue when redirect is off (even with no inboxes)", () => {
+    expect(
+      computeConfigIssues({
+        ...base,
+        redirectEnabled: false,
+        redirectEntryInboxId: "",
+        redirectWidgetInboxId: null,
+      }),
+    ).toEqual([]);
+  });
+
+  test("no issue when redirect is on and both inboxes are set", () => {
+    expect(
+      computeConfigIssues({
+        ...base,
+        redirectEnabled: true,
+        redirectEntryInboxId: "30",
+        redirectWidgetInboxId: 1,
+      }),
+    ).toEqual([]);
+  });
+
+  test("flags redirect on with a missing entry inbox, deep-linking to the Redirect tab", () => {
+    expect(
+      computeConfigIssues({
+        ...base,
+        redirectEnabled: true,
+        redirectEntryInboxId: "",
+        redirectWidgetInboxId: 1,
+      }),
+    ).toEqual([
+      { key: "redirect", tab: "channelRedirect", sectionId: "cr-entry" },
+    ]);
+  });
+
+  test("flags redirect on with a missing widget inbox", () => {
+    const issues = computeConfigIssues({
+      ...base,
+      redirectEnabled: true,
+      redirectEntryInboxId: "30",
+      redirectWidgetInboxId: null,
+    });
+    expect(issues).toEqual([
+      { key: "redirect", tab: "channelRedirect", sectionId: "cr-entry" },
+    ]);
+  });
+});

@@ -1,0 +1,23 @@
+// Flags calls to `t(...)` whose first argument is not a string literal.
+// `i18next-parser` only extracts literal keys, so dynamic calls (identifier,
+// member access, template literal with interpolation, concatenation) need
+// magic comments like `// t('key.path', 'Default')` nearby for the extractor
+// to pick them up. This plugin surfaces the missing-extraction risk at the
+// call site.
+//
+// Limitations:
+// - Does not track `t` passed as prop or aliased via `const x = t`.
+// - Does not flag missing magic comments (the extractor, not the linter,
+//   decides whether a comment is "near enough"). Presence of a dynamic
+//   call is the signal — pair with
+//   `// biome-ignore lint/plugin/no-dynamic-i18n-key` once the magic
+//   comments are in place so only this rule is muted on the next line.
+language js;
+
+`t($first, $...)` where {
+    $first <: not `"$_"`,
+    register_diagnostic(
+        span = $first,
+        message = "Dynamic i18n key: `i18next-parser` won't extract this. Add `// t('key.path', 'Default')` magic comments nearby (same file or any file listed in `i18next-parser.config.cjs`), then `// biome-ignore lint/plugin/no-dynamic-i18n-key: extracted via magic comments` on this call."
+    )
+}

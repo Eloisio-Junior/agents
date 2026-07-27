@@ -1,0 +1,77 @@
+# Deploy
+
+fazer.ai agents is one Bun process (API + bundled SPA + LangGraph runtime + background workers) plus a PostgreSQL with the `pgvector` extension. This doc is the canonical deploy contract; the per-platform sections at the end are thin wrappers over the same model.
+
+## Load-bearing invariants
+
+These are not optional. Two of them are enforced at boot (the process refuses to start when violated), the rest will silently break isolation or migrations if ignored.
+
+### 1. Two database roles (never one)
+
+| Role | Used for | Privilege |
+| --- | --- | --- |
+| **migration/owner** (`MIGRATION_DATABASE_URL`) | `prisma migrate deploy`, `db-bootstrap.ts`, `CREATE EXTENSION vector`, enum/role DDL | superuser or DB owner |
+| **runtime** (`DATABASE_URL`, `LANGGRAPH_DATABASE_URL`) | the running server, every tenant query | **NON-superuser, NON-bypassrls** |
+
+The whole multi-tenant isolation model is Postgres Row-Level Security, and **RLS is a silent no-op for superusers and bypassrls roles**. So the runtime connection must never be privileged. The server calls `assertRuntimeRoleIsNotSuperuser` at boot: in production it **hard-crashes** (crash-loops until the URL is fixed) if the runtime role is superuser/bypassrls (directly or via role membership). Locally you may point `DATABASE_URL` at the superuser and set `ALLOW_SUPERUSER_RUNTIME=true` to downgrade that to a warning — never in production (the flag is ignored when `NODE_ENV=production`).
+
+`FORCE ROW LEVEL SECURITY` is set on every tenant table, so even the table owner is subject to policies — only superuser/bypassrls bypass, which is exactly what the boot guard forbids.
+
+### 2. pgvector image
+
+Postgres must ship the `vector` extension. Use **`pgvector/pgvector:pg17`** (matches the validated isolation spike), not `postgres:17-alpine` — plain Postgres has no `vector` and `CREATE EXTENSION vector` in bootstrap fails.
+
+### 3. Deterministic provisioning, then migrate, then serve
+
+Boot ordering, one-shot per start and safe under restart:
+
+```
+bun scripts/db-bootstrap.ts && bun prisma migrate deploy && exec bun src/index.ts
+```
+
+- **`db-bootstrap.ts`** connects as the migration superuser and provisions exactly the runtime role encoded in `DATABASE_URL` (creates it NON-superuser/NON-bypassrls, grants on existing + future objects via `ALTER DEFAULT PRIVILEGES`, creates the `langgraph` checkpointer schema). It does **not** rely on Postgres `initdb.d`, which only runs on an empty data volume — managed Postgres (Coolify/EasyPanel) provisions the DB for you with no mount, so `initdb.d` never runs and the app role would never exist. The script is the platform-independent mechanism. (For a bare Postgres you control the volume of, `scripts/db-bootstrap.sql` is the equivalent psql script.)
+- **`prisma migrate deploy`** runs as the owner. `prisma.config.ts` prefers `MIGRATION_DATABASE_URL` and substitutes `${POSTGRES_PORT}` manually (the Prisma CLI does not expand it). `prisma` is a runtime **dependency** (not devDependency) so the CLI exists in the `--production` image.
+- **`bun src/index.ts`** runs the server interpreted and connects as the runtime role. We do **not** ship a `bun build --compile` binary: bundling this app trips a Bun heap-corruption bug (pinned to `@elysiajs/static`), so the compiled binary segfaults at boot while the interpreted source is immune. Full investigation + repro in [`bun-compile-segfault.md`](bun-compile-segfault.md).
+
+> **Dev gotcha — grants do not survive a reset.** `prisma migrate reset` (and a `migrate dev` that decides to reset on drift) drops and recreates the `public` schema, wiping the runtime role's grants. The next boot then fails every query with Postgres `42501` (`permission denied for schema public`). Fix: re-run `bun db:bootstrap` (idempotent) and restart. Prefer `bun db:reset`, which chains both. The boot log detects `42501` and prints this exact hint.
+
+Destructive migrations (enum changes, `ACCESS EXCLUSIVE` on `users`) want a maintenance window: on platforms with rolling deploys, run `migrate deploy` as a pre-deploy/one-shot step rather than in every replica's start command.
+
+### 4. Single replica (or one leader)
+
+The realtime pub/sub, the scheduler tick, the debounce worker, the outbound-webhook worker, and the alert-delivery worker are single-process by construction (in-process state + reentrancy guards). **Run one replica.** To scale the web tier: run the extra replicas with `SCHEDULER_WORKER_ENABLED=false`, `WEBHOOK_WORKER_ENABLED=false`, `DEBOUNCE_WORKER_ENABLED=false`, and `ALERT_WORKER_ENABLED=false` (workers off), and keep exactly one "leader" replica with them on. Scaling with workers on every replica causes double-fires and lost cross-replica realtime events (a durable claim / leader election / Redis pub/sub bridge is the post-MVP path).
+
+### 5. CSP / build
+
+Production serves `dist/index.html`; its inline-script hashes are baked into the CSP at build time. Rebuild (`bun run build`) after editing any inline script. Per-tenant theming uses `setProperty` (DOM API, no inline `<style>`) precisely so it does not break the CSP hash.
+
+## Environment variables
+
+See `.env.example` for the full list. Deploy-critical:
+
+- `MIGRATION_DATABASE_URL` — superuser/owner (migrations + bootstrap).
+- `DATABASE_URL` — runtime role (non-superuser). Boot fails if privileged.
+- `LANGGRAPH_DATABASE_URL` — checkpointer pool; use the runtime (non-superuser) role, **not** the migration URL (a superuser checkpointer pool would ignore any future RLS on `langgraph`).
+- `JWT_SECRET`, `ENCRYPTION_KEY` — strong unique secrets. Rotating `ENCRYPTION_KEY` invalidates all encrypted-at-rest data (vault, Chatwoot tokens).
+- `PUBLIC_URL`, `CORS_ORIGIN`, `PORT`.
+- Langfuse is **per-tenant** (a `langfuse` vault entry), never a global env var. To self-host the Langfuse instance itself (optional companion service), use [`deploy/langfuse/`](../deploy/langfuse/): it bundles the **MinIO blob storage that v3 ingestion requires** — the upstream one-click omits it, so reads (and the credential "test") pass while every ingest 500s and traces silently vanish. Coolify (magic vars) + Portainer/generic flavors and a verify-ingestion recipe are in its README.
+
+## Platforms
+
+### Coolify (first-class)
+
+Use `docker-compose.coolify.yml`. Coolify auto-generates the magic env vars:
+
+- `SERVICE_USER_DBUSER` / `SERVICE_PASSWORD_64_DBPASSWORD` — the Postgres superuser (owner; migrations + bootstrap).
+- `SERVICE_USER_APPDBUSER` / `SERVICE_PASSWORD_64_APPDBPASSWORD` — the runtime app role (created by bootstrap).
+- `SERVICE_PASSWORD_64_JWTSECRET`, `SERVICE_PASSWORD_64_ENCRYPTIONKEY`, `SERVICE_URL_AGENTS`.
+
+The compose runs bootstrap → migrate → serve in the app `command`. Keep a single replica.
+
+### Portainer (Tier B)
+
+The onboarding's Tier B adapter drives Portainer over its API and bundles **Caddy** for automatic TLS. Use [`docker-compose.portainer.yml`](../docker-compose.portainer.yml) (self-contained app + Postgres + Caddy; `gen-onboarding-env.ts` fills the `.env`). The full headless flow (install → admin/setup-token → API key → registry creds → `POST /stacks/create/standalone/string` → verify), the brownfield discovery, and the Chatwoot Pro/OSS + Langfuse companions live in the `agents-onboarding` skill (`references/deploy-b-portainer.md`).
+
+### EasyPanel / plain compose
+
+Same model, bring-your-own-proxy. Use [`docker-compose.prod.yml`](../docker-compose.prod.yml) (publishes the app's HTTP port; terminate TLS in front), provide a `pgvector/pgvector:pg17` Postgres, set the two URL pairs (superuser vs app role), and keep the image's bootstrap→migrate→serve command. On EasyPanel set the env vars in the service UI; for a plain VM, `gen-onboarding-env.ts` writes the `.env` and `docker compose -f docker-compose.prod.yml up -d` brings up the stack.

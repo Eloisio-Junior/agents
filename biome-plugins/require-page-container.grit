@@ -1,0 +1,33 @@
+// Page components in `src/client/pages/*.tsx` must render their root JSX
+// inside `<PageContainer>` (from `@/client/components`) so that every app
+// page shares the same max-width and horizontal padding behavior. Without it,
+// pages stretch to full viewport width on ultrawide monitors and drift out
+// of visual alignment with the rest of the app.
+//
+// Scope (configured in `biome.jsonc`):
+//   - `src/client/pages/*.tsx` only. Sub-pages like
+//     `src/client/pages/settings/*.tsx` are intentionally out of scope: their
+//     parent layout already wraps `<Outlet />` in `<PageContainer>`.
+//
+// Exceptions (suppress with
+// `// biome-ignore lint/plugin/require-page-container: <reason>`):
+//   - Auth pages (LoginPage, SignupPage) that render their own centered
+//     layout outside the main app shell.
+//
+// Limitations:
+//   - Only `export function $name() { ... }` is inspected. Arrow exports
+//     (`export const X = () => ...`) are not matched, matching the
+//     convention used by every page in this repo.
+//   - Syntactic check: any `<PageContainer>` JSX element (with children or
+//     self-closing) anywhere in the function body satisfies the rule. Good
+//     enough to catch the common "forgot to wrap" case.
+language js;
+
+`export function $name() { $body }` where {
+    $body <: not contains `<PageContainer $...>$_</PageContainer>`,
+    $body <: not contains `<PageContainer $.../>`,
+    register_diagnostic(
+        span = $name,
+        message = "Page components must render inside <PageContainer>. Import it from `@/client/components` and wrap the root JSX. If this page renders outside the main app shell (e.g. auth pages), suppress with `// biome-ignore lint/plugin/require-page-container: <reason>`."
+    )
+}

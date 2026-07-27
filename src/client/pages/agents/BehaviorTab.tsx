@@ -1,0 +1,1542 @@
+import {
+  AlertTriangle,
+  ArrowRightLeft,
+  CalendarClock,
+  Gauge,
+  Image,
+  Layers,
+  Megaphone,
+  Mic,
+  Plus,
+  Scissors,
+  Trash2,
+  Volume2,
+} from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
+import {
+  Button,
+  ComboBox,
+  type ComboItem,
+  CredentialPicker,
+  FormField,
+  Input,
+  ModelPicker,
+  type ScheduleOption,
+  SchedulePicker,
+  Select,
+  SwitchField,
+  Textarea,
+} from "@/client/components";
+import { api } from "@/client/lib/api";
+import { credentialCompat } from "@/client/lib/credentialCompat";
+import {
+  STT_DEFAULT_MODEL,
+  TTS_DEFAULT_MODEL,
+  TTS_DEFAULT_VOICE,
+  VISION_DEFAULT_MODEL,
+} from "@/client/lib/providerDefaults";
+import { providerLabel } from "@/client/lib/providerLabels";
+import { formatWindowsSummary } from "@/client/lib/schedulePreview";
+import { isValidHttpUrl } from "@/client/lib/validation";
+import { FOLLOW_UP_MAX_STEPS } from "@/modules/followups/settings";
+import { DEFAULT_EXTRACTION_PROMPT } from "@/modules/vision/prompt-default";
+import { Section, SectionNav } from "./SectionNav";
+import { TabActionBar } from "./TabActionBar";
+import type { Hours, VaultEntry } from "./types";
+
+// Transcription providers (mirror src/modules/stt/providers.ts).
+const STT_PROVIDERS = [
+  "openai",
+  "openai-compatible",
+  "gemini",
+  "elevenlabs",
+  "openrouter",
+] as const;
+
+// Audio-reply providers (mirror src/modules/tts/providers). The three reply modes are rendered
+// inline as <option>s below.
+const TTS_PROVIDERS = ["openai", "elevenlabs", "openrouter"] as const;
+
+// Image/document extraction providers (mirror src/modules/vision/providers).
+const VISION_PROVIDERS = [
+  "openai",
+  "openai-compatible",
+  "gemini",
+  "anthropic",
+  "openrouter",
+] as const;
+
+// Curated ISO-639-1 codes offered for the transcription language, plus an "other" escape that
+// reveals a free-text input (any code the provider accepts).
+const STT_LANGUAGES = [
+  "pt",
+  "en",
+  "es",
+  "fr",
+  "de",
+  "it",
+  "nl",
+  "ja",
+  "zh",
+  "ko",
+  "ru",
+  "ar",
+  "hi",
+] as const;
+
+interface DebounceState {
+  enabled: boolean;
+  windowSeconds: string;
+  maxMessagesPerBurst: string;
+  maxWindowSeconds: string;
+}
+
+interface SttState {
+  enabled: boolean;
+  provider: string;
+  model: string;
+  language: string;
+  credentialRef: string;
+  baseURL: string;
+}
+
+interface TtsState {
+  mode: string;
+  provider: string;
+  model: string;
+  voice: string;
+  credentialRef: string;
+  normalize: boolean;
+}
+
+interface SplitState {
+  enabled: boolean;
+  maxChars: string;
+  typingWpm: string;
+  maxDelayMs: string;
+}
+
+interface VisionState {
+  enabled: boolean;
+  provider: string;
+  model: string;
+  credentialRef: string;
+  baseURL: string;
+  extractionPrompt: string;
+}
+
+interface LimitsState {
+  maxToolCalls: string;
+}
+
+interface ServiceWindowState {
+  enabled: boolean;
+  windowHours: string;
+  templateName: string;
+  templateLanguage: string;
+  templateParams: string;
+  templateContent: string;
+}
+
+interface FollowUpStepState {
+  delayValue: string;
+  delayUnit: string;
+  instructions: string;
+  assignLabels: string[]; // labels added to the conversation when this step fires
+  resolve: boolean; // honored only on the last step
+}
+
+interface FollowUpState {
+  enabled: boolean;
+  steps: FollowUpStepState[];
+  pauseWhileAppointment: boolean;
+}
+
+interface BehaviorTabProps {
+  agentId: string;
+  hours: Hours[];
+  businessHoursId: string;
+  setBusinessHoursId: (v: string) => void;
+  followUpHoursId: string;
+  setFollowUpHoursId: (v: string) => void;
+  debounce: DebounceState;
+  setDebounce: React.Dispatch<React.SetStateAction<DebounceState>>;
+  stt: SttState;
+  setStt: React.Dispatch<React.SetStateAction<SttState>>;
+  sttCredBaseUrl: string | null;
+  onSttEntryChange: (entry: VaultEntry | null) => void;
+  tts: TtsState;
+  setTts: React.Dispatch<React.SetStateAction<TtsState>>;
+  split: SplitState;
+  setSplit: React.Dispatch<React.SetStateAction<SplitState>>;
+  vision: VisionState;
+  setVision: React.Dispatch<React.SetStateAction<VisionState>>;
+  visionCredBaseUrl: string | null;
+  onVisionEntryChange: (entry: VaultEntry | null) => void;
+  limits: LimitsState;
+  setLimits: React.Dispatch<React.SetStateAction<LimitsState>>;
+  serviceWindow: ServiceWindowState;
+  setServiceWindow: React.Dispatch<React.SetStateAction<ServiceWindowState>>;
+  followUp: FollowUpState;
+  setFollowUp: React.Dispatch<React.SetStateAction<FollowUpState>>;
+  // True when the WhatsApp→chat redirect is enabled with an inbox wired: the follow-up below is then
+  // suppressed for the redirect's entry + widget inboxes (a callout in the section explains it).
+  redirectSuppressesFollowUp: boolean;
+  onScheduleSaved: (savedId: string, setter: (v: string) => void) => void;
+  dirty: boolean;
+  saving: boolean;
+  onSave: () => void;
+  onDiscard: () => void;
+  onOpenPlayground: () => void;
+}
+
+function toScheduleOption(h: Hours): ScheduleOption {
+  return {
+    id: String(h.id),
+    name: h.name,
+    windows: (h.windows ?? []) as ScheduleOption["windows"],
+    timezone: h.timezone,
+  };
+}
+
+// Service-window HSM template field: a picker populated with the approved templates of the agent's
+// inbox(es) (live from Chatwoot), over a free-text input that stays the source of truth. With no
+// templates (e.g. baileys channels have none) only the input shows, plus a note. Derived Eden type.
+type SwTemplate = NonNullable<
+  Awaited<
+    ReturnType<
+      ReturnType<
+        (typeof api.api.v1.chatwoot)["service-window-templates"]
+      >["get"]
+    >
+  >["data"]
+>["templates"][number];
+
+function ServiceWindowTemplateField({
+  agentId,
+  serviceWindow,
+  setServiceWindow,
+}: {
+  agentId: string;
+  serviceWindow: ServiceWindowState;
+  setServiceWindow: React.Dispatch<React.SetStateAction<ServiceWindowState>>;
+}) {
+  const { t } = useTranslation();
+  const [templates, setTemplates] = useState<SwTemplate[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { data } = await api.api.v1.chatwoot["service-window-templates"]({
+          agentId,
+        }).get();
+        if (!cancelled && data) setTemplates(data.templates);
+      } catch {
+        // best-effort: leave the free-text field as the fallback
+      } finally {
+        if (!cancelled) setLoaded(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId]);
+  return (
+    <FormField
+      label={t("editor.svcWindowTemplate", "Template name (HSM)")}
+      group
+      description={t(
+        "editor.svcWindowTemplateHint",
+        "Approved template sent outside the window. Blank → skip (private note).",
+      )}
+    >
+      <div className="flex flex-col gap-2">
+        {templates.length > 0 && (
+          <Select
+            value={
+              templates.some((x) => x.name === serviceWindow.templateName)
+                ? serviceWindow.templateName
+                : ""
+            }
+            onChange={(e) => {
+              const tpl = templates.find((x) => x.name === e.target.value);
+              if (tpl) {
+                setServiceWindow({
+                  ...serviceWindow,
+                  templateName: tpl.name,
+                  templateLanguage:
+                    tpl.language || serviceWindow.templateLanguage,
+                });
+              }
+            }}
+            aria-label={t("editor.svcWindowTemplate", "Template name (HSM)")}
+          >
+            <option value="">
+              {t(
+                "editor.svcWindowTemplatePick",
+                "Choose an approved template…",
+              )}
+            </option>
+            {templates.map((tpl) => (
+              <option key={tpl.name} value={tpl.name}>
+                {tpl.language ? `${tpl.name} (${tpl.language})` : tpl.name}
+              </option>
+            ))}
+          </Select>
+        )}
+        <Input
+          value={serviceWindow.templateName}
+          onChange={(e) =>
+            setServiceWindow({
+              ...serviceWindow,
+              templateName: e.target.value,
+            })
+          }
+          placeholder="reengajamento"
+        />
+        {loaded && templates.length === 0 && (
+          <span className="text-text-muted text-xs">
+            {t(
+              "editor.svcWindowNoTemplates",
+              "No approved templates found for this agent's inbox. Type a name manually.",
+            )}
+          </span>
+        )}
+      </div>
+    </FormField>
+  );
+}
+
+// TTS voice/model picker backed by the live listing endpoint (item 10): OpenAI returns a curated set,
+// ElevenLabs is fetched with the vault credential so the operator picks a real per-account voice by
+// name. Eager-loads (when it won't error for lack of a credential) so the trigger shows the human
+// label; typing a custom value still works (parity with the old free input).
+function TtsOptionPicker({
+  kind,
+  provider,
+  credentialRef,
+  baseURL,
+  value,
+  onChange,
+  placeholder,
+  ariaLabel,
+}: {
+  kind: "voices" | "models";
+  provider: string;
+  credentialRef?: string;
+  baseURL?: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  ariaLabel: string;
+}) {
+  const { t } = useTranslation();
+  const loaderKey = `${kind}||${provider}||${credentialRef ?? ""}||${baseURL ?? ""}`;
+  const loader = useCallback(async (): Promise<ComboItem[]> => {
+    const { data, error } = await api.api.v1.agents.tts.list.post({
+      provider,
+      kind,
+      credentialRef,
+      baseURL,
+    });
+    if (error || !data) throw new Error("tts list failed");
+    return data.items.map((i) => ({
+      id: i.id,
+      label: i.label ?? undefined,
+      hint: i.label && i.label !== i.id ? i.id : undefined,
+    }));
+  }, [provider, kind, credentialRef, baseURL]);
+  return (
+    <ComboBox
+      value={value}
+      onChange={onChange}
+      loader={loader}
+      loaderKey={loaderKey}
+      eager
+      needsCredential={provider === "elevenlabs" && !credentialRef}
+      placeholder={placeholder}
+      searchPlaceholder={t("common.search", "Search")}
+      aria-label={ariaLabel}
+    />
+  );
+}
+
+type InboxLabelOption = { title: string; color: string | null };
+
+// Multi-select label picker for a follow-up step's "assign label" action (item 4): one ComboBox over
+// the agent inbox's known labels (with their Chatwoot color), where the operator picks any number of
+// labels and can still type one that doesn't exist yet. When the agent spans more than one Chatwoot
+// account (item 5) the label set can't be listed coherently, so it shows a warning and stays free-text.
+function LabelPicker({
+  values,
+  onChange,
+  labels,
+  multiAccount,
+  ariaLabel,
+}: {
+  values: string[];
+  onChange: (v: string[]) => void;
+  labels: InboxLabelOption[];
+  multiAccount: boolean;
+  ariaLabel: string;
+}) {
+  const { t } = useTranslation();
+  return (
+    <div className="flex flex-col gap-1.5">
+      <ComboBox
+        multiple
+        values={values}
+        onChange={onChange}
+        items={labels.map((l) => ({
+          id: l.title,
+          color: l.color ?? undefined,
+        }))}
+        placeholder={t("editor.followUpLabelPlaceholder", "Add a label…")}
+        searchPlaceholder={t("editor.followUpLabelSearch", "Search labels…")}
+        aria-label={ariaLabel}
+      />
+      {multiAccount && (
+        <span className="text-text-muted text-xs">
+          {t(
+            "editor.followUpLabelMultiAccount",
+            "This agent serves more than one Chatwoot account, so labels can't be listed. Type each label exactly as it appears.",
+          )}
+        </span>
+      )}
+    </div>
+  );
+}
+
+// The multi-step follow-up editor: an ordered list of step cards (delay + instructions + optional
+// label, and a resolve toggle on the LAST step). Labels are fetched once per agent from the inbox.
+function FollowUpStepsEditor({
+  agentId,
+  followUp,
+  setFollowUp,
+}: {
+  agentId: string;
+  followUp: FollowUpState;
+  setFollowUp: React.Dispatch<React.SetStateAction<FollowUpState>>;
+}) {
+  const { t } = useTranslation();
+  const [labels, setLabels] = useState<InboxLabelOption[]>([]);
+  const [multiAccount, setMultiAccount] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { data } = await api.api.v1.chatwoot.labels({ agentId }).get();
+        if (!cancelled && data) {
+          setLabels(data.labels);
+          setMultiAccount(data.accountCount > 1);
+        }
+      } catch {
+        // best-effort: leave the free-text field as the fallback
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId]);
+
+  const steps = followUp.steps;
+  const updateStep = (index: number, patch: Partial<FollowUpStepState>) =>
+    setFollowUp((prev) => ({
+      ...prev,
+      steps: prev.steps.map((s, i) => (i === index ? { ...s, ...patch } : s)),
+    }));
+  const addStep = () =>
+    setFollowUp((prev) => ({
+      ...prev,
+      steps: [
+        ...prev.steps,
+        {
+          delayValue: "1",
+          delayUnit: "days",
+          instructions: "",
+          assignLabels: [],
+          resolve: false,
+        },
+      ],
+    }));
+  const removeStep = (index: number) =>
+    setFollowUp((prev) => ({
+      ...prev,
+      steps: prev.steps.filter((_, i) => i !== index),
+    }));
+
+  return (
+    <div className="flex flex-col gap-3">
+      {steps.map((step, index) => {
+        const isLast = index === steps.length - 1;
+        return (
+          <div
+            // biome-ignore lint/suspicious/noArrayIndexKey: steps are positional (no stable id); reorder is add/remove only
+            key={index}
+            className="flex flex-col gap-3 rounded-lg border border-border bg-bg-secondary p-3"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <h5 className="font-medium text-sm text-text-secondary">
+                {t("editor.followUpStep", "Step {{n}}", { n: index + 1 })}
+              </h5>
+              {steps.length > 1 && (
+                <button
+                  type="button"
+                  onClick={() => removeStep(index)}
+                  aria-label={t("editor.followUpRemoveStep", "Remove step")}
+                  className="flex h-7 w-7 items-center justify-center rounded text-text-muted transition-colors hover:text-error"
+                >
+                  <Trash2 className="h-4 w-4" aria-hidden="true" />
+                </button>
+              )}
+            </div>
+            <FormField
+              label={
+                index === 0
+                  ? t("editor.followUpDelay", "Inactivity delay")
+                  : t("editor.followUpStepDelay", "Wait after previous step")
+              }
+              group
+            >
+              <div className="flex items-stretch gap-2">
+                <Input
+                  type="number"
+                  min={1}
+                  value={step.delayValue}
+                  onChange={(e) =>
+                    updateStep(index, { delayValue: e.target.value })
+                  }
+                  className="w-24 text-sm"
+                />
+                <Select
+                  value={step.delayUnit}
+                  onChange={(e) =>
+                    updateStep(index, { delayUnit: e.target.value })
+                  }
+                >
+                  <option value="minutes">
+                    {t("editor.followUpMinutes", "Minutes")}
+                  </option>
+                  <option value="hours">
+                    {t("editor.followUpHoursUnit", "Hours")}
+                  </option>
+                  <option value="days">
+                    {t("editor.followUpDays", "Days")}
+                  </option>
+                </Select>
+              </div>
+            </FormField>
+            <FormField
+              label={t("editor.followUpInstructions", "Follow-up instructions")}
+            >
+              <Textarea
+                value={step.instructions}
+                onChange={(e) =>
+                  updateStep(index, { instructions: e.target.value })
+                }
+                maxLength={2000}
+                rows={3}
+                placeholder={t(
+                  "editor.followUpInstructionsPlaceholder",
+                  "E.g.: Greet the customer warmly, remind them of the open question, and offer to help.",
+                )}
+              />
+            </FormField>
+            <FormField
+              label={t("editor.followUpAssignLabel", "Assign label")}
+              group
+              description={t(
+                "editor.followUpAssignLabelHint",
+                "Added to the conversation when this step fires (even if the agent stays silent).",
+              )}
+            >
+              <LabelPicker
+                values={step.assignLabels}
+                onChange={(v) => updateStep(index, { assignLabels: v })}
+                labels={labels}
+                multiAccount={multiAccount}
+                ariaLabel={t("editor.followUpAssignLabel", "Assign label")}
+              />
+            </FormField>
+            {isLast && (
+              <SwitchField
+                checked={step.resolve}
+                onCheckedChange={(v) => updateStep(index, { resolve: v })}
+                label={t(
+                  "editor.followUpResolve",
+                  "Resolve the conversation on this step",
+                )}
+              />
+            )}
+          </div>
+        );
+      })}
+      {steps.length < FOLLOW_UP_MAX_STEPS && (
+        <Button variant="secondary" size="sm" onClick={addStep}>
+          <Plus className="h-4 w-4" aria-hidden="true" />
+          {t("editor.followUpAddStep", "Add step")}
+        </Button>
+      )}
+    </div>
+  );
+}
+
+export function BehaviorTab({
+  agentId,
+  hours,
+  businessHoursId,
+  setBusinessHoursId,
+  followUpHoursId,
+  setFollowUpHoursId,
+  debounce,
+  setDebounce,
+  stt,
+  setStt,
+  sttCredBaseUrl,
+  onSttEntryChange,
+  tts,
+  setTts,
+  split,
+  setSplit,
+  vision,
+  setVision,
+  visionCredBaseUrl,
+  onVisionEntryChange,
+  limits,
+  setLimits,
+  serviceWindow,
+  setServiceWindow,
+  followUp,
+  setFollowUp,
+  redirectSuppressesFollowUp,
+  onScheduleSaved,
+  dirty,
+  saving,
+  onSave,
+  onDiscard,
+  onOpenPlayground,
+}: BehaviorTabProps) {
+  const { t, i18n } = useTranslation();
+
+  const sttBaseUrlInvalid =
+    stt.provider === "openai-compatible" &&
+    !sttCredBaseUrl &&
+    !isValidHttpUrl(stt.baseURL);
+
+  const visionBaseUrlInvalid =
+    vision.provider === "openai-compatible" &&
+    !visionCredBaseUrl &&
+    !isValidHttpUrl(vision.baseURL);
+
+  // Transcription language: a curated dropdown with an "other" escape to a free-text ISO code.
+  const sttLangKnown = (STT_LANGUAGES as readonly string[]).includes(
+    stt.language,
+  );
+  const langNames = (() => {
+    try {
+      return new Intl.DisplayNames([i18n.language], { type: "language" });
+    } catch {
+      return null;
+    }
+  })();
+  const langLabel = (code: string) => {
+    const name = langNames?.of(code);
+    return name && name !== code ? `${name} (${code})` : code;
+  };
+
+  // Section index (item 9): the left-rail nav + scroll-spy track these in order. Labels reuse the
+  // section titles; icons are thematic.
+  const sections = [
+    {
+      id: "availability",
+      icon: CalendarClock,
+      label: t("editor.availability", "Availability"),
+    },
+    {
+      id: "debounce",
+      icon: Layers,
+      label: t("editor.debounce", "Message grouping (debounce)"),
+    },
+    {
+      id: "stt",
+      icon: Mic,
+      label: t("editor.stt", "Voice transcription (audio)"),
+    },
+    {
+      id: "vision",
+      icon: Image,
+      label: t("editor.vision", "Image & document reading"),
+    },
+    {
+      id: "tts",
+      icon: Volume2,
+      label: t("editor.tts", "Audio replies (text-to-speech)"),
+    },
+    {
+      id: "split",
+      icon: Scissors,
+      label: t("editor.split", "Reply in multiple messages"),
+    },
+    {
+      id: "limits",
+      icon: Gauge,
+      label: t("editor.limits", "Execution limits"),
+    },
+    {
+      id: "proactive",
+      icon: Megaphone,
+      label: t("editor.proactiveSection", "Proactive messages"),
+    },
+  ];
+
+  return (
+    <div className="flex grow flex-col gap-4">
+      <div className="flex gap-6">
+        <SectionNav sections={sections} />
+        <div className="flex min-w-0 grow flex-col gap-4">
+          <Section
+            id="availability"
+            icon={CalendarClock}
+            title={t("editor.availability", "Availability")}
+            description={t(
+              "editor.availabilityHint",
+              "When the agent is active and answering. Outside these hours it stays silent and notifies the operator with a private note.",
+            )}
+          >
+            <FormField
+              label={t("editor.businessHours", "Business hours")}
+              group
+            >
+              <SchedulePicker
+                value={businessHoursId}
+                onChange={setBusinessHoursId}
+                schedules={hours.map(toScheduleOption)}
+                emptyLabel={t("editor.always", "Always on")}
+                aria-label={t("editor.businessHours", "Business hours")}
+                onScheduleSaved={(savedId) => {
+                  onScheduleSaved(savedId, setBusinessHoursId);
+                }}
+              />
+            </FormField>
+          </Section>
+
+          <Section
+            id="debounce"
+            icon={Layers}
+            title={t("editor.debounce", "Message grouping (debounce)")}
+            description={t(
+              "editor.debounceHint",
+              "Wait for the customer to stop typing, then answer their whole burst in one reply.",
+            )}
+          >
+            <SwitchField
+              checked={debounce.enabled}
+              onCheckedChange={(v) => setDebounce({ ...debounce, enabled: v })}
+              label={t(
+                "editor.debounceEnabled",
+                "Group rapid messages before replying",
+              )}
+            />
+            {debounce.enabled && (
+              <div className="grid gap-4 sm:grid-cols-3">
+                <FormField
+                  label={t("editor.debounceWindow", "Wait window (s)")}
+                  description={t(
+                    "editor.debounceWindowHint",
+                    "Idle time after the last message before replying (3-120).",
+                  )}
+                >
+                  <Input
+                    type="number"
+                    min={3}
+                    max={120}
+                    value={debounce.windowSeconds}
+                    onChange={(e) =>
+                      setDebounce({
+                        ...debounce,
+                        windowSeconds: e.target.value,
+                      })
+                    }
+                  />
+                </FormField>
+                <FormField
+                  label={t(
+                    "editor.debounceMaxMessages",
+                    "Max messages / reply",
+                  )}
+                  description={t(
+                    "editor.debounceMaxMessagesHint",
+                    "Cap on messages grouped into one turn (1-50).",
+                  )}
+                >
+                  <Input
+                    type="number"
+                    min={1}
+                    max={50}
+                    value={debounce.maxMessagesPerBurst}
+                    onChange={(e) =>
+                      setDebounce({
+                        ...debounce,
+                        maxMessagesPerBurst: e.target.value,
+                      })
+                    }
+                  />
+                </FormField>
+                <FormField
+                  label={t("editor.debounceMaxWindow", "Max total wait (s)")}
+                  description={t(
+                    "editor.debounceMaxWindowHint",
+                    "Reply at most this long after the first message, even if more keep arriving.",
+                  )}
+                >
+                  <Input
+                    type="number"
+                    min={3}
+                    max={600}
+                    value={debounce.maxWindowSeconds}
+                    onChange={(e) =>
+                      setDebounce({
+                        ...debounce,
+                        maxWindowSeconds: e.target.value,
+                      })
+                    }
+                  />
+                </FormField>
+              </div>
+            )}
+          </Section>
+
+          <Section
+            id="stt"
+            icon={Mic}
+            title={t("editor.stt", "Voice transcription (audio)")}
+            description={t(
+              "editor.sttHint",
+              "Transcribe customer voice notes so the agent can read and answer them.",
+            )}
+          >
+            <SwitchField
+              checked={stt.enabled}
+              onCheckedChange={(v) => setStt({ ...stt, enabled: v })}
+              label={t("editor.sttEnabled", "Transcribe voice notes")}
+            />
+            {stt.enabled && (
+              <>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <FormField label={t("editor.sttProvider", "Provider")}>
+                    <Select
+                      value={stt.provider}
+                      onChange={(e) =>
+                        setStt({ ...stt, provider: e.target.value })
+                      }
+                    >
+                      {STT_PROVIDERS.map((p) => (
+                        <option key={p} value={p}>
+                          {providerLabel(p, t)}
+                        </option>
+                      ))}
+                    </Select>
+                  </FormField>
+                  <FormField label={t("editor.sttCredential", "API key")} group>
+                    <CredentialPicker
+                      value={stt.credentialRef}
+                      onChange={(v) => setStt({ ...stt, credentialRef: v })}
+                      onEntryChange={onSttEntryChange}
+                      required={stt.provider !== "openai-compatible"}
+                      compatibleTypes={credentialCompat.stt(stt.provider)}
+                      defaultCreateType={credentialCompat.stt(stt.provider)[0]}
+                      ariaLabel={t("editor.sttCredential", "API key")}
+                    />
+                  </FormField>
+                </div>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <FormField
+                    label={t("editor.sttModel", "Model")}
+                    group
+                    description={t(
+                      "editor.sttModelHint",
+                      "Leave blank for the provider default.",
+                    )}
+                  >
+                    <ModelPicker
+                      value={stt.model}
+                      onChange={(v) => setStt({ ...stt, model: v })}
+                      provider={stt.provider}
+                      capability="transcription"
+                      credentialRef={stt.credentialRef || undefined}
+                      baseURL={sttCredBaseUrl ?? (stt.baseURL || undefined)}
+                      placeholder={STT_DEFAULT_MODEL[stt.provider] ?? ""}
+                      aria-label={t("editor.sttModel", "Model")}
+                    />
+                  </FormField>
+                  <FormField label={t("editor.sttLanguage", "Language")} group>
+                    <div className="flex flex-col gap-2">
+                      <Select
+                        value={sttLangKnown ? stt.language : "other"}
+                        onChange={(e) =>
+                          setStt({
+                            ...stt,
+                            language:
+                              e.target.value === "other" ? "" : e.target.value,
+                          })
+                        }
+                      >
+                        {STT_LANGUAGES.map((l) => (
+                          <option key={l} value={l}>
+                            {langLabel(l)}
+                          </option>
+                        ))}
+                        <option value="other">
+                          {t("editor.sttLanguageOther", "Other (custom code)")}
+                        </option>
+                      </Select>
+                      {!sttLangKnown && (
+                        <Input
+                          value={stt.language}
+                          onChange={(e) =>
+                            setStt({ ...stt, language: e.target.value })
+                          }
+                          placeholder="pt-BR"
+                          aria-label={t(
+                            "editor.sttLanguageCustom",
+                            "Custom language code",
+                          )}
+                        />
+                      )}
+                    </div>
+                  </FormField>
+                </div>
+                {stt.provider === "openai-compatible" && (
+                  <FormField
+                    label={t("editor.sttBaseURL", "Base URL")}
+                    description={
+                      sttCredBaseUrl
+                        ? t(
+                            "editor.baseURLFromCredential",
+                            "Defined by the selected credential.",
+                          )
+                        : t(
+                            "editor.sttBaseURLHint",
+                            "Required for OpenAI-compatible transcription endpoints.",
+                          )
+                    }
+                    error={
+                      sttBaseUrlInvalid && stt.baseURL.trim()
+                        ? t("common.invalidUrl", "Must be a valid http(s) URL.")
+                        : null
+                    }
+                  >
+                    <Input
+                      value={sttCredBaseUrl ?? stt.baseURL}
+                      onChange={(e) =>
+                        setStt({ ...stt, baseURL: e.target.value })
+                      }
+                      disabled={!!sttCredBaseUrl}
+                      placeholder="https://api.groq.com/openai/v1"
+                    />
+                  </FormField>
+                )}
+              </>
+            )}
+          </Section>
+
+          <Section
+            id="vision"
+            icon={Image}
+            title={t("editor.vision", "Image & document reading")}
+            description={t(
+              "editor.visionHint",
+              "Extract the content of images and PDFs the customer sends so the agent can read them.",
+            )}
+          >
+            <SwitchField
+              checked={vision.enabled}
+              onCheckedChange={(v) => setVision({ ...vision, enabled: v })}
+              label={t("editor.visionEnabled", "Read images and documents")}
+            />
+            {vision.enabled && (
+              <>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <FormField label={t("editor.visionProvider", "Provider")}>
+                    <Select
+                      value={vision.provider}
+                      onChange={(e) =>
+                        setVision({ ...vision, provider: e.target.value })
+                      }
+                    >
+                      {VISION_PROVIDERS.map((p) => (
+                        <option key={p} value={p}>
+                          {providerLabel(p, t)}
+                        </option>
+                      ))}
+                    </Select>
+                  </FormField>
+                  <FormField
+                    label={t("editor.visionCredential", "API key")}
+                    group
+                  >
+                    <CredentialPicker
+                      value={vision.credentialRef}
+                      onChange={(v) =>
+                        setVision({ ...vision, credentialRef: v })
+                      }
+                      onEntryChange={onVisionEntryChange}
+                      required={vision.provider !== "openai-compatible"}
+                      compatibleTypes={credentialCompat.vision(vision.provider)}
+                      defaultCreateType={
+                        credentialCompat.vision(vision.provider)[0]
+                      }
+                      ariaLabel={t("editor.visionCredential", "API key")}
+                    />
+                  </FormField>
+                </div>
+                <FormField
+                  label={t("editor.visionModel", "Model")}
+                  group
+                  description={t(
+                    "editor.visionModelHint",
+                    "Leave blank for the provider default. OpenAI reads images only; Gemini and Anthropic also read PDFs.",
+                  )}
+                >
+                  <ModelPicker
+                    value={vision.model}
+                    onChange={(v) => setVision({ ...vision, model: v })}
+                    provider={vision.provider}
+                    capability="vision"
+                    credentialRef={vision.credentialRef || undefined}
+                    baseURL={visionCredBaseUrl ?? (vision.baseURL || undefined)}
+                    placeholder={VISION_DEFAULT_MODEL[vision.provider] ?? ""}
+                    aria-label={t("editor.visionModel", "Model")}
+                  />
+                </FormField>
+                {vision.provider === "openai-compatible" && (
+                  <FormField
+                    label={t("editor.visionBaseURL", "Base URL")}
+                    description={
+                      visionCredBaseUrl
+                        ? t(
+                            "editor.baseURLFromCredential",
+                            "Defined by the selected credential.",
+                          )
+                        : t(
+                            "editor.visionBaseURLHint",
+                            "Required for OpenAI-compatible vision endpoints (e.g. a self-hosted Qwen-VL).",
+                          )
+                    }
+                    error={
+                      visionBaseUrlInvalid && vision.baseURL.trim()
+                        ? t("common.invalidUrl", "Must be a valid http(s) URL.")
+                        : null
+                    }
+                  >
+                    <Input
+                      value={visionCredBaseUrl ?? vision.baseURL}
+                      onChange={(e) =>
+                        setVision({ ...vision, baseURL: e.target.value })
+                      }
+                      disabled={!!visionCredBaseUrl}
+                      placeholder="https://your-qwen-endpoint/v1"
+                    />
+                  </FormField>
+                )}
+                <FormField
+                  label={
+                    <span className="flex items-center justify-between gap-2">
+                      <span>
+                        {t("editor.visionPrompt", "Extraction prompt")}
+                      </span>
+                      {vision.extractionPrompt.trim() !==
+                        DEFAULT_EXTRACTION_PROMPT && (
+                        <button
+                          type="button"
+                          className="font-normal text-accent text-xs hover:underline"
+                          onClick={() =>
+                            setVision({
+                              ...vision,
+                              extractionPrompt: DEFAULT_EXTRACTION_PROMPT,
+                            })
+                          }
+                        >
+                          {t("editor.visionPromptReset", "Restore default")}
+                        </button>
+                      )}
+                    </span>
+                  }
+                  description={t(
+                    "editor.visionPromptHint",
+                    "How the model should read the file.",
+                  )}
+                >
+                  <Textarea
+                    value={vision.extractionPrompt}
+                    onChange={(e) =>
+                      setVision({ ...vision, extractionPrompt: e.target.value })
+                    }
+                    rows={3}
+                    placeholder={DEFAULT_EXTRACTION_PROMPT}
+                  />
+                </FormField>
+              </>
+            )}
+          </Section>
+
+          <Section
+            id="tts"
+            icon={Volume2}
+            title={t("editor.tts", "Audio replies (text-to-speech)")}
+            description={t(
+              "editor.ttsHint",
+              "Optionally answer with a voice note.",
+            )}
+          >
+            <FormField label={t("editor.ttsMode", "When to reply with audio")}>
+              <Select
+                value={tts.mode}
+                onChange={(e) => setTts({ ...tts, mode: e.target.value })}
+              >
+                <option value="never">
+                  {t("editor.ttsModeNever", "Never (text only)")}
+                </option>
+                <option value="mirror">
+                  {t("editor.ttsModeMirror", "When the customer sends audio")}
+                </option>
+                <option value="preference">
+                  {t(
+                    "editor.ttsModePreference",
+                    "Follow the customer's preference",
+                  )}
+                </option>
+              </Select>
+            </FormField>
+            {tts.mode !== "never" && (
+              <>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <FormField label={t("editor.ttsProvider", "Provider")}>
+                    <Select
+                      value={tts.provider}
+                      onChange={(e) =>
+                        setTts({ ...tts, provider: e.target.value })
+                      }
+                    >
+                      {TTS_PROVIDERS.map((p) => (
+                        <option key={p} value={p}>
+                          {providerLabel(p, t)}
+                        </option>
+                      ))}
+                    </Select>
+                  </FormField>
+                  <FormField label={t("editor.ttsCredential", "API key")} group>
+                    <CredentialPicker
+                      value={tts.credentialRef}
+                      onChange={(v) => setTts({ ...tts, credentialRef: v })}
+                      required
+                      compatibleTypes={credentialCompat.tts(tts.provider)}
+                      defaultCreateType={credentialCompat.tts(tts.provider)[0]}
+                      ariaLabel={t("editor.ttsCredential", "API key")}
+                    />
+                  </FormField>
+                </div>
+                {tts.provider === "openrouter" && (
+                  <div className="flex items-start gap-2 rounded-lg border border-warning bg-warning-soft px-3 py-2 text-text-primary text-xs">
+                    <AlertTriangle
+                      className="mt-0.5 h-4 w-4 shrink-0 text-warning"
+                      aria-hidden="true"
+                    />
+                    <span>
+                      {t(
+                        "editor.ttsOpenRouterFileWarning",
+                        "OpenRouter doesn't output Ogg/Opus, so replies arrive as a regular audio file attachment, not a native WhatsApp voice note (PTT).",
+                      )}
+                    </span>
+                  </div>
+                )}
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <FormField
+                    label={t("editor.ttsVoice", "Voice")}
+                    description={t(
+                      "editor.ttsVoiceHint",
+                      "Voice id/name (required for ElevenLabs).",
+                    )}
+                  >
+                    <TtsOptionPicker
+                      kind="voices"
+                      provider={tts.provider}
+                      credentialRef={tts.credentialRef}
+                      value={tts.voice}
+                      onChange={(v) => setTts({ ...tts, voice: v })}
+                      placeholder={
+                        TTS_DEFAULT_VOICE[tts.provider] ||
+                        t("editor.ttsVoiceRequired", "required")
+                      }
+                      ariaLabel={t("editor.ttsVoice", "Voice")}
+                    />
+                  </FormField>
+                  <FormField
+                    label={t("editor.ttsModel", "Model")}
+                    description={t(
+                      "editor.ttsModelHint",
+                      "Leave blank for the provider default.",
+                    )}
+                  >
+                    <TtsOptionPicker
+                      kind="models"
+                      provider={tts.provider}
+                      credentialRef={tts.credentialRef}
+                      value={tts.model}
+                      onChange={(v) => setTts({ ...tts, model: v })}
+                      placeholder={TTS_DEFAULT_MODEL[tts.provider] ?? ""}
+                      ariaLabel={t("editor.ttsModel", "Model")}
+                    />
+                  </FormField>
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <SwitchField
+                    checked={tts.normalize}
+                    onCheckedChange={(v) => setTts({ ...tts, normalize: v })}
+                    label={t(
+                      "editor.ttsNormalize",
+                      "Improve pronunciation (read numbers, dates and amounts naturally)",
+                    )}
+                  />
+                  <p className="text-text-muted text-xs">
+                    {t(
+                      "editor.ttsNormalizeHint",
+                      "Uses the agent's model to rewrite the reply for clearer speech before generating the audio.",
+                    )}
+                  </p>
+                </div>
+              </>
+            )}
+          </Section>
+
+          <Section
+            id="split"
+            icon={Scissors}
+            title={t("editor.split", "Reply in multiple messages")}
+            description={t(
+              "editor.splitHint",
+              "Break long replies into smaller messages, with a typing pause between them (feels more human).",
+            )}
+          >
+            <SwitchField
+              checked={split.enabled}
+              onCheckedChange={(v) => setSplit({ ...split, enabled: v })}
+              label={t(
+                "editor.splitEnabled",
+                "Split replies into several messages with a typing delay",
+              )}
+            />
+            {split.enabled && (
+              <div className="grid gap-4 sm:grid-cols-3">
+                <FormField
+                  label={t("editor.splitMaxChars", "Max chars / message")}
+                  description={t(
+                    "editor.splitMaxCharsHint",
+                    "Longer paragraphs are split further.",
+                  )}
+                >
+                  <Input
+                    type="number"
+                    min={80}
+                    max={4000}
+                    value={split.maxChars}
+                    onChange={(e) =>
+                      setSplit({ ...split, maxChars: e.target.value })
+                    }
+                  />
+                </FormField>
+                <FormField
+                  label={t("editor.splitWpm", "Typing speed (wpm)")}
+                  description={t(
+                    "editor.splitWpmHint",
+                    "Higher = shorter pauses.",
+                  )}
+                >
+                  <Input
+                    type="number"
+                    min={40}
+                    max={1000}
+                    value={split.typingWpm}
+                    onChange={(e) =>
+                      setSplit({ ...split, typingWpm: e.target.value })
+                    }
+                  />
+                </FormField>
+                <FormField
+                  label={t("editor.splitMaxDelay", "Max pause (ms)")}
+                  description={t(
+                    "editor.splitMaxDelayHint",
+                    "Cap on the typing pause per message.",
+                  )}
+                >
+                  <Input
+                    type="number"
+                    min={0}
+                    max={30000}
+                    step={500}
+                    value={split.maxDelayMs}
+                    onChange={(e) =>
+                      setSplit({ ...split, maxDelayMs: e.target.value })
+                    }
+                  />
+                </FormField>
+              </div>
+            )}
+          </Section>
+
+          <Section
+            id="limits"
+            icon={Gauge}
+            title={t("editor.limits", "Execution limits")}
+            description={t(
+              "editor.limitsHint",
+              "Cap how much work the agent does in a single turn before it must answer.",
+            )}
+          >
+            <div className="grid gap-4 sm:grid-cols-2">
+              <FormField
+                label={t("editor.limitsMaxToolCalls", "Max tool calls / turn")}
+                description={t(
+                  "editor.limitsMaxToolCallsHint",
+                  "After this many tool uses the agent is forced to reply with what it has (no error). 1-50.",
+                )}
+              >
+                <Input
+                  type="number"
+                  min={1}
+                  max={50}
+                  value={limits.maxToolCalls}
+                  onChange={(e) =>
+                    setLimits({ ...limits, maxToolCalls: e.target.value })
+                  }
+                />
+              </FormField>
+            </div>
+          </Section>
+
+          <Section
+            id="proactive"
+            icon={Megaphone}
+            title={t("editor.proactiveSection", "Proactive messages")}
+            description={t(
+              "editor.proactiveSectionHint",
+              "Reach out first when a conversation goes silent. On WhatsApp, a message sent outside the 24h window needs an approved template (HSM).",
+            )}
+          >
+            {/* When to reach out */}
+            <div className="flex flex-col gap-4">
+              <div>
+                <h4 className="font-medium text-sm text-text-secondary">
+                  {t("editor.followUp", "Follow-up")}
+                </h4>
+                <p className="text-text-muted text-xs">
+                  {t(
+                    "editor.followUpSectionHint",
+                    "Proactively re-engage conversations that go silent after the agent's last message.",
+                  )}
+                </p>
+              </div>
+              {redirectSuppressesFollowUp && (
+                <div className="flex items-start gap-2 rounded-md border border-border bg-bg-tertiary px-3 py-2 text-text-secondary text-xs">
+                  <ArrowRightLeft
+                    className="mt-0.5 h-3.5 w-3.5 shrink-0 text-accent"
+                    aria-hidden="true"
+                  />
+                  <span>
+                    {t(
+                      "editor.followUpRedirectSuppressed",
+                      "Redirect is on for this agent, so the follow-up below does not run for the WhatsApp entry inbox or the website-chat inbox. The redirect handles re-engagement there. It still applies to any other channel this agent answers.",
+                    )}
+                  </span>
+                </div>
+              )}
+              <SwitchField
+                checked={followUp.enabled}
+                onCheckedChange={(v) =>
+                  setFollowUp({ ...followUp, enabled: v })
+                }
+                label={t(
+                  "editor.followUpEnabled",
+                  "Send a follow-up when the conversation goes silent",
+                )}
+              />
+              {followUp.enabled && (
+                <>
+                  <FormField
+                    label={t("editor.followUpWindowField", "Allowed schedule")}
+                    group
+                    description={t(
+                      "editor.followUpScheduleHint",
+                      "Applies to the whole sequence. Steps only fire inside this schedule.",
+                    )}
+                  >
+                    <SchedulePicker
+                      value={followUpHoursId}
+                      onChange={setFollowUpHoursId}
+                      schedules={hours.map(toScheduleOption)}
+                      emptyLabel={t(
+                        "editor.followUpHoursDefault",
+                        "Follow agent's main schedule",
+                      )}
+                      emptySummary={(() => {
+                        if (businessHoursId) {
+                          const inherited = hours.find(
+                            (h) => String(h.id) === businessHoursId,
+                          );
+                          if (inherited) {
+                            const summary = formatWindowsSummary(
+                              toScheduleOption(inherited).windows,
+                              t("schedule.noWindows", "No windows"),
+                              i18n.language,
+                            );
+                            return `${t("editor.followUpHoursInherited", "Inherited:")} ${inherited.name} — ${summary}`;
+                          }
+                        }
+                        return t(
+                          "editor.followUpHoursAnyTime",
+                          "No schedule set — follow-up may fire at any time.",
+                        );
+                      })()}
+                      aria-label={t(
+                        "editor.followUpWindowField",
+                        "Allowed schedule",
+                      )}
+                      onScheduleSaved={(savedId) => {
+                        onScheduleSaved(savedId, setFollowUpHoursId);
+                      }}
+                    />
+                  </FormField>
+                  <FollowUpStepsEditor
+                    agentId={agentId}
+                    followUp={followUp}
+                    setFollowUp={setFollowUp}
+                  />
+                  <div className="flex flex-col gap-1.5">
+                    <SwitchField
+                      checked={followUp.pauseWhileAppointment}
+                      onCheckedChange={(v) =>
+                        setFollowUp({
+                          ...followUp,
+                          pauseWhileAppointment: v,
+                        })
+                      }
+                      label={t(
+                        "editor.followUpPauseAppointment",
+                        "Pause while the customer has an upcoming appointment",
+                      )}
+                    />
+                    <p className="text-text-muted text-xs">
+                      {t(
+                        "editor.followUpPauseAppointmentHint",
+                        "When the customer has a booked appointment (a scheduled reminder), hold the follow-up until it passes or is cancelled. The appointment reminders take over.",
+                      )}
+                    </p>
+                  </div>
+                </>
+              )}
+            </div>
+
+            {/* How it is delivered: WhatsApp's 24h window governs every proactive send */}
+            <div className="flex flex-col gap-4 border-border border-t pt-4">
+              <div>
+                <h4 className="font-medium text-sm text-text-secondary">
+                  {t("editor.svcWindow", "WhatsApp 24h window")}
+                </h4>
+                <p className="text-text-muted text-xs">
+                  {t(
+                    "editor.svcWindowHint",
+                    "WhatsApp only allows free-form messages within 24h of the customer's last message. Outside it, proactive messages need an approved template (HSM).",
+                  )}
+                </p>
+              </div>
+              <SwitchField
+                checked={serviceWindow.enabled}
+                onCheckedChange={(v) =>
+                  setServiceWindow({ ...serviceWindow, enabled: v })
+                }
+                label={t(
+                  "editor.svcWindowEnabled",
+                  "Enforce the 24h window for proactive messages",
+                )}
+              />
+              {serviceWindow.enabled && (
+                <>
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <FormField
+                      label={t("editor.svcWindowHours", "Window (hours)")}
+                    >
+                      <Input
+                        type="number"
+                        min={1}
+                        max={168}
+                        value={serviceWindow.windowHours}
+                        onChange={(e) =>
+                          setServiceWindow({
+                            ...serviceWindow,
+                            windowHours: e.target.value,
+                          })
+                        }
+                      />
+                    </FormField>
+                    <ServiceWindowTemplateField
+                      agentId={agentId}
+                      serviceWindow={serviceWindow}
+                      setServiceWindow={setServiceWindow}
+                    />
+                  </div>
+                  {serviceWindow.templateName.trim() !== "" && (
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      <FormField
+                        label={t("editor.svcWindowLang", "Template language")}
+                      >
+                        <Input
+                          value={serviceWindow.templateLanguage}
+                          onChange={(e) =>
+                            setServiceWindow({
+                              ...serviceWindow,
+                              templateLanguage: e.target.value,
+                            })
+                          }
+                          placeholder="pt_BR"
+                        />
+                      </FormField>
+                      <FormField
+                        label={t("editor.svcWindowParams", "Body params")}
+                        description={t(
+                          "editor.svcWindowParamsHint",
+                          "Comma-separated; variables like nome_contato / primeiro_nome are interpolated.",
+                        )}
+                      >
+                        <Input
+                          value={serviceWindow.templateParams}
+                          onChange={(e) =>
+                            setServiceWindow({
+                              ...serviceWindow,
+                              templateParams: e.target.value,
+                            })
+                          }
+                          placeholder="{{primeiro_nome}}"
+                        />
+                      </FormField>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </Section>
+        </div>
+      </div>
+
+      <TabActionBar
+        dirty={dirty}
+        saving={saving}
+        onSave={onSave}
+        onDiscard={onDiscard}
+        saveDisabled={sttBaseUrlInvalid || visionBaseUrlInvalid}
+        onOpenPlayground={onOpenPlayground}
+      />
+    </div>
+  );
+}

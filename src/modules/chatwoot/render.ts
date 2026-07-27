@@ -1,0 +1,99 @@
+// Renders ONE inbound customer message into the text the agent actually sees, mirroring the n8n
+// "Extrair mensagem" node so the agent gets modality + reply context instead of a silent blank:
+//   * audio  → the transcription wrapped in <mensagem-de-audio>…</mensagem-de-audio> (or a
+//              "não audível" marker when transcription is empty/failed);
+//   * image  → a marker asking the customer to send text/audio (no vision yet);
+//   * other file → a marker naming the file type;
+//   * text   → as-is;
+//   * a quoted/replied-to message → prefixed with the referenced snippet when resolvable.
+// Pure: no DB, no network. Shared by the direct (webhook) path and the debounce flush.
+
+export interface RenderableMessage {
+  text: string;
+  transcribedText?: string | null;
+  // Vision extraction written back by the eager pass (or absent when vision is off/failed/unsupported).
+  imageDescription?: string | null;
+  extractedText?: string | null;
+  // Chatwoot file_type of each attachment ("audio" | "image" | "file" | "video" | ...).
+  attachmentTypes: string[];
+  // Best-effort file name of the first attachment (for the "could not extract" marker).
+  attachmentName?: string | null;
+  inReplyTo?: number | null;
+  // True when this message is an emoji reaction (content = the emoji). Rendered as a context marker so
+  // the agent understands the customer reacted (vs sent the emoji as a message) and can decide whether
+  // to respond. Mirrors the audio/image markers.
+  isReaction?: boolean;
+}
+
+const AMARA = /amara\.org/i;
+
+// Whisper hallucinates "…Amara.org" subtitle credits on silent/near-silent audio. Drop it.
+export function cleanTranscription(s: string): string {
+  const t = (s ?? "").trim();
+  return AMARA.test(t) ? "" : t;
+}
+
+const QUOTE_MAX = 200;
+
+export function renderInboundMessage(
+  m: RenderableMessage,
+  ctx: { resolveQuoted?: (id: number) => string | null } = {},
+): string {
+  const types = new Set(m.attachmentTypes);
+  const text = (m.text ?? "").trim();
+  const withText = (marker: string) => (text ? `${text}\n${marker}` : marker);
+
+  // A reaction is its own thing: the content is the emoji and in_reply_to points at the reacted-to
+  // message. Wrap it as a context marker (like audio/image) so the agent can choose to react back or
+  // skip a reply rather than treating the emoji as a fresh question.
+  if (m.isReaction) {
+    const emoji = text || "(emoji)";
+    const quoted =
+      m.inReplyTo != null && ctx.resolveQuoted
+        ? ctx.resolveQuoted(m.inReplyTo)
+        : null;
+    const para = quoted
+      ? ` para: "${quoted.replace(/\s+/g, " ").trim().slice(0, QUOTE_MAX)}"`
+      : "";
+    return `<reação do cliente emoji="${emoji}"${para}>`;
+  }
+  const imageDescription = (m.imageDescription ?? "").trim();
+  const extractedText = (m.extractedText ?? "").trim();
+  let body: string;
+  if (types.has("audio")) {
+    const tr = cleanTranscription(m.transcribedText ?? text);
+    body = tr
+      ? `<mensagem-de-audio>${tr}</mensagem-de-audio>`
+      : "<mensagem de áudio não audível; peça que o cliente reenvie por texto>";
+  } else if (imageDescription) {
+    // Vision extracted the image content → the agent "sees" it.
+    body = withText(`<imagem>${imageDescription}</imagem>`);
+  } else if (extractedText) {
+    // Vision extracted a document's content.
+    body = withText(`<documento>${extractedText}</documento>`);
+  } else if (types.has("image")) {
+    // No extraction (vision off/failed) → ask for text/audio, as before.
+    body = withText(
+      "<usuário enviou uma imagem; peça que envie a informação por texto ou áudio>",
+    );
+  } else if (text) {
+    body = text;
+  } else if (types.size > 0) {
+    const ty = m.attachmentTypes[0] ?? "arquivo";
+    const named = m.attachmentName?.trim()
+      ? ` chamado '${m.attachmentName.trim()}'`
+      : "";
+    body = `<usuário enviou um arquivo do tipo '${ty}'${named}; não foi possível extrair o conteúdo>`;
+  } else {
+    return ""; // nothing renderable → skip
+  }
+
+  if (m.inReplyTo != null && ctx.resolveQuoted) {
+    const quoted = ctx.resolveQuoted(m.inReplyTo);
+    if (quoted) {
+      const snippet = quoted.replace(/\s+/g, " ").trim().slice(0, QUOTE_MAX);
+      if (snippet) body = `<em resposta a: "${snippet}">\n${body}`;
+    }
+  }
+  return body;
+}
