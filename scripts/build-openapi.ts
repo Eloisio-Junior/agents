@@ -61,8 +61,36 @@ function stripNonOpenApiKeys(node: unknown): unknown {
   return out;
 }
 
+// NOTE: Elysia emits a group's index route as `/v1/agents/` (the `.get("/")` inside the group),
+// but the server answers both spellings — probed live: `/api/health` and `/api/health/` both 200,
+// `/api/v1/agents` and `/api/v1/agents/` both 401. The trailing slash is therefore an artifact of
+// how the route is declared, not the canonical path, and it makes readers think the two forms
+// differ. Strip it so the published paths are the canonical ones. Guarded against collisions: if
+// the unslashed twin already exists, the entries would silently overwrite each other.
+function stripTrailingSlashes(
+  paths: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [path, item] of Object.entries(paths)) {
+    const canonical =
+      path !== "/" && path.endsWith("/") ? path.slice(0, -1) : path;
+    if (canonical !== path && (canonical in paths || canonical in out)) {
+      throw new Error(
+        `normalize: dropping the trailing slash from "${path}" would collide with "${canonical}"; merge them by hand.`,
+      );
+    }
+    out[canonical] = item;
+  }
+  return out;
+}
+
 function normalize(doc: OpenApiDoc): OpenApiDoc {
   const cleaned = stripNonOpenApiKeys(doc) as OpenApiDoc;
+  if (cleaned.paths && typeof cleaned.paths === "object") {
+    cleaned.paths = stripTrailingSlashes(
+      cleaned.paths as Record<string, unknown>,
+    );
+  }
   cleaned.openapi = OPENAPI_VERSION;
   cleaned.servers = [API_SERVER];
   return cleaned;

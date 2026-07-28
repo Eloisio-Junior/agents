@@ -156,6 +156,10 @@ export const mcpConnectionsController = new Elysia({
     }),
     {
       requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "Update MCP connection",
+        "Updates a consumed MCP server connection of the tenant.",
+      ),
       params: t.Object({ id: t.String() }),
       body: writeBody,
     },
@@ -166,7 +170,14 @@ export const mcpConnectionsController = new Elysia({
       await deleteMcpConnection(ctxOrThrow(tenantContext), BigInt(params.id));
       return { instance: instanceIdentity, success: true };
     },
-    { requireRole: "TENANT_ADMIN", params: t.Object({ id: t.String() }) },
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "Delete MCP connection",
+        "Removes a consumed MCP server connection from the tenant.",
+      ),
+      params: t.Object({ id: t.String() }),
+    },
   )
   .post(
     "/:id/discover",
@@ -181,5 +192,12 @@ export const mcpConnectionsController = new Elysia({
         instructions: discovered.instructions,
       };
     },
-    { requireRole: "TENANT_ADMIN", params: t.Object({ id: t.String() }) },
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "Discover MCP tools",
+        "Connects to the MCP server behind the connection and lists the tools and instructions it exposes.",
+      ),
+      params: t.Object({ id: t.String() }),
+    },
   );

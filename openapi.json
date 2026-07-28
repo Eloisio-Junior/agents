@@ -1038,7 +1038,7 @@
         "operationId": "postAuthGoogle"
       }
     },
-    "/health/": {
+    "/health": {
       "get": {
         "tags": [
           "System"
@@ -1060,7 +1060,7 @@
         "operationId": "getI18nLocales"
       }
     },
-    "/updates/": {
+    "/updates": {
       "get": {
         "tags": [
           "System"
@@ -2071,7 +2071,7 @@
     },
     "/realtime/echo": {},
     "/realtime/events": {},
-    "/v1/branding/": {
+    "/v1/branding": {
       "get": {
         "tags": [
           "Settings"
@@ -4676,7 +4676,7 @@
         "operationId": "getV1MetricsCosts"
       }
     },
-    "/v1/agents/": {
+    "/v1/agents": {
       "get": {
         "tags": [
           "Agents"
@@ -9564,7 +9564,7 @@
         ]
       }
     },
-    "/v1/tools/": {
+    "/v1/tools": {
       "get": {
         "tags": [
           "Resources"
@@ -10911,7 +10911,7 @@
         "operationId": "getV1ToolsByIdReferences"
       }
     },
-    "/v1/mcp-connections/": {
+    "/v1/mcp-connections": {
       "get": {
         "tags": [
           "MCP"
@@ -11321,6 +11321,8 @@
         "tags": [
           "MCP"
         ],
+        "summary": "Update MCP connection",
+        "description": "Updates a consumed MCP server connection of the tenant.",
         "parameters": [
           {
             "name": "id",
@@ -11521,6 +11523,8 @@
         "tags": [
           "MCP"
         ],
+        "summary": "Delete MCP connection",
+        "description": "Removes a consumed MCP server connection from the tenant.",
         "parameters": [
           {
             "name": "id",
@@ -11660,6 +11664,8 @@
         "tags": [
           "MCP"
         ],
+        "summary": "Discover MCP tools",
+        "description": "Connects to the MCP server behind the connection and lists the tools and instructions it exposes.",
         "parameters": [
           {
             "name": "id",
@@ -11684,7 +11690,7 @@
         "operationId": "postV1Mcp-connectionsByIdDiscover"
       }
     },
-    "/v1/business-hours/": {
+    "/v1/business-hours": {
       "get": {
         "tags": [
           "Resources"
@@ -12493,7 +12499,7 @@
         "operationId": "deleteV1Business-hoursById"
       }
     },
-    "/v1/experiments/": {
+    "/v1/experiments": {
       "get": {
         "tags": [
           "Resources"
@@ -13418,7 +13424,7 @@
         "operationId": "getV1ExperimentsByIdResults"
       }
     },
-    "/v1/vault/": {
+    "/v1/vault": {
       "get": {
         "tags": [
           "Resources"
@@ -15427,7 +15433,7 @@
         "operationId": "getV1OauthMcpCallback"
       }
     },
-    "/v1/tenant-settings/": {
+    "/v1/tenant-settings": {
       "get": {
         "tags": [
           "Settings"
@@ -16847,7 +16853,7 @@
         "operationId": "postV1WebhooksSubscriptionsByIdTest"
       }
     },
-    "/v1/api-keys/": {
+    "/v1/api-keys": {
       "get": {
         "tags": [
           "API keys"
@@ -17153,7 +17159,7 @@
         "operationId": "deleteV1Api-keysById"
       }
     },
-    "/v1/audit/": {
+    "/v1/audit": {
       "get": {
         "tags": [
           "Audit"
@@ -17253,7 +17259,7 @@
         "operationId": "getV1Audit"
       }
     },
-    "/v1/logs/": {
+    "/v1/logs": {
       "get": {
         "tags": [
           "Logs"
@@ -17678,7 +17684,7 @@
         ]
       }
     },
-    "/v1/alert-channels/": {
+    "/v1/alert-channels": {
       "get": {
         "tags": [
           "Logs"
@@ -22316,7 +22322,7 @@
         "operationId": "getV1N8n-exportToolsById"
       }
     },
-    "/v1/quotes/": {
+    "/v1/quotes": {
       "get": {
         "tags": [
           "Resources"
@@ -23730,7 +23736,7 @@
         "operationId": "postV1McpOauthToken"
       }
     },
-    "/v1/mcp/": {
+    "/v1/mcp": {
       "post": {
         "tags": [
           "MCP"
@@ -23765,39 +23771,19 @@
         "tags": [
           "MCP"
         ],
-        "operationId": "getV1Mcp",
-        "parameters": [
-          {
-            "name": "x-tenant-id",
-            "in": "header",
-            "required": true,
-            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
-            "schema": {
-              "type": "string",
-              "default": "1"
-            },
-            "example": "1"
-          }
-        ]
+        "summary": "MCP SSE stream (not offered)",
+        "description": "Always 405 with `Allow: POST`. This transport is stateless and tools-only, so the OPTIONAL server-to-client SSE stream does not exist; the route is declared so a probing client gets an explicit 405 instead of falling through to the SPA 404 guard and reconnecting in a loop.",
+        "security": [],
+        "operationId": "getV1Mcp"
       },
       "delete": {
         "tags": [
           "MCP"
         ],
-        "operationId": "deleteV1Mcp",
-        "parameters": [
-          {
-            "name": "x-tenant-id",
-            "in": "header",
-            "required": true,
-            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
-            "schema": {
-              "type": "string",
-              "default": "1"
-            },
-            "example": "1"
-          }
-        ]
+        "summary": "MCP session teardown (not offered)",
+        "description": "Always 405 with `Allow: POST`. The transport is stateless, so there is no session to tear down; declared for the same reason as the GET above.",
+        "security": [],
+        "operationId": "deleteV1Mcp"
       }
     },
     "/v1/mcp/me/connections": {

@@ -58,13 +58,37 @@ export const mcpController = new Elysia({
   // so the OPTIONAL GET SSE stream (server-to-client) and DELETE session teardown are not offered.
   // Per the MCP spec we answer 405 + `Allow: POST`. Without these routes a client that probes GET to
   // open the stream falls through to the /api/* 404 guard (app.ts) and reconnects in a tight loop.
-  .get("/", ({ set }) => {
-    set.status = 405;
-    set.headers.Allow = "POST";
-    return { error: "method_not_allowed" };
-  })
-  .delete("/", ({ set }) => {
-    set.status = 405;
-    set.headers.Allow = "POST";
-    return { error: "method_not_allowed" };
-  });
+  .get(
+    "/",
+    ({ set }) => {
+      set.status = 405;
+      set.headers.Allow = "POST";
+      return { error: "method_not_allowed" };
+    },
+    {
+      detail: {
+        ...doc(
+          "MCP SSE stream (not offered)",
+          "Always 405 with `Allow: POST`. This transport is stateless and tools-only, so the OPTIONAL server-to-client SSE stream does not exist; the route is declared so a probing client gets an explicit 405 instead of falling through to the SPA 404 guard and reconnecting in a loop.",
+        ),
+        security: [],
+      },
+    },
+  )
+  .delete(
+    "/",
+    ({ set }) => {
+      set.status = 405;
+      set.headers.Allow = "POST";
+      return { error: "method_not_allowed" };
+    },
+    {
+      detail: {
+        ...doc(
+          "MCP session teardown (not offered)",
+          "Always 405 with `Allow: POST`. The transport is stateless, so there is no session to tear down; declared for the same reason as the GET above.",
+        ),
+        security: [],
+      },
+    },
+  );

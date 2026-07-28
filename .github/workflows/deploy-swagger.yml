@@ -1,9 +1,14 @@
 name: Deploy Swagger UI to GitHub Pages
 
 # Publishes the committed openapi.json (kept in sync by `bun openapi:check`, see
-# scripts/build-openapi.ts) as a Swagger UI page on GitHub Pages. Free-edition only: the file is
-# dropped from the Pro tree by the derivation tooling, and the job is additionally guarded to the
-# public Free repo so it no-ops if the workflow ever reaches the master or another fork.
+# scripts/build-openapi.ts) as a Swagger UI page on GitHub Pages. Free-edition only: the derivation
+# tooling drops THIS WORKFLOW from the Pro tree (openapi.json itself ships in both), and the job is
+# additionally guarded to the public Free repo so it no-ops if it ever reaches the master or a fork.
+#
+# NOTE: Pages must be enabled on the repo with "GitHub Actions" as the source, or `configure-pages`
+# fails with "Get Pages site failed". It cannot self-enable: the action's `enablement` input needs a
+# token other than GITHUB_TOKEN. Pages on a private repo also requires a paid plan, which is why
+# this job only ever succeeded after fazer-ai/agents went public.
 on:
   push:
     branches:
