@@ -64,9 +64,9 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
-  # NOTE: arm64 hosted runners are free only on public repos. While this repo is
-  # private (Free plan), build amd64 only; once it (or its public copy) is public,
-  # arm64 turns on automatically with no edit needed.
+  # NOTE: arm64 hosted runners are free only on public repos. fazer-ai/agents (Free) is
+  # public, so it builds amd64 + arm64; fazer-ai/agents-pro is private and builds amd64 only.
+  # The matrix follows each repo's visibility on its own, with no edit needed either way.
   setup:
     runs-on: ubuntu-latest
     outputs:
