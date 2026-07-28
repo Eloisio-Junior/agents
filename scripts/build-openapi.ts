@@ -34,9 +34,38 @@ const API_SERVER = {
 
 type OpenApiDoc = { servers?: unknown } & Record<string, unknown>;
 
+// NOTE: TypeBox emits modern JSON Schema (`patternProperties` for Record<string, X>, and
+// `anyOf: [X, {type: "null"}]` for nullable unions), neither of which exists in OpenAPI 3.0 —
+// that dialect predates JSON Schema 2020-12. The plugin still labels the document 3.0.3, so
+// every such schema is a hard validation error and Swagger UI flags the spec as invalid.
+// OpenAPI 3.1 *is* JSON Schema 2020-12, so declaring 3.1 makes the emitted schemas legal as-is
+// instead of lossily rewriting them (`patternProperties` -> `additionalProperties` would drop
+// the key pattern; `type: "null"` -> `nullable` is 3.0-only vocabulary).
+const OPENAPI_VERSION = "3.1.0";
+
+// NOTE: Keys the generator emits that are not OpenAPI in any dialect, so they stay invalid even
+// under 3.1: `nullable` is 3.0-only vocabulary (dropped in 3.1) and is redundant here anyway —
+// every occurrence sits beside an `anyOf` that already carries `{type: "null"}`, so removing it
+// loses nothing. `maxSize` (TypeBox file constraint) and `ws` (Elysia WebSocket route) have no
+// OpenAPI counterpart; both remain enforced at runtime, they just are not documentable here.
+const NON_OPENAPI_KEYS = ["nullable", "maxSize", "ws"] as const;
+
+function stripNonOpenApiKeys(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(stripNonOpenApiKeys);
+  if (node === null || typeof node !== "object") return node;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(node)) {
+    if ((NON_OPENAPI_KEYS as readonly string[]).includes(key)) continue;
+    out[key] = stripNonOpenApiKeys(value);
+  }
+  return out;
+}
+
 function normalize(doc: OpenApiDoc): OpenApiDoc {
-  doc.servers = [API_SERVER];
-  return doc;
+  const cleaned = stripNonOpenApiKeys(doc) as OpenApiDoc;
+  cleaned.openapi = OPENAPI_VERSION;
+  cleaned.servers = [API_SERVER];
+  return cleaned;
 }
 
 async function generate(): Promise<string> {

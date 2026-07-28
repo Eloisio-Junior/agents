@@ -1,5 +1,5 @@
 {
-  "openapi": "3.0.3",
+  "openapi": "3.1.0",
   "info": {
     "title": "agents API",
     "description": "REST surface for the fazer.ai agents operator console. Dev-only documentation, auto-generated from the route schemas.",
@@ -2069,37 +2069,8 @@
         ]
       }
     },
-    "/realtime/echo": {
-      "ws": {
-        "tags": [
-          "System"
-        ],
-        "summary": "Realtime echo socket",
-        "description": "WebSocket for chat, presence, and admin broadcasts.",
-        "operationId": "wsRealtimeEcho"
-      }
-    },
-    "/realtime/events": {
-      "ws": {
-        "tags": [
-          "System"
-        ],
-        "summary": "Realtime events socket",
-        "description": "Server-push WebSocket for per-tenant operational events.",
-        "parameters": [
-          {
-            "name": "tenantId",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "description": "Tenant id (BigInt string) selector; honored only for SUPER_ADMIN, ignored otherwise.",
-              "type": "string"
-            }
-          }
-        ],
-        "operationId": "wsRealtimeEvents"
-      }
-    },
+    "/realtime/echo": {},
+    "/realtime/events": {},
     "/v1/branding/": {
       "get": {
         "tags": [
@@ -2480,7 +2451,6 @@
                 "properties": {
                   "file": {
                     "default": "File",
-                    "maxSize": "2m",
                     "description": "Logo or favicon file (multipart). MIME and per-kind size are re-validated server-side.",
                     "type": "string",
                     "format": "binary"
@@ -2497,7 +2467,6 @@
                 "properties": {
                   "file": {
                     "default": "File",
-                    "maxSize": "2m",
                     "description": "Logo or favicon file (multipart). MIME and per-kind size are re-validated server-side.",
                     "type": "string",
                     "format": "binary"
@@ -2514,7 +2483,6 @@
                 "properties": {
                   "file": {
                     "default": "File",
-                    "maxSize": "2m",
                     "description": "Logo or favicon file (multipart). MIME and per-kind size are re-validated server-side.",
                     "type": "string",
                     "format": "binary"
@@ -13829,7 +13797,6 @@
                     ]
                   },
                   "baseUrl": {
-                    "nullable": true,
                     "anyOf": [
                       {
                         "description": "New base http(s) URL; null clears it where the kind allows.",
@@ -13873,7 +13840,6 @@
                     ]
                   },
                   "baseUrl": {
-                    "nullable": true,
                     "anyOf": [
                       {
                         "description": "New base http(s) URL; null clears it where the kind allows.",
@@ -13917,7 +13883,6 @@
                     ]
                   },
                   "baseUrl": {
-                    "nullable": true,
                     "anyOf": [
                       {
                         "description": "New base http(s) URL; null clears it where the kind allows.",
@@ -15757,7 +15722,6 @@
                     "type": "boolean"
                   },
                   "credentialRef": {
-                    "nullable": true,
                     "anyOf": [
                       {
                         "description": "Vault entry reference for the Langfuse credential (null clears it).",
@@ -15788,7 +15752,6 @@
                     "type": "boolean"
                   },
                   "credentialRef": {
-                    "nullable": true,
                     "anyOf": [
                       {
                         "description": "Vault entry reference for the Langfuse credential (null clears it).",
@@ -15819,7 +15782,6 @@
                     "type": "boolean"
                   },
                   "credentialRef": {
-                    "nullable": true,
                     "anyOf": [
                       {
                         "description": "Vault entry reference for the Langfuse credential (null clears it).",
@@ -16254,7 +16216,6 @@
                     }
                   },
                   "secretRef": {
-                    "nullable": true,
                     "anyOf": [
                       {
                         "minLength": 1,
@@ -16297,7 +16258,6 @@
                     }
                   },
                   "secretRef": {
-                    "nullable": true,
                     "anyOf": [
                       {
                         "minLength": 1,
@@ -16340,7 +16300,6 @@
                     }
                   },
                   "secretRef": {
-                    "nullable": true,
                     "anyOf": [
                       {
                         "minLength": 1,
@@ -16492,7 +16451,6 @@
                     }
                   },
                   "secretRef": {
-                    "nullable": true,
                     "anyOf": [
                       {
                         "minLength": 1,
@@ -16531,7 +16489,6 @@
                     }
                   },
                   "secretRef": {
-                    "nullable": true,
                     "anyOf": [
                       {
                         "minLength": 1,
@@ -16570,7 +16527,6 @@
                     }
                   },
                   "secretRef": {
-                    "nullable": true,
                     "anyOf": [
                       {
                         "minLength": 1,
@@ -17831,7 +17787,6 @@
                     }
                   },
                   "secretRef": {
-                    "nullable": true,
                     "anyOf": [
                       {
                         "minLength": 1,
@@ -17894,7 +17849,6 @@
                     }
                   },
                   "secretRef": {
-                    "nullable": true,
                     "anyOf": [
                       {
                         "minLength": 1,
@@ -17957,7 +17911,6 @@
                     }
                   },
                   "secretRef": {
-                    "nullable": true,
                     "anyOf": [
                       {
                         "minLength": 1,
@@ -18129,7 +18082,6 @@
                     }
                   },
                   "secretRef": {
-                    "nullable": true,
                     "anyOf": [
                       {
                         "minLength": 1,
@@ -18187,7 +18139,6 @@
                     }
                   },
                   "secretRef": {
-                    "nullable": true,
                     "anyOf": [
                       {
                         "minLength": 1,
@@ -18245,7 +18196,6 @@
                     }
                   },
                   "secretRef": {
-                    "nullable": true,
                     "anyOf": [
                       {
                         "minLength": 1,
