@@ -106,7 +106,7 @@ If the bug is fixed, simplify `src/app.ts` by removing the `serve.routes` carve-
 | `bun db:reset`                     | Reset the database AND re-provision runtime-role grants (never bare `migrate reset`)     |
 | `bun db:test:setup`                | Provision/migrate the isolated test database                                             |
 | `bun prisma:generate`              | Generate Prisma client                                                                   |
-| `bun i18n:extract`                 | Extract translation keys (also runs in the pre-commit hook)                              |
+| `bun i18n:extract`                 | Extract translation keys (also part of `bun check`)                                      |
 | `bun set-admin <email> [password]` | Promote a user to admin (creates the user if it doesn't exist; optionally sets password) |
 
 
