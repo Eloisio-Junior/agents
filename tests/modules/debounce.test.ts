@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { FakeListChatModel } from "@langchain/core/utils/testing";
 import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
@@ -19,6 +20,7 @@ import {
   enqueueJob,
 } from "@/modules/scheduler/service";
 import { seedChatwootInstance } from "../utils/chatwoot";
+import { ResolveThenReplyModel } from "../utils/scripted-models";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -72,6 +74,35 @@ function makeStub(opts: {
     },
     sendMessage: async (conversationId: number, content: string) => {
       opts.sent.push([conversationId, content]);
+      return {};
+    },
+  } as unknown as ChatwootClient;
+  return async () => client;
+}
+
+// makeStub + a toggleStatus recorder, for the resolve-intent tests.
+function makeResolveStub(opts: {
+  pages: unknown[];
+  sent: Array<[number, string]>;
+  calls: { getMessages: number };
+  toggles: Array<[number, string]>;
+}) {
+  let i = 0;
+  const client = {
+    getMessages: async () => {
+      const page = opts.pages[Math.min(i, opts.pages.length - 1)] ?? {
+        payload: [],
+      };
+      i += 1;
+      opts.calls.getMessages += 1;
+      return page;
+    },
+    sendMessage: async (conversationId: number, content: string) => {
+      opts.sent.push([conversationId, content]);
+      return {};
+    },
+    toggleStatus: async (conversationId: number, status: string) => {
+      opts.toggles.push([conversationId, status]);
       return {};
     },
   } as unknown as ChatwootClient;
@@ -426,6 +457,83 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(out).toEqual({ outcome: "done" });
     expect(sent).toEqual([]);
     expect(await watermarkOf(801)).toBeNull();
+  });
+
+  test("superseded mid-turn discards the resolve intent (no toggle, watermark untouched)", async () => {
+    await seedConversation(810);
+    const sent: Array<[number, string]> = [];
+    const toggles: Array<[number, string]> = [];
+    const calls = { getMessages: 0 };
+    const out = await flushDebounceJob({
+      job: jobFor(810),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new ResolveThenReplyModel("Fechado!") as unknown as BaseChatModel,
+        makeClient: makeResolveStub({
+          // first fetch (burst) → ids 1,2; second fetch (shouldPost) → a newer id 3 arrived.
+          pages: [
+            page([
+              { id: 1, content: "oi" },
+              { id: 2, content: "quero encerrar" },
+            ]),
+            page([
+              { id: 1, content: "oi" },
+              { id: 2, content: "quero encerrar" },
+              { id: 3, content: "na verdade, mais uma coisa" },
+            ]),
+          ],
+          sent,
+          calls,
+          toggles,
+        }),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(out).toEqual({ outcome: "done" });
+    // A newer customer message wins: no reply, no resolve, watermark intact so the re-armed
+    // flush answers the full burst.
+    expect(sent).toEqual([]);
+    expect(toggles).toEqual([]);
+    expect(await watermarkOf(810)).toBeNull();
+  });
+
+  test("empty reply superseded by a mid-turn message leaves the watermark for the re-armed flush", async () => {
+    await seedConversation(811);
+    const sent: Array<[number, string]> = [];
+    const toggles: Array<[number, string]> = [];
+    const calls = { getMessages: 0 };
+    const out = await flushDebounceJob({
+      job: jobFor(811),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new ResolveThenReplyModel("") as unknown as BaseChatModel,
+        makeClient: makeResolveStub({
+          pages: [
+            page([
+              { id: 1, content: "oi" },
+              { id: 2, content: "só isso" },
+            ]),
+            page([
+              { id: 1, content: "oi" },
+              { id: 2, content: "só isso" },
+              { id: 3, content: "espera, tem mais" },
+            ]),
+          ],
+          sent,
+          calls,
+          toggles,
+        }),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(out).toEqual({ outcome: "done" });
+    expect(sent).toEqual([]);
+    expect(toggles).toEqual([]);
+    // Empty + a newer mid-turn message must NOT advance the watermark: the re-armed flush
+    // re-coalesces the whole burst (id 3 included) instead of skipping it.
+    expect(await watermarkOf(811)).toBeNull();
   });
 
   test("a human assignee closes the gate before any Chatwoot fetch", async () => {
