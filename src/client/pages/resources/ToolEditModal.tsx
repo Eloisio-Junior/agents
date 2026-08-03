@@ -23,6 +23,10 @@ import { api } from "@/client/lib/api";
 import { cn } from "@/client/lib/utils";
 import { isValidUrlTemplate } from "@/client/lib/validation";
 import { normalizeToolName } from "@/graph/tools/toolName";
+import {
+  CONTEXT_VAR_NAMES,
+  normalizeToolShapes,
+} from "@/modules/tool-definitions/normalize";
 
 type ToolsData = Awaited<ReturnType<typeof api.api.v1.tools.get>>["data"];
 export type Tool = NonNullable<ToolsData>["tools"][number];
@@ -87,21 +91,11 @@ function loneTokenName(value: string): string | null {
 // alphanumeric/underscore name. Drives the inline {{token}} highlighting in the URL/query/headers/body.
 const TOOL_TOKEN_SOURCE = "\\{\\{\\s*([a-zA-Z0-9_]+)\\s*\\}\\}";
 
-// Context variable names the runtime interpolates (keep in sync with nativeVarItems). A {{token}} is
-// "known" (highlighted as a valid var, not a typo) when it names a declared AI field, one of these, or
-// {{secret}} (only when a credential is selected).
-const NATIVE_VAR_NAMES = new Set([
-  "conversation_id",
-  "message_id",
-  "contact_id",
-  "contact_name",
-  "contact_email",
-  "contact_phone",
-  "inbox_id",
-  "inbox_name",
-  "agent_name",
-  "company_name",
-]);
+// NOTE: context variable names the runtime interpolates (shared with the normalization module so
+// the lists cannot drift; keep nativeVarItems in sync). A {{token}} is "known" (highlighted as a
+// valid var, not a typo) when it names a declared AI field, one of these, or {{secret}} (only when
+// a credential is selected).
+const NATIVE_VAR_NAMES = new Set<string>(CONTEXT_VAR_NAMES);
 function isKnownToolToken(
   name: string,
   params: string[],
@@ -207,24 +201,48 @@ function emptyForm() {
 // Maps a stored tool (any of the new or legacy shapes) into the editor form. Legacy tools carry their
 // fixed values + body assembly inside inputSchema/body.mode==="fields"; we reconstruct them as explicit
 // rows so the operator sees what was previously assembled by magic. Saving then writes the new shape.
-function formFromTool(tool: Tool) {
-  const schema = (tool.inputSchema ?? {}) as Record<string, unknown>;
-  const bodyCfg = (tool.body ?? {}) as {
+// NOTE: exported for the load/save regression tests (pure over its argument).
+export function formFromTool(tool: Tool) {
+  // NOTE: legacy rows authored programmatically may still carry pre-normalization shapes
+  // (JSON-Schema inputSchema, single-brace {var}); render the canonical form so the real AI
+  // fields show up.
+  const { shapes } = normalizeToolShapes({
+    urlTemplate: tool.urlTemplate,
+    query: tool.query ?? {},
+    headers: tool.headers ?? {},
+    body: tool.body ?? {},
+    inputSchema: tool.inputSchema ?? {},
+  });
+  let urlTemplate = (shapes.urlTemplate ?? tool.urlTemplate) as string;
+  const schema = (shapes.inputSchema ?? {}) as Record<string, unknown>;
+  const bodyCfg = (shapes.body ?? {}) as {
     mode?: string;
     raw?: string;
     rows?: { key?: unknown; value?: unknown }[];
   };
   const aiFields = aiFieldsFromSchema(schema);
   const inUrl = new Set(
-    [...tool.urlTemplate.matchAll(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g)].map(
+    [...urlTemplate.matchAll(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g)].map(
       (m) => m[1],
     ),
   );
+  // NOTE: a legacy fixed field bound to a URL placeholder has no editor row (aiFields skips fixed;
+  // the row reconstruction skips URL names), so saving would drop its binding and leave an
+  // unresolved {{token}}. Inline the fixed field's value template into the visible URL: the
+  // operator sees the effective URL and saving preserves the semantics.
+  for (const [name, raw] of Object.entries(schema)) {
+    const s = (raw ?? {}) as Record<string, unknown>;
+    if (s.source !== "fixed" || !inUrl.has(name)) continue;
+    const value = typeof s.value === "string" ? s.value : "";
+    urlTemplate = urlTemplate.replace(
+      new RegExp(`\\{\\{\\s*${name}\\s*\\}\\}`, "g"),
+      () => value,
+    );
+  }
 
+  const query = (shapes.query ?? {}) as Record<string, unknown>;
   const queryRows: KvRow[] =
-    tool.query && Object.keys(tool.query).length > 0
-      ? objToKv(tool.query as Record<string, unknown>)
-      : [];
+    Object.keys(query).length > 0 ? objToKv(query) : [];
 
   let bodyMode: "kv" | "raw" = "kv";
   let bodyRaw = "";
@@ -263,11 +281,11 @@ function formFromTool(tool: Tool) {
     label: tool.label,
     description: tool.description ?? "",
     method: tool.method as (typeof METHODS)[number],
-    urlTemplate: tool.urlTemplate,
+    urlTemplate,
     allowedHosts: tool.allowedHosts.join(", "),
     aiFields,
     queryRows,
-    headerRows: objToKv(tool.headers),
+    headerRows: objToKv((shapes.headers ?? {}) as Record<string, unknown>),
     headersMode: "kv" as const,
     headersRaw: "",
     bodyRows,

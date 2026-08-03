@@ -816,3 +816,210 @@ describe("buildHttpTool — query params (any method)", () => {
     expect(new URL(captured.url as string).searchParams.get("foo")).toBe("X");
   });
 });
+
+describe("buildHttpTool — programmatic authoring shapes (JSON-Schema input_schema + single-brace placeholders)", () => {
+  // NOTE: the natural shapes an API/MCP author writes: standard JSON Schema for the input and
+  // OpenAPI-style single-brace path params. Both must work (converted/normalized), not fail silently.
+  const JSON_SCHEMA_INPUT = {
+    required: ["valor"],
+    properties: { valor: { type: "string" } },
+  };
+
+  test("JSON-Schema input_schema exposes the real fields, not the schema keywords", () => {
+    const schema = parseToolInputSchema(JSON_SCHEMA_INPUT);
+    expect("valor" in schema.shape).toBe(true);
+    expect("properties" in schema.shape).toBe(false);
+    expect("required" in schema.shape).toBe(false);
+    expect(schema.safeParse({}).success).toBe(false); // valor is required
+    expect(schema.safeParse({ valor: "TESTE123" }).success).toBe(true);
+  });
+
+  test("single-brace path var + JSON-Schema input: the argument reaches the URL", async () => {
+    const captured: Captured = {};
+    const tool = buildHttpTool(
+      def({
+        method: "GET",
+        urlTemplate: `https://${PUBLIC}/anything/{valor}`,
+        inputSchema: JSON_SCHEMA_INPUT,
+      }),
+      { resolveCredential: async () => null, fetchImpl: stubFetch(captured) },
+    );
+    await tool.invoke({ valor: "TESTE123" });
+    expect(new URL(captured.url as string).pathname).toBe("/anything/TESTE123");
+  });
+
+  test("two single-brace path vars (compact schema) both substitute", async () => {
+    const captured: Captured = {};
+    const tool = buildHttpTool(
+      def({
+        method: "GET",
+        urlTemplate: `https://${PUBLIC}/debug-echo/{nome_cliente}/{faixa_etaria}`,
+        inputSchema: {
+          nome_cliente: { type: "string", required: true },
+          faixa_etaria: { type: "string", required: true },
+        },
+      }),
+      { resolveCredential: async () => null, fetchImpl: stubFetch(captured) },
+    );
+    await tool.invoke({ nome_cliente: "Maria", faixa_etaria: "30-40" });
+    expect(new URL(captured.url as string).pathname).toBe(
+      "/debug-echo/Maria/30-40",
+    );
+  });
+
+  test("single-brace value in the query dict resolves to the argument", async () => {
+    const captured: Captured = {};
+    const tool = buildHttpTool(
+      def({
+        method: "GET",
+        urlTemplate: `https://${PUBLIC}/v1/x`,
+        inputSchema: { nome_cliente: { type: "string", required: true } },
+        query: { nome_cliente: "{nome_cliente}" },
+      }),
+      { resolveCredential: async () => null, fetchImpl: stubFetch(captured) },
+    );
+    await tool.invoke({ nome_cliente: "Maria" });
+    expect(
+      new URL(captured.url as string).searchParams.get("nome_cliente"),
+    ).toBe("Maria");
+  });
+
+  test("single-brace value in a header resolves to the argument", async () => {
+    const captured: Captured = {};
+    const tool = buildHttpTool(
+      def({
+        method: "GET",
+        urlTemplate: `https://${PUBLIC}/v1/x`,
+        inputSchema: { nome_cliente: { type: "string", required: true } },
+        headers: { "X-Nome-Cliente": "{nome_cliente}" },
+      }),
+      { resolveCredential: async () => null, fetchImpl: stubFetch(captured) },
+    );
+    await tool.invoke({ nome_cliente: "Maria" });
+    const headers = captured.init?.headers as Record<string, string>;
+    expect(headers["X-Nome-Cliente"]).toBe("Maria");
+  });
+
+  test("POST with empty body config + JSON-Schema input: args land in the JSON body", async () => {
+    const captured: Captured = {};
+    const tool = buildHttpTool(
+      def({
+        method: "POST",
+        urlTemplate: `https://${PUBLIC}/v1/x`,
+        inputSchema: JSON_SCHEMA_INPUT,
+        body: {},
+      }),
+      { resolveCredential: async () => null, fetchImpl: stubFetch(captured) },
+    );
+    await tool.invoke({ valor: "TESTE123" });
+    expect(JSON.parse(captured.init?.body as string)).toEqual({
+      valor: "TESTE123",
+    });
+  });
+
+  test("single-brace context var resolves in the URL", async () => {
+    const captured: Captured = {};
+    const tool = buildHttpTool(
+      def({
+        method: "GET",
+        urlTemplate: `https://${PUBLIC}/v1/conversations/{conversation_id}`,
+      }),
+      {
+        resolveCredential: async () => null,
+        fetchImpl: stubFetch(captured),
+        context: { conversation_id: "42" },
+      },
+    );
+    await tool.invoke({});
+    expect(new URL(captured.url as string).pathname).toBe(
+      "/v1/conversations/42",
+    );
+  });
+
+  test("a single-brace token matching nothing declared stays literal (raw body)", async () => {
+    const captured: Captured = {};
+    const tool = buildHttpTool(
+      def({
+        method: "POST",
+        urlTemplate: `https://${PUBLIC}/v1/x`,
+        inputSchema: { name: { type: "string", required: true } },
+        body: {
+          mode: "raw",
+          raw: '{"who":"{{name}}","tpl":"{unknown_token}"}',
+        },
+      }),
+      { resolveCredential: async () => null, fetchImpl: stubFetch(captured) },
+    );
+    await tool.invoke({ name: "Maria" });
+    expect(JSON.parse(captured.init?.body as string)).toEqual({
+      who: "Maria",
+      tpl: "{unknown_token}",
+    });
+  });
+
+  test("{{secret}} in the URL with no resolvable credential throws a config error, no fetch", async () => {
+    const captured: Captured = {};
+    const tool = buildHttpTool(
+      def({
+        method: "GET",
+        urlTemplate: `https://${PUBLIC}/v1/x?token={{secret}}`,
+      }),
+      { resolveCredential: async () => null, fetchImpl: stubFetch(captured) },
+    );
+    // NOTE: a missing credential is operator config, not model input: the model must never be told to
+    // retry with a "secret" field.
+    await expect(tool.invoke({})).rejects.toThrow(/credential/);
+    expect(captured.url).toBeUndefined();
+  });
+
+  test("a fixed URL field depending on an unavailable {{secret}} throws, no fetch", async () => {
+    const captured: Captured = {};
+    const tool = buildHttpTool(
+      def({
+        method: "GET",
+        urlTemplate: `https://${PUBLIC}/v1/x/{{token}}`,
+        inputSchema: { token: { source: "fixed", value: "{{secret}}" } },
+        credentialRef: "k",
+      }),
+      { resolveCredential: async () => null, fetchImpl: stubFetch(captured) },
+    );
+    // NOTE: the fixed value resolves to "" (headers/body semantics), but the URL guard must still refuse
+    // to fetch an incomplete URL and name the credential as the root cause.
+    await expect(tool.invoke({})).rejects.toThrow(/credential/);
+    expect(captured.url).toBeUndefined();
+  });
+
+  test("a missing context variable in the URL throws (a retry hint would loop), no fetch", async () => {
+    const captured: Captured = {};
+    const tool = buildHttpTool(
+      def({
+        method: "GET",
+        urlTemplate: `https://${PUBLIC}/v1/contacts/{{contact_email}}`,
+      }),
+      {
+        resolveCredential: async () => null,
+        fetchImpl: stubFetch(captured),
+        context: {},
+      },
+    );
+    // NOTE: context vars are injected by the platform; the model can never supply them.
+    await expect(tool.invoke({})).rejects.toThrow(/contact_email/);
+    expect(captured.url).toBeUndefined();
+  });
+
+  test("unresolved URL placeholder returns an instructive error to the model, no fetch", async () => {
+    const captured: Captured = {};
+    const tool = buildHttpTool(
+      def({
+        method: "GET",
+        urlTemplate: `https://${PUBLIC}/v1/things/{{id}}`,
+        inputSchema: { id: { type: "string" } },
+      }),
+      { resolveCredential: async () => null, fetchImpl: stubFetch(captured) },
+    );
+    const out = await tool.invoke({});
+    expect(String(out)).toContain("id");
+    expect(String(out).toLowerCase()).toContain("error");
+    expect(captured.url).toBeUndefined();
+  });
+});
