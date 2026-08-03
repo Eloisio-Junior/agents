@@ -7,8 +7,8 @@
 
 # fazer.ai agents
 
-**Agentes de IA de atendimento sobre o Chatwoot.**
-WhatsApp em primeiro lugar. Multimodais, humanizados e self-hosted.
+**Agentes de IA que assumem seu atendimento.**
+Falam como gente, agendam, cobram e vendem. Self-hosted, com qualquer modelo.
 
 **Português (Brasil)** · [English](README-en.md)
 
@@ -23,7 +23,7 @@ WhatsApp em primeiro lugar. Multimodais, humanizados e self-hosted.
 
 ---
 
-**fazer.ai agents** transforma o WhatsApp num canal de atendimento com IA de verdade. Os agentes rodam sobre o seu Chatwoot e atendem com cara de gente: transcrevem áudios, leem imagens, respondem por texto ou por voz, consultam a base de conhecimento, agendam, orçam, movem o funil e passam para o time humano na hora certa. Tudo na sua própria infraestrutura.
+**fazer.ai agents** é a plataforma self-hosted de agentes de IA que tocam o atendimento: transcrevem áudios, leem imagens, respondem por texto ou por voz, consultam a base de conhecimento, agendam, orçam, cobram, movem o funil e sabem quando passar para o time humano. No WhatsApp e em qualquer outro canal, tudo na sua própria infraestrutura.
 
 ### Destaques
 

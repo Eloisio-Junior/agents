@@ -7,8 +7,8 @@
 
 # fazer.ai agents
 
-**Customer-service AI agents on top of Chatwoot.**
-WhatsApp-first. Multimodal, humanized, self-hosted.
+**AI agents that run your customer service.**
+They talk like real people, schedule, collect payments and sell. Self-hosted, with any model.
 
 [Português (Brasil)](README.md) · **English**
 
@@ -23,7 +23,7 @@ WhatsApp-first. Multimodal, humanized, self-hosted.
 
 ---
 
-**fazer.ai agents** turns WhatsApp into a real AI-powered service channel. Agents run on top of your Chatwoot and talk like actual people: they transcribe voice notes, read images, reply by text or voice, query the knowledge base, schedule, quote, move the pipeline and hand off to the human team at the right moment. All on your own infrastructure.
+**fazer.ai agents** is the self-hosted platform for AI agents that take on your customer service: they transcribe voice notes, read images, reply by text or voice, query the knowledge base, schedule, quote, collect payments, move the pipeline and know when to hand off to the human team. On WhatsApp and any other channel, all on your own infrastructure.
 
 ### Highlights
 
