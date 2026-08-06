@@ -19,7 +19,7 @@ import {
   chatwootOutgoingUrl,
 } from "@/modules/chatwoot/webhook-mount";
 import { generateRouteToken } from "@/modules/webhooks/inbound/route-token";
-import { seedChatwootInstance } from "../utils/chatwoot";
+import { seedChatwootInstance, withRunNamespace } from "../utils/chatwoot";
 
 // ── mount constant + outgoing_url derivation (unit) ──
 describe("chatwoot webhook mount", () => {
@@ -954,7 +954,7 @@ describe.skipIf(!dbUp)("loadChatwootClient", () => {
     const cfgA = a.get() as unknown as ConstructorParameters<
       typeof ChatwootClient
     >[0];
-    expect(cfgA.baseUrl).toBe("https://chat.example.com");
+    expect(cfgA.baseUrl).toBe(withRunNamespace("https://chat.example.com"));
     expect(cfgA.accountId).toBe(1);
     expect(cfgA.adminToken).toBe("ADMIN");
     expect(cfgA.botToken).toBe("");

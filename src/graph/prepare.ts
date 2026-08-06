@@ -148,10 +148,6 @@ export interface AgentConfig {
   // The DB Inbox.id this conversation belongs to (null in the playground / no mirror row). Feeds
   // the per-inbox usage attribution on LlmUsage.
   inboxDbId: bigint | null;
-  // NOTE: the inbox's Chatwoot channel class ("Channel::Api", "Channel::Instagram", …; null when unknown
-  // or in the playground). Decides the TTS reply container (pickTtsFormat) — Meta's Instagram
-  // messaging refuses WhatsApp's Ogg/Opus.
-  channelType: string | null;
   contactDbId: bigint | null;
   // The native Chatwoot ContactInbox id (one contact on one channel) for this conversation. Keys the
   // graph memory thread (see resolveGraphThreadId). null on legacy rows / the playground.
@@ -347,14 +343,7 @@ export async function loadAgentConfig(
           customAttributes: wantsAttributeContext,
         },
       },
-      inbox: {
-        select: {
-          id: true,
-          chatwootInboxId: true,
-          name: true,
-          channelType: true,
-        },
-      },
+      inbox: { select: { id: true, chatwootInboxId: true, name: true } },
     },
   });
   // The persona's own Chatwoot Agent Bot for this instance (id for the gate + token to post AS it).
@@ -472,7 +461,6 @@ export async function loadAgentConfig(
     agentBotToken: bot ? decryptJson<string>(bot.accessToken) : null,
     conversationDbId: conv?.id ?? null,
     inboxDbId: conv?.inbox?.id ?? null,
-    channelType: conv?.inbox?.channelType ?? null,
     contactDbId: conv?.contact?.id ?? null,
     contactInboxId: conv?.contactInboxId ?? null,
     systemPrompt: attributeSection
