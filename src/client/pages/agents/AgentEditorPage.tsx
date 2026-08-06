@@ -51,6 +51,7 @@ import { useTenantEvents } from "@/client/hooks/useTenantEvents";
 import { api } from "@/client/lib/api";
 import { computeConfigIssues } from "@/client/lib/configHealth";
 import { shouldRestoreUserBaseUrl } from "@/client/lib/credentialBaseUrl";
+import type { ApiErrorPayload } from "@/client/lib/types";
 import { slugify } from "@/client/lib/utils";
 import {
   invalidateVault,
@@ -1687,8 +1688,17 @@ export function AgentEditorPage() {
       markSynced(String(data.agent.updatedAt));
       bumpSync(section);
       showToast(t("editor.saved", "Agent saved."), "success");
-    } catch {
-      showToast(t("editor.saveError", "Could not save the agent."), "error");
+    } catch (e) {
+      // NOTE: surface the backend's localized message when present (e.g. the prompt-size cap)
+      // instead of the generic failure toast.
+      const apiMsg =
+        e && typeof e === "object" && "value" in e
+          ? ((e as { value?: ApiErrorPayload }).value?.error ?? null)
+          : null;
+      showToast(
+        apiMsg || t("editor.saveError", "Could not save the agent."),
+        "error",
+      );
     } finally {
       savingRef.current -= 1;
       setSavingAgent(false);

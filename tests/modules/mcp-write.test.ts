@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
+import config from "@/config";
 import type { VerifiedToken } from "@/modules/mcp/oauth/tokens";
 import {
   agentList,
@@ -68,6 +69,15 @@ describe("MCP write gate (no DB)", () => {
     });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toContain("invalid agent_id");
+  });
+
+  test("system_prompt over the cap → err on the DRY-RUN path too, before any DB access", async () => {
+    const r = await promptSet(principal({}), {
+      agent_id: "1",
+      system_prompt: "p".repeat(config.agent.promptMaxChars + 1),
+    });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toContain("system prompt is too long");
   });
 
   test("credential_create requires mcp:write", async () => {

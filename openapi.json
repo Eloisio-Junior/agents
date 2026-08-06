@@ -4948,8 +4948,7 @@
                     "type": "string"
                   },
                   "systemPrompt": {
-                    "maxLength": 50000,
-                    "description": "System prompt template, may contain {{variable}} placeholders.",
+                    "description": "System prompt template, may contain {{variable}} placeholders (up to 100000 characters).",
                     "type": "string"
                   },
                   "enabled": {
@@ -5020,8 +5019,7 @@
                     "type": "string"
                   },
                   "systemPrompt": {
-                    "maxLength": 50000,
-                    "description": "System prompt template, may contain {{variable}} placeholders.",
+                    "description": "System prompt template, may contain {{variable}} placeholders (up to 100000 characters).",
                     "type": "string"
                   },
                   "enabled": {
@@ -5092,8 +5090,7 @@
                     "type": "string"
                   },
                   "systemPrompt": {
-                    "maxLength": 50000,
-                    "description": "System prompt template, may contain {{variable}} placeholders.",
+                    "description": "System prompt template, may contain {{variable}} placeholders (up to 100000 characters).",
                     "type": "string"
                   },
                   "enabled": {
@@ -5381,8 +5378,7 @@
                     "type": "string"
                   },
                   "systemPrompt": {
-                    "maxLength": 50000,
-                    "description": "System prompt template, may contain {{variable}} placeholders.",
+                    "description": "System prompt template, may contain {{variable}} placeholders (up to 100000 characters).",
                     "type": "string"
                   },
                   "enabled": {
@@ -5454,8 +5450,7 @@
                     "type": "string"
                   },
                   "systemPrompt": {
-                    "maxLength": 50000,
-                    "description": "System prompt template, may contain {{variable}} placeholders.",
+                    "description": "System prompt template, may contain {{variable}} placeholders (up to 100000 characters).",
                     "type": "string"
                   },
                   "enabled": {
@@ -5527,8 +5522,7 @@
                     "type": "string"
                   },
                   "systemPrompt": {
-                    "maxLength": 50000,
-                    "description": "System prompt template, may contain {{variable}} placeholders.",
+                    "description": "System prompt template, may contain {{variable}} placeholders (up to 100000 characters).",
                     "type": "string"
                   },
                   "enabled": {
@@ -6807,7 +6801,7 @@
                     "type": "object",
                     "properties": {
                       "systemPrompt": {
-                        "maxLength": 50000,
+                        "maxLength": 100000,
                         "type": "string"
                       },
                       "modelConfig": {
@@ -6874,7 +6868,7 @@
                     "type": "object",
                     "properties": {
                       "systemPrompt": {
-                        "maxLength": 50000,
+                        "maxLength": 100000,
                         "type": "string"
                       },
                       "modelConfig": {
@@ -6941,7 +6935,7 @@
                     "type": "object",
                     "properties": {
                       "systemPrompt": {
-                        "maxLength": 50000,
+                        "maxLength": 100000,
                         "type": "string"
                       },
                       "modelConfig": {
@@ -7232,7 +7226,7 @@
                     "type": "object",
                     "properties": {
                       "systemPrompt": {
-                        "maxLength": 50000,
+                        "maxLength": 100000,
                         "type": "string"
                       },
                       "modelConfig": {
@@ -7291,7 +7285,7 @@
                     "type": "object",
                     "properties": {
                       "systemPrompt": {
-                        "maxLength": 50000,
+                        "maxLength": 100000,
                         "type": "string"
                       },
                       "modelConfig": {
@@ -7350,7 +7344,7 @@
                     "type": "object",
                     "properties": {
                       "systemPrompt": {
-                        "maxLength": 50000,
+                        "maxLength": 100000,
                         "type": "string"
                       },
                       "modelConfig": {
@@ -7527,7 +7521,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -7594,7 +7588,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -7661,7 +7655,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -7847,7 +7841,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -7926,7 +7920,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -8005,7 +7999,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -8195,7 +8189,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -8262,7 +8256,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -8329,7 +8323,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -8515,7 +8509,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -8598,7 +8592,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -8681,7 +8675,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
