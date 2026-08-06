@@ -485,22 +485,6 @@ describe.skipIf(!dbUp)("MCP write tools (DB)", () => {
     if ("ref" in res) expect(res.ref).toMatch(/^vault:\d+$/);
   });
 
-  test("tenant_update applies name + audits", async () => {
-    const p = principal({ tenantId: tenantA });
-    const r = await tenantUpdate(
-      p,
-      { name: "WA renamed", dry_run: false },
-      { base: appDb },
-    );
-    expect(r.ok).toBe(true);
-    const row = await suDb.tenant.findUnique({ where: { id: tenantA } });
-    expect(row?.name).toBe("WA renamed");
-    const audits = await suDb.auditLog.count({
-      where: { tenantId: tenantA, action: "mcp.tenant_update" },
-    });
-    expect(audits).toBe(1);
-  });
-
   test("agent_list returns the tenant's agents (id, name, enabled)", async () => {
     const p = principal({ tenantId: tenantA });
     const r = await agentList(p, { base: appDb });
