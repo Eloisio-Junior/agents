@@ -130,6 +130,51 @@ export function normalizeChatwootEvent(
   return normalized;
 }
 
+// NOTE: Minimal parse of a LIVE conversation payload (GET /conversations/:id — the REST show shape;
+// same field positions as the conversation-event payloads: `status` at the top, `meta.assignee_type`,
+// `meta.assignee.{id,name}`, `id` = display_id). Null when the payload does not look like a
+// conversation — a missing `status` is treated as unparseable (the caller must fail closed and retry,
+// never conclude "not bot-owned" from a degraded payload). Feeds the proactive-send live gate: the
+// mirror can be stale forever (a lost resolve webhook has no reconciliation), so anything about to
+// message a customer proactively re-checks this.
+export interface LiveConversationState {
+  status: string;
+  assigneeType: string | null;
+  assigneeId: number | null;
+  assigneeName: string | null;
+  // NOTE: The conversation's last_activity_at (REST show renders it both as `last_activity_at` and
+  // `timestamp`, epoch seconds). Lets the live-probe reconcile compare freshness against the
+  // mirror's monotonic lastEventAt. null when the payload omits both.
+  lastActivityAt: Date | null;
+}
+
+export function parseLiveConversation(
+  raw: unknown,
+): LiveConversationState | null {
+  if (!isRecord(raw)) return null;
+  if (num(raw.id) === null) return null;
+  const status = str(raw.status);
+  if (status === null) return null;
+  const meta = isRecord(raw.meta) ? raw.meta : null;
+  const assignee = meta && isRecord(meta.assignee) ? meta.assignee : null;
+  const assigneeType = meta ? str(meta.assignee_type) : null;
+  const assigneeId = assignee ? num(assignee.id) : null;
+  // NOTE: An "AgentBot" claim without a readable numeric id is unverifiable ownership — with a null
+  // assigneeId, shouldBotHandle would treat a conversation owned by ANOTHER bot as ours. The fork's
+  // jbuilder always renders meta.assignee (agent_bot_slim, with id) alongside assignee_type
+  // "AgentBot", so this only rejects genuinely malformed payloads. Fail closed: the live gate turns
+  // null into "live-unavailable" and retries.
+  if (assigneeType === "AgentBot" && assigneeId === null) return null;
+  const activitySec = num(raw.last_activity_at) ?? num(raw.timestamp);
+  return {
+    status,
+    assigneeType,
+    assigneeId,
+    assigneeName: assignee ? str(assignee.name) : null,
+    lastActivityAt: activitySec !== null ? new Date(activitySec * 1000) : null,
+  };
+}
+
 // Attribution = source of truth. The bot owns a conversation only while NO human is assigned
 // (assignee_type !== "User") and it is still pending. A human assignee (handoff) or a
 // resolved/snoozed/open status means fazer.ai agents stays silent. The gate is OUR responsibility:
