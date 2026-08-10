@@ -46,6 +46,45 @@ function cleanText(v: unknown, max: number): string | null {
   return s || null;
 }
 
+// NOTE: Date.parse rolls impossible calendar dates over ("2026-02-30" parses as March 2) while the
+// SQL mirror's pg_input_is_valid REJECTS them — without this guard an impossible startISO would look
+// upcoming to the JS re-check but never to the sweep. Reject the roll-over up front: NaN, like garbage.
+function hasImpossibleDateParts(startISO: string): boolean {
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[Tt ]|$)/.exec(startISO);
+  if (!m) return false;
+  const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  // NOTE: setUTCFullYear, not Date.UTC — Date.UTC maps years 0-99 to 1900-1999, which would flag
+  // valid ancient dates ("0099-02-28") as impossible.
+  const roundTrip = new Date(0);
+  roundTrip.setUTCFullYear(y, mo - 1, d);
+  return (
+    roundTrip.getUTCFullYear() !== y ||
+    roundTrip.getUTCMonth() !== mo - 1 ||
+    roundTrip.getUTCDate() !== d
+  );
+}
+
+// NOTE: One shared time-zone rule for startISO values WITHOUT an offset, mirrored by the follow-up
+// sweep's SQL normalization (followups/handlers.ts): all-day dates and offset-less datetimes are
+// pinned to UTC. Date.parse already reads a bare date as UTC midnight but reads an offset-less
+// DATETIME in the host zone — while Postgres would use the session TimeZone — so without the pin the
+// two liveness decisions could diverge when app and DB zones differ. startISO can carry an
+// offset-less datetime only via the model-input fallback in the Calendar toolpack (Google always
+// returns an offset); UTC is arbitrary there, but agreement matters more than the boundary instant.
+export function parseStartMs(startISO: string): number {
+  if (hasImpossibleDateParts(startISO)) return Number.NaN;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(startISO)) {
+    return Date.parse(`${startISO}T00:00:00Z`);
+  }
+  if (
+    /[Tt ]\d{2}:/.test(startISO) &&
+    !/(?:[Zz]|[+-]\d{2}:?\d{2})$/.test(startISO)
+  ) {
+    return Date.parse(`${startISO}Z`);
+  }
+  return Date.parse(startISO);
+}
+
 // Pure: scheduler rows → the LIVE appointments of a conversation. A row counts toward an event when
 // it is not tombstoned; an event is live when some row is still queued (PENDING/CLAIMED — the
 // reminder turn itself runs on a CLAIMED row) or when its start is still ahead of `now`. The freshest
@@ -82,7 +121,7 @@ export function projectAppointmentEvents(
       typeof winner.payload.startISO === "string"
         ? winner.payload.startISO
         : "";
-    const startMs = Date.parse(startISO);
+    const startMs = parseStartMs(startISO);
     const queued = group.rows.some(
       ({ row }) => row.status === "PENDING" || row.status === "CLAIMED",
     );
