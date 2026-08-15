@@ -20,3 +20,32 @@ src/modules/conversations/service.ts: Validate pending jobs before marking the s
 # ORIGIN. What was genuinely missing is that the operator could not know the split, so the hint on
 # that field now says guardrails read text and never the picture.
 src/graph/runtime.ts: Screen image contents before delivering guarded output
+
+# PR #75 (issue #61). Real, and it predates this PR: `updateMirror` writes status/assignee and never
+# `lastEventAt`, so the guard this change replaces (`existing.lastEventAt > newLastEventAt`) did not
+# reject an in-flight conversation event after a console write either. The one sub-case where the old
+# guard did reject it — a message landed in between and moved `lastEventAt` — is the exact discard
+# that leaves a delayed handoff lost forever, i.e. issue #61 itself; the two cannot both hold.
+# Closing it needs the version our own write produced, and the two endpoints it calls do not return
+# it (`assignments#create` renders the agent; `toggle_status` renders success/conversation_id/
+# current_status/snoozed_until). The REST `show` DOES render it, though
+# (`conversations/partials/_conversation.json.jbuilder`), so the fix is a re-read after the write
+# rather than a fork change — one extra call per console action, which is its own scope. The
+# marker-based attempt at doing it without any version was built and removed inside this PR after
+# review found four races in it. Filed as #77.
+src/modules/chatwoot/mirror.ts: Fence source events after locally written state
+src/modules/chatwoot/state-order.ts: Fence source events after locally written state
+
+# PR #75 (issue #61). The gap is real — while the handoff's own event is delayed, the mirror does not
+# know about the human, and a turn already running rechecks the ROW — but the remedy is not available
+# yet. Trusting a versioned message snapshot for the assignee undoes a take-over made from our own
+# console: that write claims no version, so the row sits ahead of its marks and the tail carries a
+# HIGHER version with an OLDER truth. Measured, not argued: applying the suggested change turns "a
+# take-over in the console survives a message tail from before it" red. Both failure modes end the
+# same way (the bot answers over a human); this one is bounded by the webhook's own retry budget
+# (AgentBots::WebhookJob, 3 attempts 3s apart), while the console one lasts until the echo arrives.
+# #77 is what unblocks it: once a local write claims the version it produced (the REST show renders
+# `updated_at`), the row is never ahead of its marks and a newer versioned snapshot stops being
+# ambiguous. Then this change becomes correct, and desirable.
+src/modules/chatwoot/mirror.ts: Mirror newer human ownership from message events
+src/modules/chatwoot/state-order.ts: Mirror newer human ownership from message events
