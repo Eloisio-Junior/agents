@@ -49,3 +49,24 @@ src/modules/chatwoot/state-order.ts: Fence source events after locally written s
 # ambiguous. Then this change becomes correct, and desirable.
 src/modules/chatwoot/mirror.ts: Mirror newer human ownership from message events
 src/modules/chatwoot/state-order.ts: Mirror newer human ownership from message events
+
+
+# PR #75 (issue #61). Real but out of scope for a mirror fix, and below the bar for the remedy it
+# asks for (a drain / two-phase rollout). It needs an operator running MULTIPLE web replicas (the
+# documented model is one replica, docs/deploy.md "Single replica (or one leader)"), a rolling
+# deploy, and a webhook delivered late inside the overlap window — which Chatwoot bounds to roughly
+# nine seconds (AgentBots::WebhookJob retries 3× at 3s). The failure is a stale status/assignee that
+# the next conversation event repairs, which is the same self-healing behavior any out-of-order
+# delivery already has. Making the rollout itself two-phase to close it would put deploy ceremony
+# into every future release for a seconds-wide window.
+src/modules/chatwoot/mirror.ts: Guard the watermark during rolling deploys
+
+# PR #75 (issue #61), round 3. Accepted and implemented, then withdrawn on the evidence of round 4:
+# letting an unordered message snapshot PROMOTE the assignee to a human fixes a lost handoff, and
+# creates the mirror image of it — a message the human sent before the conversation went back to the
+# bot arrives with the same last_activity_at and re-takes it, firing a false conversation.handoff at
+# every subscriber. Without a version neither direction can be ordered, so the mirror keeps what it
+# has: on a Chatwoot older than 4.0.2 a handoff whose events are all delayed past the human's first
+# message stays bot-owned until the next conversation event repairs it. The supported deployments
+# ship our fork (4.11.x), where the version exists and decides.
+src/modules/chatwoot/mirror.ts: Preserve human-message handoffs without a version stamp
