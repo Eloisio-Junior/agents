@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
+import { setPublisher } from "@/api/features/realtime/realtime.service";
 import { encryptJson } from "@/api/lib/crypto";
 import type { TenantContext } from "@/lib/tenancy";
 import { mirrorChatwootEvent } from "@/modules/chatwoot/mirror";
@@ -111,11 +112,25 @@ async function mirror(payload: unknown) {
 async function mirrored(convId: number) {
   return suDb.conversation.findFirstOrThrow({
     where: { tenantId, chatwootConversationId: convId },
-    select: { status: true, assigneeType: true, assigneeId: true },
+    select: {
+      status: true,
+      assigneeType: true,
+      assigneeId: true,
+      lastEventAt: true,
+    },
   });
 }
 
 const HUMAN = { id: 3, name: "Atendente Humana" };
+
+// The realtime envelope, as the console's socket receives it.
+interface ServerEventLike {
+  type: string;
+  status?: string;
+  assigneeId?: number | null;
+  assigneeType?: string | null;
+  lastEventAt?: string | null;
+}
 
 // The burst as delivered, in order. `t` is the burst's shared last_activity_at (the agent's message);
 // `u` is when each event was serialized. The tail carries the snapshot from BEFORE the status change,
@@ -1102,7 +1117,18 @@ describe.skipIf(!dbUp)(
         role: "TENANT_ADMIN",
       });
 
-      function stubClient() {
+      // `live` is what a GET on the conversation answers AFTER the write, which is where the version
+      // of our own write comes from: the two write endpoints render the agent / a status blob and
+      // never the conversation's updated_at, but the REST show renders the same `updated_at.to_f`
+      // the webhook carries. `live: null` stands for a GET that failed.
+      function stubClient(
+        live?: {
+          status: string;
+          assignee?: { id: number; name: string } | null;
+          lastActivityAt: number;
+          updatedAt: number | null;
+        } | null,
+      ) {
         const calls: string[] = [];
         const client = {
           assignToAgent: async () => {
@@ -1116,6 +1142,23 @@ describe.skipIf(!dbUp)(
           toggleStatus: async () => {
             calls.push("toggleStatus");
             return {};
+          },
+          getConversation: async () => {
+            calls.push("getConversation");
+            if (live === null) throw new Error("Chatwoot API 502 for GET");
+            if (live === undefined) return {};
+            return {
+              id: 1,
+              status: live.status,
+              meta: {
+                assignee_type: live.assignee ? "User" : null,
+                assignee: live.assignee ?? null,
+              },
+              last_activity_at: live.lastActivityAt,
+              ...(live.updatedAt === null
+                ? {}
+                : { updated_at: live.updatedAt }),
+            };
           },
         };
         return {
@@ -1150,7 +1193,11 @@ describe.skipIf(!dbUp)(
           { makeClient: stub.makeClient },
           appDb,
         );
-        expect(stub.calls).toEqual(["assignToAgent", "toggleStatus"]);
+        expect(stub.calls).toEqual([
+          "assignToAgent",
+          "toggleStatus",
+          "getConversation",
+        ]);
         // Serialized after the version we hold, but before the operator clicked. Higher version,
         // older truth.
         await mirror(
@@ -1196,6 +1243,176 @@ describe.skipIf(!dbUp)(
         expect((await mirrored(41)).status).toBe("resolved");
       });
 
+      // Issue #77. The tails above are MESSAGE events, which stopped writing conversation state in
+      // #61. A conversation event is the case that remained: Chatwoot may have serialized one before
+      // the operator clicked and still be retrying its delivery (AgentBots::WebhookJob retries 3x at
+      // 3s), so it lands after the local write carrying the pre-click truth AND a higher version than
+      // the row's stamp — because the local write had no version to claim.
+      test("a take-over in the console survives a CONVERSATION event serialized before it", async () => {
+        const T = 1_786_504_000;
+        await mirror({
+          event: "conversation_updated",
+          ...convPayload(60, {
+            status: "pending",
+            lastActivityAt: T,
+            updatedAt: T + 0.1,
+          }),
+        });
+        // The GET after the write reports the conversation as it now is, at the version our write
+        // produced — later than anything serialized before the click.
+        const stub = stubClient({
+          status: "open",
+          assignee: HUMAN,
+          lastActivityAt: T,
+          updatedAt: T + 0.5,
+        });
+        await handoffConversation(
+          opCtx(),
+          await rowIdOf(60),
+          HUMAN.id,
+          { makeClient: stub.makeClient },
+          appDb,
+        );
+        expect(stub.calls).toContain("getConversation");
+        await mirror({
+          event: "conversation_updated",
+          ...convPayload(60, {
+            status: "pending",
+            lastActivityAt: T,
+            updatedAt: T + 0.3,
+          }),
+        });
+        const row = await mirrored(60);
+        expect(row.assigneeType).toBe("User");
+        expect(row.assigneeId).toBe(HUMAN.id);
+        expect(row.status).toBe("open");
+      });
+
+      test("a resolve in the console survives one too", async () => {
+        const T = 1_786_505_000;
+        await mirror({
+          event: "conversation_updated",
+          ...convPayload(61, {
+            status: "open",
+            lastActivityAt: T,
+            updatedAt: T + 0.1,
+          }),
+        });
+        const stub = stubClient({
+          status: "resolved",
+          lastActivityAt: T,
+          updatedAt: T + 0.5,
+        });
+        await setConversationStatus(
+          opCtx(),
+          await rowIdOf(61),
+          "resolved",
+          { makeClient: stub.makeClient },
+          appDb,
+        );
+        await mirror({
+          event: "conversation_updated",
+          ...convPayload(61, {
+            status: "open",
+            lastActivityAt: T,
+            updatedAt: T + 0.3,
+          }),
+        });
+        expect((await mirrored(61)).status).toBe("resolved");
+      });
+
+      // A snapshot with no version buys nothing and can cost: the reconcile applies the WHOLE snapshot,
+      // so a status click would carry back an assignee a webhook has since changed. Without a version
+      // the console writes exactly the fields its own action meant to change.
+      test("an unversioned snapshot does not let a status change touch the assignee", async () => {
+        const T = 1_786_507_000;
+        await mirror({
+          event: "conversation_updated",
+          ...convPayload(63, {
+            status: "open",
+            assignee: HUMAN,
+            lastActivityAt: T,
+            updatedAt: T + 0.1,
+          }),
+        });
+        // The GET answers without `updated_at` (a Chatwoot too old to serialize it) AND with a stale
+        // assignee: unassigned, as it was before the human took it.
+        const stub = stubClient({
+          status: "resolved",
+          assignee: null,
+          lastActivityAt: T,
+          updatedAt: null,
+        });
+        await setConversationStatus(
+          opCtx(),
+          await rowIdOf(63),
+          "resolved",
+          { makeClient: stub.makeClient },
+          appDb,
+        );
+        const row = await mirrored(63);
+        expect(row.status).toBe("resolved");
+        expect(row.assigneeType).toBe("User");
+        expect(row.assigneeId).toBe(HUMAN.id);
+      });
+
+      // A row with no marks cannot be ordered by version, so the coarse activity comparison decides —
+      // and `lastEventAt` may have been synthesized from receipt time, which makes it reject a
+      // snapshot that is actually newer. Treating that no-op as success left the operator's action
+      // absent from the mirror, and the runtime's ownership recheck reads this row.
+      test("a read rejected by activity alone still leaves the console's write applied", async () => {
+        const T = 1_786_508_000;
+        // Mirrored WITHOUT a version (a Chatwoot too old to send one), so the row keeps null marks
+        // and a lastEventAt this test then pushes ahead of the snapshot's activity time.
+        await mirror({
+          event: "conversation_updated",
+          ...convPayload(64, { status: "pending", lastActivityAt: T + 30 }),
+        });
+        const stub = stubClient({
+          status: "open",
+          assignee: HUMAN,
+          lastActivityAt: T,
+          updatedAt: T + 50,
+        });
+        await handoffConversation(
+          opCtx(),
+          await rowIdOf(64),
+          HUMAN.id,
+          { makeClient: stub.makeClient },
+          appDb,
+        );
+        const row = await mirrored(64);
+        expect(row.assigneeType).toBe("User");
+        expect(row.assigneeId).toBe(HUMAN.id);
+        expect(row.status).toBe("open");
+      });
+
+      // The version is an improvement on the write, not a precondition for it: when the extra read
+      // fails there is nothing to claim, and the console must still reflect what the operator did.
+      test("a GET that fails still leaves the console's write applied", async () => {
+        const T = 1_786_506_000;
+        await mirror({
+          event: "conversation_updated",
+          ...convPayload(62, {
+            status: "pending",
+            lastActivityAt: T,
+            updatedAt: T + 0.1,
+          }),
+        });
+        const stub = stubClient(null);
+        await handoffConversation(
+          opCtx(),
+          await rowIdOf(62),
+          HUMAN.id,
+          { makeClient: stub.makeClient },
+          appDb,
+        );
+        const row = await mirrored(62);
+        expect(row.assigneeType).toBe("User");
+        expect(row.assigneeId).toBe(HUMAN.id);
+        expect(row.status).toBe("open");
+      });
+
       // Not over-fenced: a brand-new customer message genuinely reopens, and that reopen is
       // Chatwoot's own doing, not a stale snapshot.
       test("a new incoming message still reopens a conversation resolved in the console", async () => {
@@ -1226,6 +1443,100 @@ describe.skipIf(!dbUp)(
           }),
         );
         expect((await mirrored(43)).status).toBe("open");
+      });
+
+      // The console renders the click optimistically off this publish and only reconciles when the
+      // inbound webhook arrives, which may be seconds later or (on a conversation Chatwoot has
+      // nothing more to say about) never. So a publish of the INTENT after a write that did not land
+      // is the last word the operator gets, and it shows a state nobody holds.
+      test("the optimistic publish announces the row as stored, not as clicked", async () => {
+        const T = 1_786_509_000;
+        // A webhook already carried this conversation past the version our own write can claim: it
+        // was resolved and unassigned at T+90, and the GET after the handoff still answers with the
+        // older T+50 snapshot.
+        await mirror({
+          event: "conversation_resolved",
+          ...convPayload(66, {
+            status: "resolved",
+            lastActivityAt: T,
+            updatedAt: T + 90,
+          }),
+        });
+        const stub = stubClient({
+          status: "open",
+          assignee: HUMAN,
+          lastActivityAt: T,
+          updatedAt: T + 50,
+        });
+        const published: ServerEventLike[] = [];
+        setPublisher((_topic, data) => {
+          published.push(JSON.parse(data) as ServerEventLike);
+        });
+        try {
+          await handoffConversation(
+            opCtx(),
+            await rowIdOf(66),
+            HUMAN.id,
+            { makeClient: stub.makeClient },
+            appDb,
+          );
+        } finally {
+          setPublisher(() => undefined);
+        }
+        const event = published.find((e) => e.type === "conversation");
+        expect(event).toBeDefined();
+        expect(event?.status).toBe("resolved");
+        expect(event?.assigneeId).toBeNull();
+        expect(event?.assigneeType).toBeNull();
+        // And the row agrees with what was announced: the reconcile wrote nothing over the newer
+        // version, and the unversioned fallback did not run behind its back.
+        const row = await mirrored(66);
+        expect(row.status).toBe("resolved");
+        expect(row.assigneeId).toBeNull();
+      });
+
+      // Same rule, applied to the field the list SORTS by. The read after the write is the first
+      // sight of a message the mirror had not processed yet, so this call is what advances the
+      // stored recency — and a publish of the timestamp loaded before the action puts the row back
+      // where it was in the ordering, against a mirror that already moved it.
+      test("the optimistic publish carries the recency the reconcile stored", async () => {
+        const T = 1_786_510_000;
+        await mirror({
+          event: "conversation_updated",
+          ...convPayload(67, {
+            status: "pending",
+            lastActivityAt: T,
+            updatedAt: T + 1,
+          }),
+        });
+        // A customer message landed while the operator was clicking, and the GET is where we see it.
+        const stub = stubClient({
+          status: "open",
+          assignee: HUMAN,
+          lastActivityAt: T + 120,
+          updatedAt: T + 2,
+        });
+        const published: ServerEventLike[] = [];
+        setPublisher((_topic, data) => {
+          published.push(JSON.parse(data) as ServerEventLike);
+        });
+        try {
+          await handoffConversation(
+            opCtx(),
+            await rowIdOf(67),
+            HUMAN.id,
+            { makeClient: stub.makeClient },
+            appDb,
+          );
+        } finally {
+          setPublisher(() => undefined);
+        }
+        const row = await mirrored(67);
+        expect(row.lastEventAt?.getTime()).toBe((T + 120) * 1000);
+        const event = published.find((e) => e.type === "conversation");
+        expect(event?.lastEventAt).toBe(
+          new Date((T + 120) * 1000).toISOString(),
+        );
       });
     });
   },
