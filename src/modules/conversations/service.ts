@@ -5,7 +5,6 @@ import basePrisma from "@/api/lib/prisma";
 import { modelConfigSchema } from "@/graph/model-config";
 import { AppError, NotFoundError } from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
-import { isTestSilenced } from "@/modules/agents/test-mode";
 import { loadAppointmentContext } from "@/modules/appointments/context";
 import {
   isOutOfHoursNow,
@@ -18,7 +17,7 @@ import {
   loadAgentBot,
   loadChatwootClient,
 } from "@/modules/chatwoot/instance";
-import { shouldBotHandle } from "@/modules/chatwoot/normalize";
+import { isFollowUpLive } from "@/modules/followups/eligibility";
 import type { FollowUpDelayUnit } from "@/modules/followups/settings";
 import {
   isNewFollowUpEpisode,
@@ -355,6 +354,16 @@ export interface ConversationDetail {
     // an indicator that promises a follow-up the sweep suppresses is indistinguishable from a broken
     // scheduler, which is the worst failure mode for an indicator whose whole job is to be trusted.
     pausedByAppointment: boolean;
+    // A follow-up job IS armed for this conversation and the handler will drop it when it claims it
+    // (isFollowUpLive: agent enabled, follow-up on, not redirect-managed, not test-silenced, bot
+    // still owns the conversation). Nothing is coming, but nothing completed either — so the console
+    // must show neither a countdown nor the "sequence complete" marker.
+    //
+    // It is keyed on a job EXISTING, not on liveness alone, because the two look identical from the
+    // outside and mean opposite things: a sequence whose last step is configured to resolve the
+    // conversation ends with the bot no longer owning it, which is a completed sequence, not an
+    // abandoned one. What separates them is whether a step is still queued.
+    abandoned: boolean;
   } | null;
   // Pending appointment reminders for THIS conversation (deterministic Calendar-booked reminders), for
   // an operator-facing "a reminder is scheduled" indicator. One entry per pending scheduler job, soonest
@@ -606,6 +615,7 @@ export async function getConversationDetail(
             where: { id: agentId },
             select: {
               name: true,
+              enabled: true,
               mode: true,
               settings: true,
               modelConfig: true,
@@ -633,6 +643,18 @@ export async function getConversationDetail(
       inboxCwId != null &&
       (redirectCfg.widgetInboxId === inboxCwId ||
         redirectCfg.entryInboxId === inboxCwId);
+    // Whether a follow-up for this conversation is alive AT ALL, by the same predicate the handler
+    // re-checks when it claims the job. Both branches below are gated on it: the estimate because the
+    // sweep would never enqueue it, and the armed job because the handler would drop it (issue #72).
+    const followUpLive = isFollowUpLive({
+      agentEnabled: agent?.enabled ?? false,
+      followUpEnabled: cfg.enabled,
+      managedByRedirect,
+      agentMode: agent?.mode ?? "production",
+      testActivatedAt: conv.testActivatedAt,
+      status: conv.status,
+      assigneeType: conv.assigneeType,
+    });
     const isRedirectWidgetConv =
       redirectCfg.enabled &&
       inboxCwId != null &&
@@ -682,7 +704,7 @@ export async function getConversationDetail(
       (agent?.followUpArmedAt == null ||
         conv.lastInboundAt == null ||
         conv.lastInboundAt < agent.followUpArmedAt);
-    if (job && !fencedStep0Job) {
+    if (job && !fencedStep0Job && followUpLive) {
       const stepIndex = jobStepIndex;
       nextStep = stepIndex + 1;
       // job.runAt is NOT the firing time yet — the sweep enqueues step 0 with runAt=now (and re-arms
@@ -714,8 +736,7 @@ export async function getConversationDetail(
       // test-silenced, and we know when the conversation last moved. The episode predicate MUST match
       // the sweep/handler (isNewFollowUpEpisode) or the indicator disagrees with what actually fires.
       // (managedByRedirect already forces job=null; guard the estimate too so it stays suppressed.)
-      !managedByRedirect &&
-      cfg.enabled &&
+      followUpLive &&
       firstStep &&
       isNewFollowUpEpisode(conv.lastFollowUpAt, conv.lastInboundAt) &&
       // NOTE: Activation fence (mirrors the sweep SQL): no estimate for an episode that began before
@@ -723,12 +744,7 @@ export async function getConversationDetail(
       agent?.followUpArmedAt != null &&
       conv.lastInboundAt != null &&
       conv.lastInboundAt >= agent.followUpArmedAt &&
-      conv.lastEventAt &&
-      shouldBotHandle({
-        status: conv.status,
-        assigneeType: conv.assigneeType,
-      }) &&
-      !isTestSilenced(agent?.mode ?? "production", conv.testActivatedAt)
+      conv.lastEventAt
     ) {
       nextStep = 1;
       let dueAt = new Date(
@@ -824,6 +840,7 @@ export async function getConversationDetail(
       managedByRedirect,
       redirectNext,
       pausedByAppointment,
+      abandoned: job !== null && !followUpLive,
     };
   }
 
