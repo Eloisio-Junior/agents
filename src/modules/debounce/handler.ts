@@ -24,10 +24,15 @@ import {
   clearConversationError,
   recordConversationError,
 } from "@/modules/conversations/error";
+import { announceFailedTurn } from "@/modules/conversations/failure-note";
 import { emitFlowEvent } from "@/modules/flowlog/service";
 import type { FlowStage } from "@/modules/flowlog/stages";
 import type { ClaimedJob } from "@/modules/scheduler/service";
-import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
+import {
+  type JobResult,
+  registerDeadLetterHandler,
+  registerJobHandler,
+} from "@/modules/scheduler/worker";
 import { readLastMessageId } from "./service";
 import { readDebounceConfig } from "./settings";
 import { advanceHandledWatermark } from "./watermark";
@@ -378,9 +383,46 @@ function debounceFlushHandler(
   return flushDebounceJob({ job, base });
 }
 
+// The burst is definitively unanswered: the flush exhausted its attempts and the row is DEAD, so no
+// retry is coming and the customer is waiting on nobody. This is the only place on this path where
+// that can be said — the handler's catch runs on attempt 1 too, and cannot know whether another
+// attempt exists (issue #71).
+export async function announceDeadDebounceFlush(
+  job: ClaimedJob,
+  error: string,
+  base: PrismaClient,
+): Promise<void> {
+  const threadId =
+    typeof job.payload.threadId === "string" ? job.payload.threadId : null;
+  if (!threadId) return;
+  const parsed = parseThreadId(threadId);
+  if (!parsed || parsed.tenantId !== job.tenantId) return;
+  await announceFailedTurn({
+    tenantId: job.tenantId,
+    instanceId: parsed.instanceId,
+    chatwootConversationId: parsed.conversationId,
+    // NOTE: Re-read rather than trust the dead-letter that got us here: `armDebounce` upserts this
+    // very row back to PENDING on the next inbound message, and a row that is queued again is a turn
+    // that is coming — announcing over it is what would make an operator take over and close the
+    // gate that queued flush depends on.
+    assess: async () => {
+      const row = await runScopedOn(base, sysCtx(job.tenantId), (db) =>
+        db.schedulerJob.findUnique({
+          where: { id: job.id },
+          select: { status: true },
+        }),
+      );
+      return { path: "job", deadLettered: row?.status === "DEAD" };
+    },
+    error,
+    base,
+  });
+}
+
 let registered = false;
 export function registerDebounceHandler(): void {
   if (registered) return;
   registerJobHandler("DEBOUNCE", debounceFlushHandler);
+  registerDeadLetterHandler("DEBOUNCE", announceDeadDebounceFlush);
   registered = true;
 }
