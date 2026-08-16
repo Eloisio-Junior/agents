@@ -1845,6 +1845,8 @@
     "emptyDesc": "Define a tool once, then grant it to the agents that need it.",
     "emptyTitle": "No HTTP tools yet",
     "enumValuePlaceholder": "value",
+    "expectedStatuses": "Statuses that mean 'no result'",
+    "expectedStatusesHint": "Comma-separated, e.g. 404. Use it when this API answers with an error status for an ordinary answer — a lookup that returns 404 for 'no record'. Those responses stop counting as integration failures, so they no longer raise alerts. The AI reads the same reply either way. Leave empty and every non-2xx is treated as a failure.",
     "formatJson": "Format",
     "headerKey": "Header",
     "headers": "Headers",
