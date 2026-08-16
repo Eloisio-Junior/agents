@@ -1235,7 +1235,8 @@
       "PENDING": "Pending",
       "PROCESSING": "Processing...",
       "READY": "{{n}} trechos",
-      "UNINDEXED": "Not indexed"
+      "UNINDEXED": "Not indexed",
+      "UNINDEXED_BLOCKED": "Not indexed: blocked"
     },
     "docTitle": "Title",
     "docTitleLabel": "Title",
@@ -1247,6 +1248,11 @@
     "docUpdateError": "Could not update the document.",
     "dropHint": "Arraste e solte um arquivo aqui, ou clique para escolher",
     "editTitle": "Edit knowledge base",
+    "embeddingBlock": {
+      "empty": "The embedding credential is empty. Fill it in, then index again.",
+      "notConfigured": "The embedding credential is not configured for this workspace. Set it under Components, then index again.",
+      "pending": "The embedding credential was never filled in. Fill it under Components, then index again."
+    },
     "emptyDesc": "Create one and ingest your FAQs, docs or product info.",
     "emptyTitle": "No knowledge bases yet",
     "fileHint": "PDF, DOCX, TXT, MD, CSV",
@@ -1258,8 +1264,6 @@
     "index": "Index",
     "indexAll": "Index all ({{n}})",
     "indexAllError": "Could not start indexing.",
-    "indexBlockedCredentialPending": "The embedding credential isn't filled yet. Fill its secret in the vault, then try again.",
-    "indexBlockedNotConfigured": "Embedding is not configured. Set the tenant's embedding (provider/model/credential) before indexing.",
     "indexing": "Indexing…",
     "loadError": "Could not load this base.",
     "name": "Name",

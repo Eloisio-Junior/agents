@@ -1239,7 +1239,8 @@
       "PENDING": "Pendente",
       "PROCESSING": "Processando...",
       "READY": "{{n}} trechos",
-      "UNINDEXED": "Não indexado"
+      "UNINDEXED": "Não indexado",
+      "UNINDEXED_BLOCKED": "Não indexado: bloqueado"
     },
     "docTitle": "Título",
     "docTitleLabel": "Título",
@@ -1252,6 +1253,11 @@
     "docUpdateError": "Não foi possível atualizar o documento.",
     "dropHint": "Arraste e solte arquivos aqui, ou clique para escolher",
     "editTitle": "Editar base de conhecimento",
+    "embeddingBlock": {
+      "empty": "A credencial de embedding está vazia. Preencha-a e indexe novamente.",
+      "notConfigured": "A credencial de embedding não está configurada neste workspace. Configure em Componentes e indexe novamente.",
+      "pending": "A credencial de embedding existe mas nunca foi preenchida. Preencha em Componentes e indexe novamente."
+    },
     "emptyDesc": "Crie uma e adicione seus FAQs, documentos ou informações de produto.",
     "emptyTitle": "Nenhuma base de conhecimento ainda",
     "fileHint": "PDF, DOCX, TXT, MD, CSV",
@@ -1263,8 +1269,6 @@
     "index": "Indexar",
     "indexAll": "Indexar todos ({{n}})",
     "indexAllError": "Não foi possível iniciar a indexação.",
-    "indexBlockedCredentialPending": "A credencial de embedding ainda não foi preenchida. Preencha o segredo no vault e tente de novo.",
-    "indexBlockedNotConfigured": "Embedding não configurado. Configure o embedding do tenant (provedor/modelo/credencial) antes de indexar.",
     "indexing": "Indexando…",
     "loadError": "Não foi possível carregar esta base.",
     "name": "Nome",
