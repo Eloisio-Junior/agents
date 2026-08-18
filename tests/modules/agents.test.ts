@@ -950,10 +950,16 @@ describe.skipIf(!dbUp)("agents create/clone/delete/tool-selections", () => {
       data: { settings: { handoff: { instructions: legacy } } },
       select: { updatedAt: true },
     });
-    // Someone else shortens it while this editor holds the old bag.
+    // Someone else shortens it while this editor holds the old bag. The stamp is set explicitly
+    // because `updatedAt` is client-side and ms-resolution: two back-to-back writes land in the
+    // same millisecond often enough to matter (3 in 40 here), and when they do the held token
+    // still matches, no conflict is raised, and the cap check answers the 400 this test forbids.
     await suDb.agent.update({
       where: { id: BigInt(a.id) },
-      data: { settings: { handoff: { instructions: "short now" } } },
+      data: {
+        settings: { handoff: { instructions: "short now" } },
+        updatedAt: new Date(seeded.updatedAt.getTime() + 1000),
+      },
     });
     try {
       await updateAgent(
