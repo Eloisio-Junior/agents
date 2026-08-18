@@ -442,3 +442,412 @@ describe("computeConfigIssues — redirect enabled but incomplete", () => {
     });
   });
 });
+
+// A stored ref can point at a vault entry that no longer exists. Deleting an entry is not blocked by
+// its references (the vault's delete is a plain deleteMany; the reference list it shows is
+// informational), and `PATCH /v1/agents/:id` stores whatever ref it is handed, name or id. The
+// runtime is where it lands: the agent's own model logs "cannot reply until it is fixed", and
+// STT/vision/TTS/the speech rewrite skip with a warn line nobody is watching for. Which makes this
+// panel the one place it can be caught before the next customer message, and it stayed green.
+describe("computeConfigIssues — a credential whose vault entry is gone", () => {
+  const linked = {
+    key: "model",
+    tab: "general",
+    sectionId: "general-model",
+  } as const;
+
+  test("flags the model credential when the vault no longer holds it", () => {
+    expect(
+      computeConfigIssues({ ...base, knownRefs: new Set(["vault:7"]) }),
+    ).toEqual([{ ...linked, unresolved: true }]);
+  });
+
+  // The vault list arrives one request after the first paint. An empty set would mean "no credential
+  // resolves" and light up every field on screen for a moment, so "not loaded" has to be its own
+  // value and it has to mean silence.
+  test("raises nothing while the vault has not loaded (undefined or null)", () => {
+    expect(computeConfigIssues(base)).toEqual([]);
+    expect(computeConfigIssues({ ...base, knownRefs: null })).toEqual([]);
+  });
+
+  // Refs are resolved by id and only by id (`vaultRefWhere` matches `vault:<id>`; anything else falls
+  // through to a never-matching row). A name reaches the field over MCP and REST, reads as configured
+  // in the editor, and resolves to nothing at runtime — the same failure by another spelling.
+  test("flags a ref stored as a name, which no resolver will ever match", () => {
+    expect(
+      computeConfigIssues({
+        ...base,
+        modelCredentialRef: "openai-key",
+        knownRefs: new Set(["vault:1"]),
+      }),
+    ).toEqual([{ ...linked, unresolved: true }]);
+  });
+
+  // A pending entry EXISTS, so it is in the known set; the two states cannot both be true. Asserted
+  // anyway because the fixes differ: pending opens the fill modal, unresolved sends the operator
+  // back to the field to pick another key.
+  test("a pending entry is reported as pending, never as unresolved", () => {
+    expect(
+      computeConfigIssues({
+        ...base,
+        pendingRefs: new Set(["vault:1"]),
+        knownRefs: new Set(["vault:1"]),
+      }),
+    ).toEqual([{ ...linked, pending: true, vaultId: "1" }]);
+  });
+
+  test("flags stt, tts and vision the same way, each to its own section", () => {
+    const issues = computeConfigIssues({
+      ...base,
+      sttEnabled: true,
+      sttCredentialRef: "vault:9",
+      ttsMode: "mirror",
+      ttsCredentialRef: "vault:8",
+      visionEnabled: true,
+      visionCredentialRef: "vault:6",
+      knownRefs: new Set(["vault:1"]),
+    });
+    expect(
+      issues.map((i) => `${i.key}:${i.unresolved}:${i.sectionId}`),
+    ).toEqual(["stt:true:stt", "tts:true:tts", "vision:true:vision"]);
+  });
+
+  test("flags the speech rewrite's own credential", () => {
+    expect(
+      computeConfigIssues({
+        ...base,
+        ttsMode: "mirror",
+        ttsCredentialRef: "vault:2",
+        ttsNormalize: true,
+        ttsNormalizeProvider: "anthropic",
+        ttsNormalizeCredentialRef: "vault:3",
+        knownRefs: new Set(["vault:1", "vault:2"]),
+      }),
+    ).toEqual([
+      {
+        key: "ttsNormalize",
+        tab: "behavior",
+        sectionId: "tts",
+        unresolved: true,
+      },
+    ]);
+  });
+
+  // The rewrite has a second, earlier way to be unusable: the resolver refusing the bag outright.
+  // That verdict does not depend on the vault, and it is the one the operator has to act on first,
+  // so it stays the single issue raised.
+  test("a bag the resolver refuses stays one issue, not two", () => {
+    expect(
+      computeConfigIssues({
+        ...base,
+        ttsMode: "mirror",
+        ttsCredentialRef: "vault:2",
+        ttsNormalize: true,
+        ttsNormalizeProvider: "not-a-provider",
+        ttsNormalizeCredentialRef: "vault:3",
+        knownRefs: new Set(["vault:1", "vault:2"]),
+      }),
+    ).toEqual([{ key: "ttsNormalize", tab: "behavior", sectionId: "tts" }]);
+  });
+
+  // The tenant's embedding key is the sixth ref that can dangle, and it fails the same way: the
+  // per-base "index me" prompts would all fail on a key that is not there, so the root cause is the
+  // one issue raised.
+  test("flags the tenant embedding credential instead of the per-base index prompts", () => {
+    expect(
+      computeConfigIssues({
+        ...base,
+        knowledgeBasesNeedingIndex: [{ id: "5", name: "FAQ" }],
+        embeddingCredentialRef: "vault:7",
+        knownRefs: new Set(["vault:1"]),
+      }),
+    ).toEqual([{ key: "embedding", unresolved: true }]);
+  });
+});
+
+// `vault:007` and `vault:7` are the same entry: the runtime parses the id with BigInt, so a
+// noncanonical spelling resolves fine. It reaches the field the way every unvalidated ref does,
+// through `PATCH /v1/agents/:id`, which stores what it is handed. Comparing raw strings against a
+// list that only ever holds the canonical spelling would call a working credential deleted, which
+// is a worse failure than the silence this whole change replaced.
+describe("computeConfigIssues — noncanonical ref spellings", () => {
+  test("a padded id resolves against the canonical list", () => {
+    expect(
+      computeConfigIssues({
+        ...base,
+        modelCredentialRef: "vault:0001",
+        knownRefs: new Set(["vault:1"]),
+      }),
+    ).toEqual([]);
+  });
+
+  test("a padded id still reports pending, with the canonical vaultId", () => {
+    expect(
+      computeConfigIssues({
+        ...base,
+        modelCredentialRef: "vault:0001",
+        knownRefs: new Set(["vault:1"]),
+        pendingRefs: new Set(["vault:1"]),
+      }),
+    ).toEqual([
+      {
+        key: "model",
+        tab: "general",
+        sectionId: "general-model",
+        pending: true,
+        vaultId: "1",
+      },
+    ]);
+  });
+
+  test("a ref whose id is not a number is unresolvable, like a name", () => {
+    expect(
+      computeConfigIssues({
+        ...base,
+        modelCredentialRef: "vault:abc",
+        knownRefs: new Set(["vault:1"]),
+      }),
+    ).toEqual([
+      {
+        key: "model",
+        tab: "general",
+        sectionId: "general-model",
+        unresolved: true,
+      },
+    ]);
+  });
+});
+
+// An OpenAI-compatible model authenticates through its base URL, so it needs no credential — which
+// is a statement about a credential being ABSENT, and it was being read as "this field is never
+// checked". A ref that IS set has to resolve whatever the provider is: `loadAgentConfig` resolves
+// it before it looks at the provider, and returns null for the whole agent when it cannot, so the
+// agent goes silent on every message.
+describe("computeConfigIssues — an openai-compatible model with a ref of its own", () => {
+  const compat = { ...base, modelProvider: "openai-compatible" };
+
+  test("still raises nothing when no credential is set", () => {
+    expect(
+      computeConfigIssues({
+        ...compat,
+        modelCredentialRef: "",
+        knownRefs: new Set(["vault:1"]),
+      }),
+    ).toEqual([]);
+  });
+
+  test("flags a credential it does set whose entry is gone", () => {
+    expect(
+      computeConfigIssues({ ...compat, knownRefs: new Set(["vault:9"]) }),
+    ).toEqual([
+      {
+        key: "model",
+        tab: "general",
+        sectionId: "general-model",
+        unresolved: true,
+      },
+    ]);
+  });
+
+  test("flags a credential it does set that is still pending", () => {
+    expect(
+      computeConfigIssues({
+        ...compat,
+        pendingRefs: new Set(["vault:1"]),
+        knownRefs: new Set(["vault:1"]),
+      }),
+    ).toEqual([
+      {
+        key: "model",
+        tab: "general",
+        sectionId: "general-model",
+        pending: true,
+        vaultId: "1",
+      },
+    ]);
+  });
+});
+
+// The seventh credential the agent can hold, and the only one whose failure lets messages through
+// UNSCREENED: `loadAgentConfig` fails open when the guardrails credential does not resolve, so the
+// analysis is skipped and every message is delivered as if it had been reviewed and approved.
+describe("computeConfigIssues — the guardrails credential", () => {
+  const guarded = { ...base, guardrailsEnabled: true };
+  const at = { tab: "guardrails", sectionId: "gr-model" } as const;
+
+  test("raises nothing while guardrails are off, whatever the ref says", () => {
+    expect(
+      computeConfigIssues({
+        ...base,
+        guardrailsEnabled: false,
+        guardrailsCredentialRef: "vault:404",
+        knownRefs: new Set(["vault:1"]),
+      }),
+    ).toEqual([]);
+  });
+
+  test("flags guardrails enabled with no credential", () => {
+    expect(
+      computeConfigIssues({ ...guarded, guardrailsCredentialRef: "" }),
+    ).toEqual([{ key: "guardrails", ...at }]);
+  });
+
+  test("flags a pending guardrails credential", () => {
+    expect(
+      computeConfigIssues({
+        ...guarded,
+        guardrailsCredentialRef: "vault:5",
+        pendingRefs: new Set(["vault:5"]),
+        knownRefs: new Set(["vault:1", "vault:5"]),
+      }),
+    ).toEqual([{ key: "guardrails", ...at, pending: true, vaultId: "5" }]);
+  });
+
+  test("flags a guardrails credential whose entry is gone", () => {
+    expect(
+      computeConfigIssues({
+        ...guarded,
+        guardrailsCredentialRef: "vault:5",
+        knownRefs: new Set(["vault:1"]),
+      }),
+    ).toEqual([{ key: "guardrails", ...at, unresolved: true }]);
+  });
+});
+
+// Found by sweeping the panel's own inputs rather than by a review round: the rewrite's endpoint can
+// live on its CREDENTIAL, and the browser learns credential endpoints from the same vault list that
+// arrives a request after the first paint. Judged before that answer exists, an endpoint that is
+// merely unread reads as absent, and the panel announces that a runnable rewrite cannot run — the
+// same false alarm the null-until-loaded rule exists to prevent, arriving through the endpoint
+// instead of through the ref.
+describe("computeConfigIssues — the rewrite endpoint while the vault is unknown", () => {
+  const compatRewrite = {
+    ...base,
+    ttsMode: "mirror",
+    ttsCredentialRef: "vault:2",
+    ttsNormalize: true,
+    ttsNormalizeProvider: "openai-compatible",
+    ttsNormalizeCredentialRef: "vault:3",
+    ttsNormalizeBaseURL: "",
+  };
+
+  test("holds the endpoint refusal while the vault has not answered", () => {
+    expect(computeConfigIssues({ ...compatRewrite, knownRefs: null })).toEqual(
+      [],
+    );
+  });
+
+  test("raises it once the vault has answered and the endpoint is still nowhere", () => {
+    expect(
+      computeConfigIssues({
+        ...compatRewrite,
+        knownRefs: new Set(["vault:1", "vault:2", "vault:3"]),
+      }),
+    ).toEqual([{ key: "ttsNormalize", tab: "behavior", sectionId: "tts" }]);
+  });
+
+  // Only the endpoint answer comes from the vault. A bag naming a provider that does not exist is
+  // wrong on its face, and waiting on a list that cannot change that verdict would just delay it.
+  test("still refuses a bag the vault could not rescue", () => {
+    expect(
+      computeConfigIssues({
+        ...compatRewrite,
+        ttsNormalizeProvider: "not-a-provider",
+        knownRefs: null,
+      }),
+    ).toEqual([{ key: "ttsNormalize", tab: "behavior", sectionId: "tts" }]);
+  });
+});
+
+// The endpoint refusal waits for the vault, but only where the vault could still change it. A
+// failed vault load leaves that answer missing INDEFINITELY (nothing retries until a mutation or a
+// reload), so deferring a verdict the vault cannot rescue would not delay a warning, it would
+// delete one.
+describe("computeConfigIssues — which endpoint refusals wait for the vault", () => {
+  const audio = { ...base, ttsMode: "mirror", ttsCredentialRef: "vault:2" };
+
+  test("an undialable endpoint with no credential to correct it is decided now", () => {
+    expect(
+      computeConfigIssues({
+        ...audio,
+        ttsNormalize: true,
+        ttsNormalizeProvider: "openai-compatible",
+        ttsNormalizeBaseURL: "llama:8080",
+        knownRefs: null,
+      }),
+    ).toEqual([{ key: "ttsNormalize", tab: "behavior", sectionId: "tts" }]);
+  });
+
+  // A stated endpoint does not settle the question, because a credential's own base URL WINS over
+  // the typed one, here and in the runtime alike — so an unread credential can still replace an
+  // undialable string with a working host, and calling the rewrite dead before reading it would be
+  // wrong in the same way it was wrong with no endpoint at all.
+  test("waits on an undialable endpoint that a credential could still replace", () => {
+    expect(
+      computeConfigIssues({
+        ...audio,
+        ttsNormalize: true,
+        ttsNormalizeProvider: "openai-compatible",
+        ttsNormalizeCredentialRef: "vault:3",
+        ttsNormalizeBaseURL: "llama:8080",
+        knownRefs: null,
+      }),
+    ).toEqual([]);
+  });
+
+  test("no endpoint and no credential anywhere is decided without the vault", () => {
+    expect(
+      computeConfigIssues({
+        ...audio,
+        savedModelProvider: "openai",
+        ttsNormalize: true,
+        ttsNormalizeProvider: "openai-compatible",
+        ttsNormalizeBaseURL: "",
+        knownRefs: null,
+      }),
+    ).toEqual([{ key: "ttsNormalize", tab: "behavior", sectionId: "tts" }]);
+  });
+
+  test("waits when the rewrite's own credential could carry the endpoint", () => {
+    expect(
+      computeConfigIssues({
+        ...audio,
+        ttsNormalize: true,
+        ttsNormalizeProvider: "openai-compatible",
+        ttsNormalizeCredentialRef: "vault:3",
+        ttsNormalizeBaseURL: "",
+        knownRefs: null,
+      }),
+    ).toEqual([]);
+  });
+
+  // Inheriting the agent's model means inheriting its endpoint, and the agent's endpoint can live on
+  // the agent's credential — read from the same list.
+  test("waits when the inherited agent credential could carry it", () => {
+    expect(
+      computeConfigIssues({
+        ...audio,
+        savedModelProvider: "openai-compatible",
+        savedModelCredentialRef: "vault:1",
+        savedModelBaseURL: "",
+        ttsNormalize: true,
+        ttsNormalizeProvider: "",
+        ttsNormalizeBaseURL: "",
+        knownRefs: null,
+      }),
+    ).toEqual([]);
+  });
+
+  test("stops waiting once the vault has answered and nothing supplied one", () => {
+    expect(
+      computeConfigIssues({
+        ...audio,
+        ttsNormalize: true,
+        ttsNormalizeProvider: "openai-compatible",
+        ttsNormalizeCredentialRef: "vault:3",
+        ttsNormalizeBaseURL: "",
+        knownRefs: new Set(["vault:1", "vault:2", "vault:3"]),
+      }),
+    ).toEqual([{ key: "ttsNormalize", tab: "behavior", sectionId: "tts" }]);
+  });
+});
