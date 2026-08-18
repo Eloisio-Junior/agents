@@ -1,3 +1,6 @@
+import { isValidHttpUrl } from "@/client/lib/validation";
+import { resolveNormalizeModel } from "@/modules/tts/normalize-model";
+
 // Live configuration-health checks for the agent editor (item 1): detect features that are turned on
 // but missing the credential they need to actually run. The common trigger is importing an agent —
 // the import never carries secrets, so every credential ref comes back unset. Each issue carries a
@@ -7,6 +10,7 @@ export type ConfigIssueKey =
   | "model"
   | "stt"
   | "tts"
+  | "ttsNormalize"
   | "vision"
   | "knowledge"
   | "embedding"
@@ -32,13 +36,30 @@ export interface ConfigIssue {
 }
 
 export interface ConfigHealthInput {
+  // The agent's model as the operator is EDITING it: this pair answers "does the model have a key",
+  // which is a question about what the General tab is about to save.
   modelProvider: string;
   modelCredentialRef: string;
+  // The agent's model as STORED, with its EFFECTIVE endpoint (a credential that carries one wins
+  // over the typed field). Separate from the pair above on purpose: the speech rewrite inherits
+  // from the SAVED model, because the editor's tabs save independently and a Behavior save carries
+  // none of General's pending edits.
+  savedModelProvider: string;
+  savedModelBaseURL?: string;
   sttEnabled: boolean;
   sttCredentialRef: string;
   // TTS has no boolean toggle — any mode other than "never" means audio replies are on.
   ttsMode: string;
   ttsCredentialRef: string;
+  // The speech rewrite's four overrides, passed WHOLE because the question they answer is answered
+  // by the shared resolver, not re-derived here: which provider and model, whose key, which
+  // endpoint. The model id is here for the same reason the credential is — it belongs to the vendor
+  // it was picked from, and a bag that does not name that vendor is refused.
+  ttsNormalize?: boolean;
+  ttsNormalizeProvider?: string;
+  ttsNormalizeModel?: string;
+  ttsNormalizeCredentialRef?: string;
+  ttsNormalizeBaseURL?: string;
   visionEnabled: boolean;
   visionCredentialRef: string;
   // Refs (`vault:<id>`) whose vault entry exists but is still pending (secret not filled in yet). A
@@ -110,6 +131,55 @@ export function computeConfigIssues(input: ConfigHealthInput): ConfigIssue[] {
   push(
     { key: "tts", tab: "behavior", sectionId: "tts" },
     credIssue(input.ttsMode !== "never", input.ttsCredentialRef, pending),
+  );
+  // The speech rewrite. Both ways it fails are SILENT at runtime (best-effort: the audio still goes
+  // out, unrewritten), so the editor is the only place they surface.
+  //
+  // Which configurations need a key of their own is not decided here: it is asked of the same
+  // resolver the runtime uses, or the two drift. They already had, twice — a keyless
+  // openai-compatible endpoint authenticates by its URL and needs no credential at all, and an
+  // unsupported provider name needs a fix rather than a key.
+  const normalizeOn = Boolean(input.ttsNormalize) && input.ttsMode !== "never";
+  const normalizeResolution = normalizeOn
+    ? resolveNormalizeModel(
+        {
+          normalizeProvider: input.ttsNormalizeProvider,
+          normalizeModel: input.ttsNormalizeModel,
+          normalizeCredentialRef: input.ttsNormalizeCredentialRef,
+          normalizeBaseURL: input.ttsNormalizeBaseURL,
+        },
+        // The SAVED model, never the one the General tab is holding: the two tabs save separately,
+        // so a rewrite validated against an unsaved provider is validated against a configuration
+        // that will not exist when the Behavior block lands.
+        {
+          provider: input.savedModelProvider,
+          model: "",
+          baseURL: input.savedModelBaseURL ?? null,
+        },
+        // The editor's strictness, not the runtime's, because this check exists FOR the bags the
+        // editor never validated: `llama:8080` is a string, so the runtime's "is there anything
+        // there" says yes and the rewrite dies at the first audio reply instead of here.
+        { isUsableBaseURL: isValidHttpUrl },
+      )
+    : null;
+  // Two independent ways the rewrite goes quiet, and they need different answers. The resolver
+  // REFUSING is a settled fact — for ANY of its reasons, not only the ones about the credential: a
+  // provider name we do not support and a missing endpoint kill the rewrite just as silently, and
+  // the editor cannot save either one, so the bags that carry them arrive over REST and MCP and this
+  // is the only place they are ever seen. The issue is raised whether or not a ref is present,
+  // because a present-but-unusable ref is the whole problem. A resolvable configuration can still be
+  // waiting on a vault entry nobody filled in, which is the ordinary pending case.
+  const refused = normalizeResolution !== null && !normalizeResolution.runnable;
+  push(
+    { key: "ttsNormalize", tab: "behavior", sectionId: "tts" },
+    refused
+      ? { pending: false }
+      : credIssue(
+          normalizeResolution !== null &&
+            Boolean(input.ttsNormalizeCredentialRef),
+          input.ttsNormalizeCredentialRef ?? "",
+          pending,
+        ),
   );
   push(
     { key: "vision", tab: "behavior", sectionId: "vision" },

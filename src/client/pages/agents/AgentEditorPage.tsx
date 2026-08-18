@@ -50,12 +50,12 @@ import { useNavGuard } from "@/client/contexts/NavGuardContext";
 import { useTenantEvents } from "@/client/hooks/useTenantEvents";
 import { api } from "@/client/lib/api";
 import { computeConfigIssues } from "@/client/lib/configHealth";
-import { shouldRestoreUserBaseUrl } from "@/client/lib/credentialBaseUrl";
 import type { ApiErrorPayload } from "@/client/lib/types";
 import { slugify } from "@/client/lib/utils";
 import {
   invalidateVault,
   loadVault,
+  useVaultBaseUrls,
   VAULT_CHANGED_EVENT,
 } from "@/client/lib/vaultCache";
 import { IntegrationEditModal } from "@/client/pages/resources/IntegrationEditModal";
@@ -88,6 +88,7 @@ import { KnowledgeTab } from "./KnowledgeTab";
 import { PlaygroundFab } from "./PlaygroundFab";
 import { PlaygroundTab } from "./PlaygroundTab";
 import { ToolsTab } from "./ToolsTab";
+import { readTtsFormState, ttsSettingsFrom } from "./ttsFormState";
 import type {
   GrantState,
   HandoffUiState,
@@ -302,14 +303,7 @@ function readBehaviorState(a: Agent) {
       credentialRef: str(st.credentialRef),
       baseURL: str(st.baseURL),
     },
-    tts: {
-      mode: str(tt.mode) || "never",
-      provider: str(tt.provider) || "openai",
-      model: str(tt.model),
-      voice: str(tt.voice),
-      credentialRef: str(tt.credentialRef),
-      normalize: typeof tt.normalize === "boolean" ? tt.normalize : false,
-    },
+    tts: readTtsFormState(tt),
     split: {
       enabled: typeof sp.enabled === "boolean" ? sp.enabled : true,
       maxChars: num(sp.maxChars) || "600",
@@ -499,7 +493,21 @@ function AgentEditorSkeleton() {
   );
 }
 
+// The route element is REUSED when `:id` changes — cloning an agent lands straight on the clone's
+// editor — and this page keeps state that only means anything for one record. `usePlaygroundChat`
+// reloads its saved simulation on that transition but not the conversation itself, so without this
+// the turns you had with one agent show up under the next.
+//
+// Keyed by the record rather than reset field by field: every one of those resets has to know when
+// the thing it clears will be repopulated, and answering that per field is how a discard ends up
+// stranding a value the form still needs. A different agent is a different form. `:tab` is NOT in
+// the key, so moving between tabs of the same agent keeps everything, which is what it is for.
 export function AgentEditorPage() {
+  const { id = "" } = useParams();
+  return <AgentEditor key={id} />;
+}
+
+function AgentEditor() {
   const { t } = useTranslation();
   const { showToast } = useToast();
   const navigate = useNavigate();
@@ -562,25 +570,10 @@ export function AgentEditorPage() {
     credentialRef: "",
     baseURL: "",
   });
-  // Base URL from the selected STT credential (locks the input when set).
-  const [sttCredBaseUrl, setSttCredBaseUrl] = useState<string | null>(null);
-  // User's own STT base URL value preserved while a credential with baseUrl is selected.
-  const sttUserBaseUrlRef = useRef("");
-  // Base URL from the selected vision credential (locks the input when set).
-  const [visionCredBaseUrl, setVisionCredBaseUrl] = useState<string | null>(
-    null,
-  );
-  // User's own vision base URL value preserved while a credential with baseUrl is selected.
-  const visionUserBaseUrlRef = useRef("");
   // Text-to-speech (audio replies). Mode + provider mirror modules/tts.
-  const [tts, setTts] = useState({
-    mode: "never",
-    provider: "openai",
-    model: "",
-    voice: "",
-    credentialRef: "",
-    normalize: false,
-  });
+  // Same reader the saved agent goes through, so a new field can never exist in one and not the
+  // other: the Behavior save REPLACES this block wholesale.
+  const [tts, setTts] = useState(() => readTtsFormState({}));
   // Reply in multiple messages (split + typing delay). Mirrors modules/split
   // (on by default, wpm 250 — matches SPLIT_DEFAULTS).
   const [split, setSplit] = useState({
@@ -678,10 +671,16 @@ export function AgentEditorPage() {
     temperature: "",
     reasoningEffort: "",
   });
-  // Base URL from the selected model credential (locks the input when set).
-  const [modelCredBaseUrl, setModelCredBaseUrl] = useState<string | null>(null);
-  // User's own model base URL value preserved while a credential with baseUrl is selected.
-  const modelUserBaseUrlRef = useRef("");
+  // The endpoint each selected credential carries, which OUTRANKS the typed field wherever one is
+  // shown. Resolved from the vault, not from the pickers: the page judges these on every tab, and
+  // one tab's picker is unmounted while another is on screen. Only ever mirrored, never merged into
+  // the form — each field displays `credBaseUrl ?? form.baseURL` and is disabled while a credential
+  // provides it, so the operator's own value is never overwritten and never needs giving back.
+  const vaultBaseUrl = useVaultBaseUrls();
+  const modelCredBaseUrl = vaultBaseUrl(model.credentialRef);
+  const sttCredBaseUrl = vaultBaseUrl(stt.credentialRef);
+  const visionCredBaseUrl = vaultBaseUrl(vision.credentialRef);
+  const ttsNormalizeCredBaseUrl = vaultBaseUrl(tts.normalizeCredentialRef);
 
   // Tool selection
   const [grants, setGrants] = useState<GrantState[]>([]);
@@ -1010,18 +1009,9 @@ export function AgentEditorPage() {
         credentialRef: stt.credentialRef || null,
         // When the credential has a baseUrl, the runtime uses it; don't overwrite with the
         // displayed (credential's) value — keep the user's own config or null.
-        baseURL: sttCredBaseUrl
-          ? sttUserBaseUrlRef.current.trim() || null
-          : stt.baseURL.trim() || null,
+        baseURL: stt.baseURL.trim() || null,
       },
-      tts: {
-        mode: tts.mode,
-        provider: tts.provider,
-        model: tts.model.trim(),
-        voice: tts.voice.trim(),
-        credentialRef: tts.credentialRef || null,
-        normalize: tts.normalize,
-      },
+      tts: ttsSettingsFrom(tts),
       split: {
         enabled: split.enabled,
         maxChars: Number(split.maxChars) || 600,
@@ -1067,9 +1057,7 @@ export function AgentEditorPage() {
         credentialRef: vision.credentialRef || null,
         // When the credential carries a baseUrl, the runtime uses it; keep the user's own value
         // (or null) instead of persisting the displayed credential URL (mirror STT).
-        baseURL: visionCredBaseUrl
-          ? visionUserBaseUrlRef.current.trim() || null
-          : vision.baseURL.trim() || null,
+        baseURL: vision.baseURL.trim() || null,
         // Store null when the prompt is empty or still the default (keeps storage
         // clean; the reader re-prefills the default on load — no false-dirty).
         extractionPrompt:
@@ -1226,6 +1214,8 @@ export function AgentEditorPage() {
   // t('editor.configIssue.model', 'The model has no API key set, so the agent cannot reply.')
   // t('editor.configIssue.stt', 'Voice transcription is on but has no API key set.')
   // t('editor.configIssue.tts', 'Audio replies are on but have no API key set.')
+  // t('editor.configIssue.ttsNormalize', 'The speech rewrite is on but its model configuration cannot run, so replies will be spoken without it. Check its provider, model, key and endpoint.')
+  // t('editor.configIssuePending.ttsNormalize', 'The speech-rewrite credential is referenced but not filled in yet.')
   // t('editor.configIssue.vision', 'Image/document reading is on but has no API key set.')
   // t('editor.configIssuePending.model', 'The model credential is referenced but not filled in yet.')
   // t('editor.configIssuePending.stt', 'The transcription credential is referenced but not filled in yet.')
@@ -1241,6 +1231,18 @@ export function AgentEditorPage() {
   const knowledgeBasesNeedingIndex = (catalog?.knowledgeBases ?? [])
     .filter((k) => selectedKbIds.has(k.id) && k.unindexedCount > 0)
     .map((k) => ({ id: k.id, name: k.name }));
+  // The agent's model as STORED, which is what the speech rewrite will inherit at runtime and is
+  // not the same thing as the model being edited on General. The tabs do not save together: a
+  // Behavior save carries none of General's pending edits, so judging the rewrite against them
+  // blesses a pairing that exists nowhere. Reproduced by review: switch the provider on General,
+  // configure the rewrite to inherit that provider's key, save Behavior, discard General. The bag
+  // now names a vendor the saved agent never had, and every audio reply skips the rewrite as
+  // `credential_required` while the editor called the configuration valid.
+  const savedModel = syncedAgentRef.current
+    ? readModelState(syncedAgentRef.current)
+    : model;
+  const savedModelBaseUrl =
+    vaultBaseUrl(savedModel.credentialRef) ?? savedModel.baseURL;
   const configIssues = computeConfigIssues({
     modelProvider: model.provider,
     modelCredentialRef: model.credentialRef,
@@ -1248,6 +1250,13 @@ export function AgentEditorPage() {
     sttCredentialRef: stt.credentialRef,
     ttsMode: tts.mode,
     ttsCredentialRef: tts.credentialRef,
+    savedModelProvider: savedModel.provider,
+    savedModelBaseURL: savedModelBaseUrl,
+    ttsNormalize: tts.normalize,
+    ttsNormalizeProvider: tts.normalizeProvider,
+    ttsNormalizeModel: tts.normalizeModel,
+    ttsNormalizeCredentialRef: tts.normalizeCredentialRef,
+    ttsNormalizeBaseURL: ttsNormalizeCredBaseUrl ?? tts.normalizeBaseURL,
     visionEnabled: vision.enabled,
     visionCredentialRef: vision.credentialRef,
     pendingRefs,
@@ -2042,55 +2051,6 @@ export function AgentEditorPage() {
     });
   }
 
-  // NOTE: Closed-over callback for model credential entry change (preserves ref across tab
-  // unmounts). The `else if` is load-bearing: on mount the picker reports the resolved entry, and a
-  // credential WITHOUT a baseUrl must leave the persisted field alone (shouldRestoreUserBaseUrl).
-  const onModelEntryChange = (entry: VaultEntry | null) => {
-    const credUrl = entry?.baseUrl ?? null;
-    const restore = shouldRestoreUserBaseUrl(modelCredBaseUrl, credUrl);
-    setModelCredBaseUrl(credUrl);
-    if (credUrl) {
-      modelUserBaseUrlRef.current = model.baseURL;
-    } else if (restore) {
-      setModel((prev) => ({
-        ...prev,
-        baseURL: modelUserBaseUrlRef.current,
-      }));
-    }
-  };
-
-  // Closed-over callback for STT credential entry change (preserves sttUserBaseUrlRef across tab unmounts).
-  const onSttEntryChange = (entry: VaultEntry | null) => {
-    const credUrl = entry?.baseUrl ?? null;
-    const restore = shouldRestoreUserBaseUrl(sttCredBaseUrl, credUrl);
-    setSttCredBaseUrl(credUrl);
-    if (credUrl) {
-      // Lock: preserve the user's own value while locked.
-      sttUserBaseUrlRef.current = stt.baseURL;
-    } else if (restore) {
-      // Unlock: restore the user's own value.
-      setStt((prev) => ({
-        ...prev,
-        baseURL: sttUserBaseUrlRef.current,
-      }));
-    }
-  };
-
-  // Closed-over callback for vision credential entry change (mirror of onSttEntryChange).
-  const onVisionEntryChange = (entry: VaultEntry | null) => {
-    const credUrl = entry?.baseUrl ?? null;
-    const restore = shouldRestoreUserBaseUrl(visionCredBaseUrl, credUrl);
-    setVisionCredBaseUrl(credUrl);
-    if (credUrl) {
-      visionUserBaseUrlRef.current = vision.baseURL;
-    } else if (restore) {
-      setVision((prev) => ({
-        ...prev,
-        baseURL: visionUserBaseUrlRef.current,
-      }));
-    }
-  };
-
   // Shared onScheduleSaved handler: re-fetches hours then sets the saved id.
   const onScheduleSaved = (savedId: string, setter: (v: string) => void) => {
     void loadHours().then(() => setter(savedId));
@@ -2408,7 +2368,6 @@ export function AgentEditorPage() {
                 model={model}
                 setModel={setModel}
                 modelCredBaseUrl={modelCredBaseUrl}
-                onModelEntryChange={onModelEntryChange}
                 dirty={dirty.general}
                 saving={savingAgent}
                 onSave={() => {
@@ -2501,9 +2460,16 @@ export function AgentEditorPage() {
                 stt={stt}
                 setStt={setStt}
                 sttCredBaseUrl={sttCredBaseUrl}
-                onSttEntryChange={onSttEntryChange}
                 tts={tts}
                 setTts={setTts}
+                // The SAVED model, not the one being edited on General (see savedModel above), and
+                // its EFFECTIVE endpoint: a credential that carries its own wins over the typed
+                // field, exactly as the runtime resolves it.
+                agentModelProvider={savedModel.provider}
+                agentModelName={savedModel.model}
+                agentModelCredentialRef={savedModel.credentialRef}
+                agentModelBaseUrl={savedModelBaseUrl}
+                ttsNormalizeCredBaseUrl={ttsNormalizeCredBaseUrl}
                 split={split}
                 setSplit={setSplit}
                 serviceWindow={serviceWindow}
@@ -2518,7 +2484,6 @@ export function AgentEditorPage() {
                 vision={vision}
                 setVision={setVision}
                 visionCredBaseUrl={visionCredBaseUrl}
-                onVisionEntryChange={onVisionEntryChange}
                 limits={limits}
                 setLimits={setLimits}
                 observability={observability}

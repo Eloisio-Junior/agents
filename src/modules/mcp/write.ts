@@ -26,6 +26,7 @@ import {
   mergeBehaviorSettings,
   readBehaviorSettings,
 } from "@/modules/agents/behavior-settings";
+import { SETTINGS_CREDENTIAL_PATHS } from "@/modules/agents/credential-paths";
 import {
   assertPromptSize,
   getAgent,
@@ -441,26 +442,16 @@ export async function agentSettingsGet(
   try {
     const agent = await getAgent(ctx, agentId, base);
     const settings = readBehaviorSettings(agent.settings);
-    // The MCP contract speaks NAMES: project the stored `vault:<id>` refs back to entry names.
-    if (settings.stt.credentialRef) {
-      settings.stt = {
-        ...settings.stt,
-        credentialRef: await vaultNameByRef(
-          ctx,
-          settings.stt.credentialRef,
-          base,
-        ),
-      };
-    }
-    if (settings.tts.credentialRef) {
-      settings.tts = {
-        ...settings.tts,
-        credentialRef: await vaultNameByRef(
-          ctx,
-          settings.tts.credentialRef,
-          base,
-        ),
-      };
+    // The MCP contract speaks NAMES: project the stored `vault:<id>` refs back to entry names, over
+    // the same (block, field) list the write path resolves them from.
+    for (const { block: key, field } of SETTINGS_CREDENTIAL_PATHS) {
+      const block = settings[key] as unknown as
+        | Record<string, unknown>
+        | undefined;
+      const ref = block?.[field];
+      if (block && typeof ref === "string" && ref) {
+        block[field] = await vaultNameByRef(ctx, ref, base);
+      }
     }
     return ok({ agentId: agent.id, settings });
   } catch (e) {
@@ -526,31 +517,36 @@ export async function agentSettingsSet(
     // A `vault:<id>` ref is validated directly; a plain name goes through resolveVaultRefByName
     // so ambiguity (multiple kinds sharing the same name) surfaces as an explicit error rather
     // than a silent wrong-entry selection.
-    for (const key of ["stt", "tts", "vision"] as const) {
+    // NOTE: (block, field) pairs, not one field per block: `tts` carries a second credential for
+    // the speech normalizer's own model, and a loop that only knows `credentialRef` would let that
+    // one through as a raw name, which then fails to resolve at turn time instead of here.
+    for (const { block: key, field } of SETTINGS_CREDENTIAL_PATHS) {
+      // Re-read inside the loop: two fields of the same block are rewritten in sequence.
       const block = patch[key];
-      if (
-        block &&
-        typeof block.credentialRef === "string" &&
-        block.credentialRef
-      ) {
-        const raw = block.credentialRef;
-        if (isVaultIdRef(raw)) {
+      const value = block?.[field];
+      if (block && typeof value === "string" && value) {
+        if (isVaultIdRef(value)) {
           // Caller passed a stable ref directly — just validate it resolves in this tenant.
-          const name = await vaultNameByRef(ctx, raw, base);
-          if (!name) return err(`credential ref "${raw}" not found`);
+          const name = await vaultNameByRef(ctx, value, base);
+          if (!name) return err(`credential ref "${value}" not found`);
           // Store as-is (already in vault:<id> form).
         } else {
-          const resolution = await resolveVaultRefByName(ctx, raw, null, base);
+          const resolution = await resolveVaultRefByName(
+            ctx,
+            value,
+            null,
+            base,
+          );
           if (resolution.status === "not_found") {
-            return err(`credential "${raw}" not found`);
+            return err(`credential "${value}" not found`);
           }
           if (resolution.status === "ambiguous") {
             const typeList = resolution.kinds.join(", ");
             return err(
-              `credential "${raw}" is ambiguous (types: ${typeList}); pass the vault:<id> ref or rename one of the entries`,
+              `credential "${value}" is ambiguous (types: ${typeList}); pass the vault:<id> ref or rename one of the entries`,
             );
           }
-          patch[key] = { ...block, credentialRef: resolution.ref };
+          patch[key] = { ...block, [field]: resolution.ref };
         }
       }
     }

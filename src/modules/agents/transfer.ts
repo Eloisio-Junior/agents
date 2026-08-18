@@ -25,6 +25,10 @@ import {
   stdioCommandLauncher,
 } from "@/lib/mcp-launchers";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import {
+  type CredentialFieldTab,
+  SETTINGS_CREDENTIAL_PATHS,
+} from "@/modules/agents/credential-paths";
 import { normalizeSettingsForStorage } from "@/modules/images/settings";
 import { isKnownCatalogType } from "@/modules/integrations/catalog";
 import { assertNoSecrets } from "@/modules/n8n-export/n8n";
@@ -193,9 +197,9 @@ type ExportedBusinessHours = z.infer<typeof exportedBusinessHoursSchema>;
 // config-health panel). The backend stays i18n-agnostic; all message text lives in the client locale.
 export type ImportWarningTarget =
   | { kind: "vault" }
-  // An agent-level credential field (model/stt/tts/vision): deep-links to the exact editor section
-  // that references the missing credential, instead of the vault page.
-  | { kind: "agentField"; tab: "general" | "behavior"; sectionId: string }
+  // An agent-level credential field (model/stt/tts/vision/guardrails): deep-links to the exact editor
+  // section that references the missing credential, instead of the vault page.
+  | { kind: "agentField"; tab: CredentialFieldTab; sectionId: string }
   | { kind: "businessHours"; name: string }
   | { kind: "tool"; name: string }
   | { kind: "mcp"; name: string }
@@ -236,10 +240,10 @@ export function collectCredRefs(
   ) {
     refs.push(modelConfig.credentialRef);
   }
-  for (const key of ["stt", "tts", "vision"] as const) {
-    const sub = settings[key];
+  for (const { block, field } of SETTINGS_CREDENTIAL_PATHS) {
+    const sub = settings[block];
     if (sub && typeof sub === "object") {
-      const ref = (sub as Record<string, unknown>).credentialRef;
+      const ref = (sub as Record<string, unknown>)[field];
       if (typeof ref === "string" && ref) refs.push(ref);
     }
   }
@@ -250,17 +254,14 @@ export function collectCredRefs(
 // "credential not found" import warning can deep-link to the exact field rather than the vault page.
 // First occurrence wins: a name shared across fields lands on one section, and config-health surfaces
 // the rest live once the agent is open. The section ids mirror configHealth.ts.
-function credentialFieldTargets(
+export function credentialFieldTargets(
   modelConfig: Record<string, unknown>,
   settings: Record<string, unknown>,
-): Map<string, { tab: "general" | "behavior"; sectionId: string }> {
-  const out = new Map<
-    string,
-    { tab: "general" | "behavior"; sectionId: string }
-  >();
+): Map<string, { tab: CredentialFieldTab; sectionId: string }> {
+  const out = new Map<string, { tab: CredentialFieldTab; sectionId: string }>();
   const add = (
     ref: unknown,
-    tab: "general" | "behavior",
+    tab: CredentialFieldTab,
     sectionId: string,
   ): void => {
     if (typeof ref === "string" && ref && !isVaultIdRef(ref) && !out.has(ref)) {
@@ -268,10 +269,10 @@ function credentialFieldTargets(
     }
   };
   add(modelConfig.credentialRef, "general", "general-model");
-  for (const key of ["stt", "tts", "vision"] as const) {
-    const sub = settings[key];
+  for (const { block, field, tab, sectionId } of SETTINGS_CREDENTIAL_PATHS) {
+    const sub = settings[block];
     if (sub && typeof sub === "object") {
-      add((sub as Record<string, unknown>).credentialRef, "behavior", key);
+      add((sub as Record<string, unknown>)[field], tab, sectionId);
     }
   }
   return out;
@@ -291,15 +292,18 @@ export function remapCredRefs(
     else mc.credentialRef = mapped;
   }
   const st = { ...settings };
-  for (const key of ["stt", "tts", "vision"] as const) {
-    const sub = st[key];
+  // NOTE: re-read st[key] each time, since two paths share the `tts` block and the second must see
+  // the first one's rewrite.
+  for (const { block, field } of SETTINGS_CREDENTIAL_PATHS) {
+    const sub = st[block];
     if (sub && typeof sub === "object") {
       const subCopy = { ...(sub as Record<string, unknown>) };
-      if (typeof subCopy.credentialRef === "string" && subCopy.credentialRef) {
-        const mapped = map(subCopy.credentialRef);
-        if (mapped === null) delete subCopy.credentialRef;
-        else subCopy.credentialRef = mapped;
-        st[key] = subCopy;
+      const ref = subCopy[field];
+      if (typeof ref === "string" && ref) {
+        const mapped = map(ref);
+        if (mapped === null) delete subCopy[field];
+        else subCopy[field] = mapped;
+        st[block] = subCopy;
       }
     }
   }
