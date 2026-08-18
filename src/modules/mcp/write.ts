@@ -29,6 +29,7 @@ import {
 import { SETTINGS_CREDENTIAL_PATHS } from "@/modules/agents/credential-paths";
 import {
   assertPromptSize,
+  assertSettingsTextSizes,
   getAgent,
   listAgents,
   updateAgent,
@@ -552,6 +553,12 @@ export async function agentSettingsSet(
     }
     const current = await getAgent(ctx, agentId, base);
     const before = readBehaviorSettings(current.settings);
+    // On the PATCH, before the merge: mergeBehaviorSettings re-reads each touched block through its
+    // typed reader, so by the time the merged bag exists an over-cap note has already been clamped
+    // and there is nothing left to refuse. Before the dry run too, not only before the apply — a
+    // preview that promises a write the apply would refuse is worse than no preview. Against the
+    // stored bag, so re-sending a legacy value untouched is not a refusal.
+    assertSettingsTextSizes(patch, current.settings);
     const nextBag = mergeBehaviorSettings(
       (current.settings ?? {}) as Record<string, unknown>,
       patch,

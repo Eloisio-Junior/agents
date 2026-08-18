@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { computeConfigIssues } from "@/client/lib/configHealth";
+import { computeConfigIssues, issueHasAction } from "@/client/lib/configHealth";
 
 // Phase E: detect features turned on without the credential they need (the import that strips
 // secrets is the common trigger), each carrying a deep-link target (tab + section anchor).
@@ -849,5 +849,139 @@ describe("computeConfigIssues — which endpoint refusals wait for the vault", (
         knownRefs: new Set(["vault:1", "vault:2", "vault:3"]),
       }),
     ).toEqual([{ key: "ttsNormalize", tab: "behavior", sectionId: "tts" }]);
+  });
+});
+
+// Text stored over its cap is cut on the way to the model and nowhere else, so the editor is the
+// only place it can surface. It has to surface from OUTSIDE the field: the boundary deliberately
+// lets an untouched legacy value save, and the field itself may not be on screen — several of these
+// notes have no control in the editor at all, and the sections that do only render when switched on.
+describe("computeConfigIssues — text stored over its cap", () => {
+  const bag = (settings: Record<string, unknown>) => ({ ...base, settings });
+
+  test("no settings, or nothing over its cap, is no issue", () => {
+    expect(computeConfigIssues(base)).toEqual([]);
+    expect(
+      computeConfigIssues(bag({ handoff: { instructions: "short" } })),
+    ).toEqual([]);
+  });
+
+  test("flags an over-cap tool note, deep-linking to the native tools section", () => {
+    const issues = computeConfigIssues(
+      bag({ handoff: { instructions: "h".repeat(1501) } }),
+    );
+    expect(issues).toEqual([
+      {
+        key: "textCap",
+        tab: "tools",
+        sectionId: "tools-native",
+        field: "handoff.instructions",
+        length: 1501,
+        max: 1500,
+      },
+    ]);
+  });
+
+  test("each capped family deep-links to where its field actually lives", () => {
+    // Guardrails ON, because its inner sections are only mounted then (the row below covers OFF).
+    const target = (settings: Record<string, unknown>) => {
+      const issue = computeConfigIssues({
+        ...bag(settings),
+        guardrailsEnabled: true,
+        guardrailsCredentialRef: "vault:1",
+      }).find((i) => i.key === "textCap");
+      return `${issue?.tab ?? "-"}/${issue?.sectionId ?? "-"}`;
+    };
+    expect(target({ guardrails: { customPolicy: "p".repeat(2001) } })).toBe(
+      "guardrails/gr-policy",
+    );
+    expect(
+      target({ guardrails: { input: { templateMessage: "t".repeat(2001) } } }),
+    ).toBe("guardrails/gr-input");
+    expect(
+      target({
+        guardrails: { output: { generationPrompt: "g".repeat(2001) } },
+      }),
+    ).toBe("guardrails/gr-output");
+    expect(target({ toolGuidance: { assign_label: "l".repeat(1501) } })).toBe(
+      "tools/tools-native",
+    );
+    expect(target({ vision: { extractionPrompt: "v".repeat(4001) } })).toBe(
+      "behavior/vision",
+    );
+    expect(
+      target({ followUp: { steps: [{ instructions: "f".repeat(2001) }] } }),
+    ).toBe("behavior/proactive");
+  });
+
+  // GuardrailsTab renders gr-input/gr-output/gr-policy only when guardrails are ON, so with them off
+  // the deep-link would carry an anchor that is not in the DOM: the editor's one-shot lookup finds
+  // nothing, and the operator lands on the tab with no scroll, no highlight and no field. gr-model is
+  // the section that is always mounted, and it holds the switch that reveals the rest.
+  test("with guardrails off, its warnings target the section that is actually mounted", () => {
+    const off = computeConfigIssues(
+      bag({ guardrails: { customPolicy: "p".repeat(2001) } }),
+    ).find((i) => i.key === "textCap");
+    expect(off?.sectionId).toBe("gr-model");
+
+    const on = computeConfigIssues({
+      ...bag({ guardrails: { customPolicy: "p".repeat(2001) } }),
+      guardrailsEnabled: true,
+      guardrailsCredentialRef: "vault:1",
+    }).find((i) => i.key === "textCap");
+    expect(on?.sectionId).toBe("gr-policy");
+  });
+
+  // The reported case: a note written through REST or MCP for a native tool the editor has no field
+  // for. It still gets an issue — that is the only way the operator learns the text is being cut —
+  // but with no deep-link target, because there is nowhere to send them.
+  test("a note with no control in the editor is flagged without a target", () => {
+    const [issue] = computeConfigIssues(
+      bag({ toolGuidance: { private_note: "n".repeat(1501) } }),
+    );
+    expect(issue).toEqual({
+      key: "textCap",
+      field: "toolGuidance.private_note",
+      length: 1501,
+      max: 1500,
+    });
+  });
+
+  test("every over-cap field gets its own row", () => {
+    const issues = computeConfigIssues(
+      bag({
+        handoff: { instructions: "h".repeat(1501) },
+        vision: { extractionPrompt: "v".repeat(4001) },
+      }),
+    );
+    expect(issues.map((i) => i.field).sort()).toEqual([
+      "handoff.instructions",
+      "vision.extractionPrompt",
+    ]);
+  });
+});
+
+// The panel hides its button for a warning with nothing to click. That is only ever a textCap issue
+// for a field the console has no control for: an embedding issue also carries no tab, and its fix
+// (fill the vault entry, or set the tenant embedding) is exactly what the button is for.
+describe("issueHasAction", () => {
+  test("a targetless textCap issue has no action, and everything else does", () => {
+    expect(
+      issueHasAction({ key: "textCap", field: "toolGuidance.private_note" }),
+    ).toBe(false);
+    expect(
+      issueHasAction({
+        key: "textCap",
+        tab: "guardrails",
+        sectionId: "gr-policy",
+      }),
+    ).toBe(true);
+    expect(issueHasAction({ key: "embedding" })).toBe(true);
+    expect(
+      issueHasAction({ key: "embedding", pending: true, vaultId: "7" }),
+    ).toBe(true);
+    expect(issueHasAction({ key: "knowledge", knowledgeBaseId: "1" })).toBe(
+      true,
+    );
   });
 });

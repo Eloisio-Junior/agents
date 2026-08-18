@@ -49,8 +49,8 @@ import { useBreadcrumbLabel } from "@/client/contexts/BreadcrumbContext";
 import { useNavGuard } from "@/client/contexts/NavGuardContext";
 import { useTenantEvents } from "@/client/hooks/useTenantEvents";
 import { api } from "@/client/lib/api";
-import { computeConfigIssues } from "@/client/lib/configHealth";
-import type { ApiErrorPayload } from "@/client/lib/types";
+import { apiErrorMessage } from "@/client/lib/apiError";
+import { computeConfigIssues, issueHasAction } from "@/client/lib/configHealth";
 import { slugify } from "@/client/lib/utils";
 import {
   invalidateVault,
@@ -61,6 +61,7 @@ import { IntegrationEditModal } from "@/client/pages/resources/IntegrationEditMo
 import { McpEditModal } from "@/client/pages/resources/McpEditModal";
 import { ToolEditModal } from "@/client/pages/resources/ToolEditModal";
 import { useKnowledgeManager } from "@/client/pages/resources/useKnowledgeManager";
+import { collectOversizedTextChanges } from "@/modules/agents/text-caps";
 import {
   CHANNEL_REDIRECT_DEFAULTS,
   type ChannelRedirectConfig,
@@ -71,7 +72,6 @@ import { FOLLOW_UP_MAX_STEPS } from "@/modules/followups/settings";
 import {
   GUARDRAILS_DEFAULTS,
   type GuardrailsConfig,
-  readGuardrailsConfig,
 } from "@/modules/guardrails/settings";
 import { DEFAULT_EXTRACTION_PROMPT } from "@/modules/vision/prompt-default";
 import { BehaviorTab, type SendImageState } from "./BehaviorTab";
@@ -83,6 +83,7 @@ import { ChannelsTab } from "./ChannelsTab";
 import { ExportAgentModal } from "./ExportAgentModal";
 import { GeneralTab } from "./GeneralTab";
 import { GuardrailsTab } from "./GuardrailsTab";
+import { readGuardrailsFormState } from "./guardrailsFormState";
 import { KnowledgeTab } from "./KnowledgeTab";
 import { PlaygroundFab } from "./PlaygroundFab";
 import { PlaygroundTab } from "./PlaygroundTab";
@@ -788,7 +789,7 @@ function AgentEditor() {
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
     setChannelRedirect(readChannelRedirectState(a));
-    setGuardrails(readGuardrailsConfig(a.settings));
+    setGuardrails(readGuardrailsFormState(a.settings));
   }, []);
 
   // Reset ONLY the general section (identity + model) from a synced agent — the post-save sync for the
@@ -831,7 +832,7 @@ function AgentEditor() {
   // Reset ONLY the guardrails section from a synced agent — the post-save sync for the Guardrails tab.
   const applyGuardrails = useCallback((a: Agent) => {
     syncedAgentRef.current = a;
-    setGuardrails(readGuardrailsConfig(a.settings));
+    setGuardrails(readGuardrailsFormState(a.settings));
   }, []);
 
   const loadHours = useCallback(async () => {
@@ -1242,6 +1243,7 @@ function AgentEditor() {
   const savedModelBaseUrl =
     vaultBaseUrl(savedModel.credentialRef) ?? savedModel.baseURL;
   const configIssues = computeConfigIssues({
+    settings: syncedAgentRef.current?.settings,
     modelProvider: model.provider,
     modelCredentialRef: model.credentialRef,
     sttEnabled: stt.enabled,
@@ -1316,6 +1318,28 @@ function AgentEditor() {
   // move differs (fill it, pick another, set one). Kept out of the JSX so the dynamic-key lint
   // suppression sits on the t() call.
   function issueMessage(issue: (typeof configIssues)[number]): string {
+    // Text already in the row, over its cap: whatever passes the cap is dropped by the reader, which
+    // is invisible everywhere else. The message stops at that, without claiming the model receives
+    // the rest — with the section switched off it receives none of it. When the field has no control
+    // in the editor the message says so, instead of leaving the operator hunting for a tab.
+    if (issue.key === "textCap") {
+      const params = {
+        field: issue.field ?? "",
+        len: issue.length ?? 0,
+        max: issue.max ?? 0,
+      };
+      return issue.tab
+        ? t(
+            "editor.configIssueTextCap",
+            "{{field}} holds {{len}} characters and the limit is {{max}}: everything past that is ignored.",
+            params,
+          )
+        : t(
+            "editor.configIssueTextCapNoField",
+            "{{field}} holds {{len}} characters and the limit is {{max}}: everything past that is ignored. This note has no field in the console, so it can only be shortened through the API.",
+            params,
+          );
+    }
     if (issue.key === "knowledge") {
       return t(
         "editor.configIssueKnowledge",
@@ -1341,11 +1365,32 @@ function AgentEditor() {
     });
   }
 
+  // The write boundary refuses a settings bag whose operator prose is over its cap. A save that
+  // fires several calls (tools = grants PUT then agent PATCH) would otherwise persist the first and
+  // fail the second, leaving the grants saved, the toast saying it failed, and the local state stale.
+  // Same walker and same comparison the server runs — against the last-synced bag, so a value stored
+  // before the caps is not what stops a save that never touched it.
+  function settingsTextError(bag: unknown, stored: unknown): string | null {
+    const over = collectOversizedTextChanges(bag, stored)[0];
+    if (!over) return null;
+    return t(
+      "editor.settingsTextTooLong",
+      "The text in {{field}} is too long: {{len}} characters (limit {{max}}).",
+      { field: over.path, len: over.length, max: over.max },
+    );
+  }
+
   // Localized text for a structured import warning. Static keys (one per code) keep it extract-safe;
   // params interpolate the names/counts. New codes added in transfer.ts must get a case here.
   function importWarningMessage(w: ImportWarning): string {
     const p = w.params ?? {};
     switch (w.code) {
+      case "guidanceClipped":
+        return t(
+          "editor.importWarning.guidanceClipped",
+          'The text in "{{field}}" was longer than {{max}} characters and was trimmed on import.',
+          p,
+        );
       case "credentialNotFound":
         return t(
           "editor.importWarning.credentialNotFound",
@@ -1646,7 +1691,7 @@ function AgentEditor() {
   const revertGuardrails = () => {
     const a = syncedAgentRef.current;
     if (!a) return;
-    setGuardrails(readGuardrailsConfig(a.settings));
+    setGuardrails(readGuardrailsFormState(a.settings));
   };
   // Tools and Knowledge share one grant array but own disjoint slices (Tools =
   // non-RAG, Knowledge = RAG), so each discard restores only its slice and
@@ -1747,14 +1792,11 @@ function AgentEditor() {
       bumpSync(section);
       showToast(t("editor.saved", "Agent saved."), "success");
     } catch (e) {
-      // NOTE: surface the backend's localized message when present (e.g. the prompt-size cap)
-      // instead of the generic failure toast.
-      const apiMsg =
-        e && typeof e === "object" && "value" in e
-          ? ((e as { value?: ApiErrorPayload }).value?.error ?? null)
-          : null;
+      // NOTE: surface the backend's localized message when present (the prompt-size cap, the
+      // settings text caps) instead of the generic failure toast.
       showToast(
-        apiMsg || t("editor.saveError", "Could not save the agent."),
+        apiErrorMessage(e) ||
+          t("editor.saveError", "Could not save the agent."),
         "error",
       );
     } finally {
@@ -1782,8 +1824,12 @@ function AgentEditor() {
       markSynced(data.agentUpdatedAt ? String(data.agentUpdatedAt) : null);
       bumpSync("tools", "knowledge");
       showToast(t("editor.grantsSaved", "Tools updated."), "success");
-    } catch {
-      showToast(t("editor.grantsError", "Could not update tools."), "error");
+    } catch (e) {
+      showToast(
+        apiErrorMessage(e) ||
+          t("editor.grantsError", "Could not update tools."),
+        "error",
+      );
     } finally {
       savingRef.current -= 1;
       setSavingGrants(false);
@@ -1799,15 +1845,8 @@ function AgentEditor() {
     savingRef.current += 1;
     setSavingGrants(true);
     try {
-      const expected = expectedFor(force);
-      const grantsRes = await api.api.v1.agents({ id })["tool-selections"].put({
-        grants,
-        ...(expected ? { expectedUpdatedAt: expected } : {}),
-      });
-      if (handleConflict(grantsRes.error, () => void saveTools(true))) return;
-      if (grantsRes.error || !grantsRes.data) {
-        throw grantsRes.error ?? new Error("no data");
-      }
+      // Everything the PATCH will send, built BEFORE the grants PUT so the whole bag can be checked
+      // against the write boundary's own rule first. None of it depends on the PUT's result.
       const syncedSettings = (syncedAgentRef.current?.settings ?? {}) as Record<
         string,
         unknown
@@ -1830,6 +1869,38 @@ function AgentEditor() {
       if (updateKanbanNote)
         toolGuidanceJson.update_kanban_task = updateKanbanNote;
       else delete toolGuidanceJson.update_kanban_task;
+      const toolsSettings = {
+        ...syncedSettings,
+        handoff: handoffJson,
+        kanban: kanbanJson,
+        toolGuidance: toolGuidanceJson,
+      };
+      // The WHOLE bag, not just this tab's fields: the PATCH resends every block, so text typed on
+      // another tab would refuse it just the same — after the grants had already been written.
+      //
+      // On a forced overwrite the last-synced bag is stale by definition (the 409 says someone else
+      // wrote), so it is re-read first: if the other writer shortened a legacy over-cap note, our
+      // copy is now an EDIT of it, the server would refuse the PATCH, and the grants PUT would
+      // already have persisted. A failed re-read falls back to the synced bag rather than blocking
+      // the save on it.
+      const storedSettings = force
+        ? ((await api.api.v1.agents({ id }).get()).data?.agent.settings ??
+          syncedSettings)
+        : syncedSettings;
+      const toolsText = settingsTextError(toolsSettings, storedSettings);
+      if (toolsText) {
+        showToast(toolsText, "error");
+        return;
+      }
+      const expected = expectedFor(force);
+      const grantsRes = await api.api.v1.agents({ id })["tool-selections"].put({
+        grants,
+        ...(expected ? { expectedUpdatedAt: expected } : {}),
+      });
+      if (handleConflict(grantsRes.error, () => void saveTools(true))) return;
+      if (grantsRes.error || !grantsRes.data) {
+        throw grantsRes.error ?? new Error("no data");
+      }
       // Chain the PATCH precondition to the token the grant write just produced.
       const afterGrants = grantsRes.data.agentUpdatedAt
         ? String(grantsRes.data.agentUpdatedAt)
@@ -1841,12 +1912,7 @@ function AgentEditor() {
       const patchExpected = force ? undefined : afterGrants;
       const agentRes = await api.api.v1.agents({ id }).patch({
         transferWithSummary,
-        settings: {
-          ...syncedSettings,
-          handoff: handoffJson,
-          kanban: kanbanJson,
-          toolGuidance: toolGuidanceJson,
-        },
+        settings: toolsSettings,
         ...(patchExpected ? { expectedUpdatedAt: patchExpected } : {}),
       });
       if (handleConflict(agentRes.error, () => void saveTools(true))) return;
@@ -1870,8 +1936,12 @@ function AgentEditor() {
       markSynced(String(agentRes.data.agent.updatedAt));
       bumpSync("tools", "knowledge");
       showToast(t("editor.grantsSaved", "Tools updated."), "success");
-    } catch {
-      showToast(t("editor.grantsError", "Could not update tools."), "error");
+    } catch (e) {
+      showToast(
+        apiErrorMessage(e) ||
+          t("editor.grantsError", "Could not update tools."),
+        "error",
+      );
     } finally {
       savingRef.current -= 1;
       setSavingGrants(false);
@@ -1905,8 +1975,12 @@ function AgentEditor() {
       markSynced(String(data.agent.updatedAt));
       bumpSync("channelRedirect");
       showToast(t("editor.saved", "Agent saved."), "success");
-    } catch {
-      showToast(t("editor.saveError", "Could not save the agent."), "error");
+    } catch (e) {
+      showToast(
+        apiErrorMessage(e) ||
+          t("editor.saveError", "Could not save the agent."),
+        "error",
+      );
     } finally {
       savingRef.current -= 1;
       setSavingChannelRedirect(false);
@@ -1936,8 +2010,12 @@ function AgentEditor() {
       markSynced(String(data.agent.updatedAt));
       bumpSync("guardrails");
       showToast(t("editor.saved", "Agent saved."), "success");
-    } catch {
-      showToast(t("editor.saveError", "Could not save the agent."), "error");
+    } catch (e) {
+      showToast(
+        apiErrorMessage(e) ||
+          t("editor.saveError", "Could not save the agent."),
+        "error",
+      );
     } finally {
       savingRef.current -= 1;
       setSavingGuardrails(false);
@@ -1953,8 +2031,14 @@ function AgentEditor() {
       cloneModal.close();
       showToast(t("editor.cloned", "Agent cloned (disabled)."), "success");
       navigate(`/agents/${data.agent.id}`);
-    } catch {
-      showToast(t("editor.cloneError", "Could not clone."), "error");
+    } catch (e) {
+      // The clone carries the source agent's settings verbatim, so a source written before the text
+      // caps is refused by name — the generic message would leave the operator with a button that
+      // fails and no field to shorten.
+      showToast(
+        apiErrorMessage(e) || t("editor.cloneError", "Could not clone."),
+        "error",
+      );
     }
   }
 
@@ -2342,23 +2426,25 @@ function AgentEditor() {
                 <ul className="flex flex-col gap-1">
                   {configIssues.map((issue) => (
                     <li
-                      key={issue.knowledgeBaseId ?? issue.key}
+                      key={issue.field ?? issue.knowledgeBaseId ?? issue.key}
                       className="flex items-baseline justify-between gap-3 pl-6"
                     >
                       <span className="min-w-0 text-text-secondary text-xs">
                         {issueMessage(issue)}
                       </span>
-                      <button
-                        type="button"
-                        onClick={() => goToIssue(issue)}
-                        className="shrink-0 rounded font-medium text-accent text-xs hover:underline focus-visible:underline"
-                      >
-                        {issue.key === "knowledge"
-                          ? t("editor.indexKnowledge", "Index")
-                          : issue.pending
-                            ? t("editor.fillCredential", "Fill")
-                            : t("editor.goToIssue", "Fix")}
-                      </button>
+                      {issueHasAction(issue) && (
+                        <button
+                          type="button"
+                          onClick={() => goToIssue(issue)}
+                          className="shrink-0 rounded font-medium text-accent text-xs hover:underline focus-visible:underline"
+                        >
+                          {issue.key === "knowledge"
+                            ? t("editor.indexKnowledge", "Index")
+                            : issue.pending
+                              ? t("editor.fillCredential", "Fill")
+                              : t("editor.goToIssue", "Fix")}
+                        </button>
+                      )}
                     </li>
                   ))}
                 </ul>

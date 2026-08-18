@@ -296,6 +296,7 @@
   },
   "common": {
     "cancel": "Cancel",
+    "charOverLimit": "{{over}} characters over the limit. The agent only receives the first {{max}}; shorten it to save a change to this field.",
     "clearSearch": "Clear search",
     "close": "Close",
     "comboBoxAddMore": "Add…",
@@ -688,6 +689,8 @@
       "vision": "The image-reading credential is referenced but not filled in yet."
     },
     "configIssuesTitle": "Configuration warnings",
+    "configIssueTextCap": "{{field}} holds {{len}} characters and the limit is {{max}}: everything past that is ignored.",
+    "configIssueTextCapNoField": "{{field}} holds {{len}} characters and the limit is {{max}}: everything past that is ignored. This note has no field in the console, so it can only be shortened through the API.",
     "configIssueUnresolved": {
       "embedding": "A knowledge base needs indexing, but the embedding credential no longer exists.",
       "guardrails": "The guardrails credential no longer exists, so messages go out unscreened.",
@@ -832,6 +835,7 @@
       "credentialMissingMeta": "Credential \"{{name}}\" is missing from the export metadata, so it was left unset.",
       "credentialNotFound": "Credential \"{{name}}\" was not found here, so it was left unset.",
       "credentialPending": "Credential \"{{name}}\" was not found here, so a placeholder was created. Fill in its secret to activate it.",
+      "guidanceClipped": "The text in \"{{field}}\" was longer than {{max}} characters and was trimmed on import.",
       "hoursNotFound": "Business hours \"{{name}}\" were not found here, so they were left unset.",
       "hoursReused": "Business hours \"{{name}}\" already existed and were reused; check the schedule is right.",
       "httpGrantNotFound": "Tool \"{{name}}\" was not found, so its grant was skipped.",
@@ -918,6 +922,7 @@
     "sendImageHint": "Hosts the agent may fetch an image from when it uses the \"Send image\" tool. The agent chooses the URL, so this list is what decides where it can actually go: leave it empty and every attempt is refused. Output guardrails read text and never the picture itself, so this list is the only control over what an image may show. It has no effect unless the tool is granted on the Tools tab.",
     "sendImageHosts": "Allowed hosts",
     "sendImageHostsHint": "One per line, e.g. cdn.minhaloja.com.br. Start with \"*.\" to cover a domain and its subdomains (*.minhaloja.com.br). Paste a full URL and only its host is kept.",
+    "settingsTextTooLong": "The text in {{field}} is too long: {{len}} characters (limit {{max}}).",
     "split": "Reply in multiple messages",
     "splitEnabled": "Split replies into several messages with a typing delay",
     "splitHint": "Break long replies into smaller messages, with a typing pause between them (feels more human).",
