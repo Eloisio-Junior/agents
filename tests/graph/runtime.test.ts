@@ -1387,7 +1387,17 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       expect(sent).toEqual([]);
     });
 
-    test("input 'generated' → delivers the suggestedReply and skips the agent graph", async () => {
+    // On the INPUT direction there is no assistant reply to rewrite — the analyzed text is the
+    // CUSTOMER's own message — so `generated` has nothing to repair and the model composes from an
+    // empty desk: no agent prompt, no knowledge base, no account data (`runGuardrail` passes
+    // systemPrompt and customerMessage as undefined for input). Measured live, 32 runs per case:
+    // against gpt-5.4-mini it wrote in the CUSTOMER's voice 18/32 (the bot posting the customer's
+    // own complaint back at them) and named an operator-banned competitor 14/32. Worse on
+    // gpt-4o-mini, where the customer's message could DICTATE the reply: one instructing the
+    // reviewer to state a price and a partnership produced exactly that, verbatim, 16/16.
+    // So the replacement is dropped and the configured template goes out, exactly as
+    // answer_relevance already does for the same reason (issues #95, #99).
+    test("input 'generated' → sends the template, never a composed reply", async () => {
       await setGuardrails({
         enabled: true,
         provider: "openai",
@@ -1428,10 +1438,19 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         },
       });
       expect(outcome).toBe("posted");
-      // The generated suggestedReply is delivered — NOT the template, NOT the agent's own REPLY.
-      expect(sent).toEqual([[940, "GEN-IN-REPLY"]]);
-      // The operator is notified via a private note so a replaced reply is never invisible.
+      // The template goes out. The model DID write a replacement (the fake verdict carries one) and
+      // it is discarded — that is the whole rule, and asserting only "not GEN-IN-REPLY" would pass
+      // for a turn that posted nothing at all.
+      expect(sent).toEqual([[940, "TEMPLATE-IN"]]);
+      // Still skips the agent graph: the customer never gets the agent's own REPLY either.
+      expect(sent.some(([, text]) => text === REPLY)).toBe(false);
+      // The operator is notified via a private note so a replaced reply is never invisible, and the
+      // note names what the guardrail DID. Reporting the configured "generated" on a line where the
+      // template went out is the config read back, not the event, and it is what an operator
+      // debugging "why did my customer get this text" reads first.
       expect(notes.length).toBe(1);
+      expect(notes[0]?.[1]).toContain("— template.");
+      expect(notes[0]?.[1]).not.toContain("generated");
     });
 
     test("issue #49: an input-guardrail reply claims the trigger too (superseded → nothing posted)", async () => {
@@ -1595,6 +1614,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       // suggestedReply was null → the runtime falls back to the configured templateMessage.
       expect(sent).toEqual([[942, "TEMPLATE-OUT"]]);
       expect(notes.length).toBe(1);
+      // Same rule on this direction, and this case is older than the input one: a `generated` action
+      // that produced nothing sent the template while the note claimed "generated".
+      expect(notes[0]?.[1]).toContain("— template.");
     });
 
     test("output 'silent' discards the resolve intent (no toggle, no reply)", async () => {

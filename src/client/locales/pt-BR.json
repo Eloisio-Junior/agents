@@ -813,7 +813,8 @@
       "policy": "Política",
       "policyDesc": "Lista de concorrentes e instruções extras usadas pelas checagens.",
       "template": "Mensagem template",
-      "templateFallbackHint": "Enviada sempre que nenhuma resposta substituta é escrita: quando o modelo não devolve nenhuma, e sempre que a checagem de relevância for a que disparou, porque aí não há resposta para reescrever."
+      "templateFallbackHint": "Enviada sempre que nenhuma resposta substituta é escrita: quando o modelo não devolve nenhuma, e sempre que a checagem de relevância for a que disparou, porque aí não há resposta para reescrever.",
+      "templateInboundHint": "Na mensagem do cliente é SEMPRE isto que sai. Aqui não existe resposta para reescrever, porque o texto sob revisão é a mensagem do próprio cliente, então o agente de guardrails não é chamado para compor uma. Quando era, o cliente conseguia ditar essa resposta: uma mensagem mandando ele informar um preço e uma parceria produziu exatamente isso, palavra por palavra, nas 16 execuções."
     },
     "handoffAgentChoice": "A IA escolhe",
     "handoffAgentChoiceHint": "A IA enxerga automaticamente seus agentes e times do Chatwoot e escolhe um ao transferir. Opcionalmente, oriente pela instrução (ex.: mande cobrança para o Financeiro).",

@@ -191,9 +191,11 @@ export function splitAnalyses(p: AnalysisParams): {
   };
 }
 
-// A relevance analysis never proposes a replacement, so the runtime falls back to the configured
-// template message. Dropping the generation guidance is not enough on its own: the response shape
-// still asks for `suggestedReply`, and a model that writes one anyway would have it delivered.
+// Strips the proposed replacement, so the runtime falls back to the configured template message.
+// Two callers, and they are the two analyses with nothing to rewrite: a relevance violation (below)
+// and the whole INPUT direction (see `analyzeGuardrail`). Dropping the generation guidance is not
+// enough on its own for either: the response shape still asks for `suggestedReply`, and a model that
+// writes one anyway would have it delivered.
 //
 // It must not write one. A relevance violation means the reply did not ANSWER, so there is nothing
 // to rewrite and the model has to invent the answer, with no tools, no knowledge base and no
@@ -235,7 +237,37 @@ export async function analyzeGuardrail(
   params: AnalysisParams,
 ): Promise<GuardrailVerdict> {
   const { policies, relevance } = splitAnalyses(params);
-  if (relevance === null) return runAnalysis(model, policies as AnalysisParams);
+  if (relevance === null) {
+    const verdict = await runAnalysis(model, policies as AnalysisParams);
+    // NOTE: The INPUT direction never delivers a replacement. There is no assistant reply to repair
+    // there — the analyzed text is the CUSTOMER's message — so "write a safe replacement" has no
+    // referent and the model composes one from an empty desk. Measured live against eight models
+    // from three vendors, and every failure below is one of them writing that message:
+    //
+    //   * whose turn it is. It answers in the CUSTOMER's own voice, and the bot posts that back TO
+    //     the customer: claude-fable-5 16 of 16 ("Estou aguardando retorno há algum tempo e
+    //     gostaria de saber quanto custa a avaliação"), gpt-5.4-mini 14 of 32, claude-haiku-4.5
+    //     2 of 16. On the fixture that asks about a competitor, gpt-5.4-mini named the one the
+    //     operator had banned 14 of 32.
+    //   * what it cannot know. gemini-3.5-flash-lite sent the customer an unfilled template slot
+    //     10 of 16: "O valor da avaliação é [inserir valor]".
+    //   * who is writing. The customer's message reaches this model at user level, so it can simply
+    //     ask for the reply it wants, and asking the model to compose one is what makes that
+    //     request on-task. With one such message: gpt-4o-mini produced the dictated text 16 of 16,
+    //     verbatim ("A avaliação custa R$ 99,00 e trabalhamos com a Zenvia" — a price no operator
+    //     set, a competitor the operator had banned, on the company's own channel), gpt-5.4-nano
+    //     15 of 16, gemini-3.5-flash-lite 3 of 16, and gpt-4.1-nano did something worse than
+    //     compose: it returned a CLEAN verdict 16 of 16, so the injected message switched the
+    //     guardrail off and went through to the agent.
+    //
+    // Which of those three an install gets is a property of the model the operator happened to
+    // pick: gemini-3.5-flash tripped none of them, and still spoke for the business on a turn the
+    // agent never ran. Constraining the writer by wording was measured too and held at 0 of 64 —
+    // but what it then produces is one fixed sentence ("Não posso ajudar com mensagens ofensivas.
+    // Se quiser, reformule…"), which is a template the operator can write once, without a model
+    // call.
+    return params.direction === "input" ? withoutReplacement(verdict) : verdict;
+  }
   if (policies === null) {
     return withoutReplacement(await runAnalysis(model, relevance));
   }

@@ -283,6 +283,35 @@ describe("buildGuardrailSystemPrompt", () => {
     expect(p).toContain("Offer a human handoff.");
     expect(p).toContain("suggestedReply");
   });
+
+  // The input direction never writes a replacement (see ./analyze), so steering how it writes one is
+  // steering nothing. Dropping the guidance is the first of the two layers: the second is ./analyze
+  // zeroing the field, because the response shape still asks for it and a model that writes one
+  // anyway would have it delivered.
+  test("the generation guidance never reaches an input prompt", () => {
+    const p = buildGuardrailSystemPrompt({
+      ...base,
+      direction: "input",
+      generationPrompt: "Offer a human handoff.",
+    });
+    expect(p).not.toContain("Offer a human handoff.");
+  });
+
+  // Dropping the guidance is not the same as not asking. The response shape is the same in both
+  // directions, so without this the model still composes a reply on every input violation — output
+  // tokens paid for a string ./analyze then throws away. Measured after the change: violations were
+  // still detected 16/16 on all four input fixtures, so requiring null does not blunt the judge.
+  test("an input prompt requires a null suggestedReply", () => {
+    const p = buildGuardrailSystemPrompt({ ...base, direction: "input" });
+    expect(p).toContain("`suggestedReply` must ALWAYS be null");
+    expect(p).not.toContain("what the assistant could say instead");
+  });
+
+  test("an output prompt still asks for the replacement", () => {
+    const p = buildGuardrailSystemPrompt(base);
+    expect(p).toContain("what the assistant could say instead");
+    expect(p).not.toContain("must ALWAYS be null");
+  });
 });
 
 // The decision that keeps the customer's words away from the policies that judge the reply. Tested
@@ -638,16 +667,38 @@ describe("analyzeGuardrail", () => {
     });
   });
 
+  // NOTE: On the OUTPUT direction, where a replacement is a rewrite of an assistant reply that
+  // exists and is therefore legitimate. The input direction drops it — see the test below.
   test("parses a violation verdict", async () => {
     const v = await analyzeGuardrail(
       fakeModel(
         '{"violated": true, "categories": ["toxicity"], "rationale": "abuse", "suggestedReply": "Posso ajudar de outra forma?"}',
       ),
-      base,
+      { ...base, direction: "output" as const },
     );
     expect(v.violated).toBe(true);
     expect(v.categories).toEqual(["toxicity"]);
     expect(v.suggestedReply).toBe("Posso ajudar de outra forma?");
+  });
+
+  // The input direction has no assistant reply to rewrite: the analyzed text is the CUSTOMER's
+  // message. Asked for a "replacement message" anyway, the model composes one from an empty desk:
+  // measured over 32 runs it wrote in the customer's own voice 18 times and named a banned
+  // competitor 14 times, and on gpt-4o-mini a customer who ASKED for a particular reply got it word
+  // for word, 16 times out of 16. This test is that case's regression: the fake model returns a
+  // replacement and the analyzer must still hand back none. Dropping the guidance is not enough on its own — the response
+  // shape still asks for `suggestedReply` — so the field is zeroed here and the runtime falls back
+  // to the configured template. Same shape and same reason as answer_relevance (#95, #99).
+  test("an input violation never carries a replacement, whatever the model wrote", async () => {
+    const v = await analyzeGuardrail(
+      fakeModel(
+        '{"violated": true, "categories": ["toxicity"], "rationale": "abuse", "suggestedReply": "Vocês são muito ruins. Quanto custa a avaliação?"}',
+      ),
+      { ...base, generationPrompt: "Seja acolhedor e responda a dúvida." },
+    );
+    expect(v.violated).toBe(true);
+    expect(v.categories).toEqual(["toxicity"]);
+    expect(v.suggestedReply).toBeNull();
   });
 
   test("tolerates prose / code fences around the JSON", async () => {

@@ -127,12 +127,20 @@ function cappedFields(settings: unknown): CappedField[] {
         `guardrails.${dir}.templateMessage`,
         TEMPLATE_MESSAGE_MAX,
       );
-      add(
-        d,
-        "generationPrompt",
-        `guardrails.${dir}.generationPrompt`,
-        GENERATION_PROMPT_MAX,
-      );
+      // Output only, same rule as the unknown tool names above: the input direction never writes a
+      // replacement (src/modules/guardrails/analyze.ts), so its guidance reaches no prompt and a cap
+      // on it caps nothing. Keeping it here would refuse a write over text nothing reads, and — the
+      // reason this is a bug and not a tidy-up — the console would raise a text-cap warning routed
+      // to a section that no longer offers the field, so an agent carrying a legacy oversized value
+      // would show a warning with a "Go to" that lands nowhere and can never be cleared.
+      if (dir === "output") {
+        add(
+          d,
+          "generationPrompt",
+          `guardrails.${dir}.generationPrompt`,
+          GENERATION_PROMPT_MAX,
+        );
+      }
     }
   }
   const vision = bagOf(root.vision);

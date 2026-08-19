@@ -439,13 +439,24 @@ export async function runLoadedTurn(
       });
     }
     if (!verdict.violated) return null;
+    // NOTE: The turn trail and the operator note report what the guardrail DID, not what it was
+    // configured to do. `generated` with no replacement in hand sends the template — when the model
+    // returns none, and on the input direction every time (see modules/guardrails/analyze.ts) — and
+    // an operator reading "generated" on a line where the template went out is reading the config
+    // back, not the event.
+    const replacement =
+      dir.action === "generated" ? verdict.suggestedReply : null;
+    const effectiveAction =
+      dir.action === "generated" && replacement === null
+        ? "template"
+        : dir.action;
     emitFlowEvent(flow, {
       stage: "guardrail",
       status: "ok",
       level: "warn",
       detail: {
         direction,
-        action: dir.action,
+        action: effectiveAction,
         categories: verdict.categories,
         rationale: verdict.rationale,
       },
@@ -453,16 +464,11 @@ export async function runLoadedTurn(
     await client
       .sendPrivateNote(
         conversationId,
-        `Guardrail (${direction}): ${verdict.categories.join(", ") || "policy"} — ${dir.action}. ${verdict.rationale}`,
+        `Guardrail (${direction}): ${verdict.categories.join(", ") || "policy"} — ${effectiveAction}. ${verdict.rationale}`,
       )
       .catch(() => {});
     if (dir.action === "silent") return { reply: null };
-    return {
-      reply:
-        dir.action === "generated"
-          ? (verdict.suggestedReply ?? dir.templateMessage)
-          : dir.templateMessage,
-    };
+    return { reply: replacement ?? dir.templateMessage };
   };
   // How many balloons the (text) reply was delivered as, surfaced on `finished` so the UI can hold a
   // "delivering" indicator until the paced balloons land. 1 for audio / single send; null on no post.

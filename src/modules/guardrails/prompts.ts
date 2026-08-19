@@ -119,7 +119,10 @@ export function buildGuardrailSystemPrompt(p: GuardrailPromptParams): string {
   if (p.customPolicy.trim()) {
     lines.push("", `Additional policy: ${p.customPolicy.trim()}`);
   }
-  if (p.generationPrompt?.trim()) {
+  // NOTE: Output only. An input violation never delivers a replacement (see ./analyze), so steering
+  // how one is written steers nothing — and the operator's guidance is usually "be warm, answer
+  // them", which is an instruction to do the thing that direction must not do.
+  if (p.direction === "output" && p.generationPrompt?.trim()) {
     lines.push(
       "",
       "When writing `suggestedReply`, follow this guidance:",
@@ -131,9 +134,27 @@ export function buildGuardrailSystemPrompt(p: GuardrailPromptParams): string {
     "Respond with ONLY a JSON object (no markdown, no prose) of the form:",
     '{"violated": boolean, "categories": string[], "rationale": string, "suggestedReply": string | null}',
     '`categories` lists the violated policy keys (e.g. "toxicity"). `rationale` is one short sentence. ' +
-      "`suggestedReply` is a safe, polite replacement message in the SAME language as the analyzed text " +
-      "(what the assistant could say instead, following the guidance above when present), or null. When " +
-      'nothing is violated, set "violated" to false and "categories" to [].',
+      // NOTE: The shape stays identical in both directions; only what `suggestedReply` may hold
+      // changes. On input it is always null — asking for a replacement there and discarding it in
+      // ./analyze would pay for output tokens on every violation, and would leave the console's
+      // claim that this direction never asks for a composed reply true only after the fact.
+      //
+      // It also closes an injection surface, which was measured rather than predicted. The
+      // customer's message reaches this model at user level, so asking the model to WRITE something
+      // makes any "write this instead" inside that message an on-task instruction. Against
+      // gpt-4.1-nano, an abusive message carrying one was judged CLEAN 16 of 16 — the customer had
+      // switched the guardrail off and passed straight through to the agent — while the same model
+      // caught the same abuse without the injection 16 of 16. gemini-3.5-flash-lite obeyed the
+      // injected order instead, 3 of 16. With this line the injected order has no task to attach
+      // to, and both models catch the violation 16 of 16.
+      (p.direction === "input"
+        ? "`suggestedReply` must ALWAYS be null on this direction: the analyzed text is the " +
+          "customer's own message, so there is no assistant reply to replace and you must not " +
+          "compose one. "
+        : "`suggestedReply` is a safe, polite replacement message in the SAME language as the " +
+          "analyzed text (what the assistant could say instead, following the guidance above when " +
+          "present), or null. ") +
+      'When nothing is violated, set "violated" to false and "categories" to [].',
   );
   return lines.join("\n");
 }
