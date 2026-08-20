@@ -20,7 +20,13 @@ import { withEntityLock } from "@/lib/locks";
 import { asSuperAdminOn, runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { shouldRunReset } from "@/modules/agents/test-mode";
 import {
+  awayMessageDue,
+  readAvailabilityConfig,
+  renderAwayMessage,
+} from "@/modules/availability/away";
+import {
   isOpenAt,
+  NEXT_OPEN_SCAN_DAYS,
   parseSchedule,
   type Schedule,
 } from "@/modules/business-hours/hours";
@@ -59,7 +65,11 @@ import {
 } from "@/modules/vision/service";
 import { hashRouteToken } from "@/modules/webhooks/inbound/route-token";
 import type { ChatwootClient } from "./client";
-import { loadAgentBot, loadChatwootClient } from "./instance";
+import {
+  type AgentBotIdentity,
+  loadAgentBot,
+  loadChatwootClient,
+} from "./instance";
 import { mirrorChatwootEvent } from "./mirror";
 import {
   type ControlCommand,
@@ -556,6 +566,11 @@ async function ingestUnhandledMessage(args: {
 // replies to the customer. Outside the configured window the agent stays SILENT; the operator gets a
 // one-shot private note (postNote true only the first time, mirroring the test-mode notice). No
 // schedule / empty windows → always on (never silenced). Pure (now injected) so it is unit-testable.
+//
+// The CUSTOMER-facing half of the same closure is a separate decision on a separate watermark
+// (awayMessageDue, src/modules/availability/away.ts): the two answer different questions on different
+// clocks, and a conversation whose note went out earlier today must still receive the message the
+// first time an operator writes one.
 export function outOfHoursGate(
   hours: Schedule | null,
   now: Date,
@@ -568,6 +583,62 @@ export function outOfHoursGate(
     return { silence: false, postNote: false };
   }
   return { silence: true, postNote: !noticeAlreadySent };
+}
+
+// Claim the day's away message with a compare-and-swap on its watermark's exact previous value (null
+// included). The webhook dispatch is DETACHED, so a customer who writes twice in a row lands two
+// invocations that both read the same watermark before either writes it; without the claim both would
+// post and the customer would see the message twice. The loser skips: the winner is already posting.
+export async function claimAwayMessage(params: {
+  tenantId: bigint;
+  conversationId: bigint;
+  previous: Date | null;
+  now: Date;
+  base: PrismaClient;
+}): Promise<boolean> {
+  const claimed = await runScopedOn(
+    params.base,
+    sysCtx(params.tenantId),
+    (db) =>
+      db.conversation.updateMany({
+        where: {
+          id: params.conversationId,
+          awayMessageSentAt: params.previous,
+        },
+        data: { awayMessageSentAt: params.now },
+      }),
+  );
+  return claimed.count === 1;
+}
+
+// Give the day back when the message never left. The watermark means "the customer heard from us
+// today", and a claim that delivered nothing must not settle it, or the retry the next message would
+// have made is suppressed until tomorrow. Guarded on our own stamp, so a claim that has since moved on
+// is never clobbered. The operator note has its own watermark and is untouched either way.
+export async function releaseAwayMessage(params: {
+  tenantId: bigint;
+  conversationId: bigint;
+  previous: Date | null;
+  claimed: Date;
+  base: PrismaClient;
+}): Promise<void> {
+  try {
+    await runScopedOn(params.base, sysCtx(params.tenantId), (db) =>
+      db.conversation.updateMany({
+        where: {
+          id: params.conversationId,
+          awayMessageSentAt: params.claimed,
+        },
+        data: { awayMessageSentAt: params.previous },
+      }),
+    );
+  } catch (err) {
+    logger.warn(
+      "chatwoot: away-message claim release failed (conv=%s): %s",
+      String(params.conversationId),
+      errMsg(err),
+    );
+  }
 }
 
 // Test-mode gate + the /teste and /reset commands (item 1 + 2). Runs at the TOP of the actionable
@@ -609,6 +680,7 @@ async function maybeConsumeCommandOrGate(params: {
         testActivatedAt: true,
         testNoticeSentAt: true,
         outOfHoursNoticeSentAt: true,
+        awayMessageSentAt: true,
         redirectSentAt: true,
         redirectCount: true,
         redirectLinkedAt: true,
@@ -620,6 +692,7 @@ async function maybeConsumeCommandOrGate(params: {
     let inboxChatwootId: number | null = null;
     let agentSettings: unknown = null;
     let mode = "production";
+    let agentEnabled = true;
     let hours: Schedule | null = null;
     if (conv.inboxId !== null) {
       const inbox = await db.inbox.findUnique({
@@ -631,10 +704,16 @@ async function maybeConsumeCommandOrGate(params: {
         agentId = inbox.agentId;
         const agent = await db.agent.findUnique({
           where: { id: inbox.agentId },
-          select: { mode: true, businessHoursId: true, settings: true },
+          select: {
+            mode: true,
+            enabled: true,
+            businessHoursId: true,
+            settings: true,
+          },
         });
         if (agent) {
           mode = agent.mode;
+          agentEnabled = agent.enabled;
           agentSettings = agent.settings;
           // The agent's "Availability" schedule (businessHoursId) gates REACTIVE replies: outside it
           // the agent stays silent (a one-shot private note tells the operator). Empty = always on.
@@ -648,50 +727,135 @@ async function maybeConsumeCommandOrGate(params: {
         }
       }
     }
-    return { conv, agentId, mode, hours, inboxChatwootId, agentSettings };
+    return {
+      conv,
+      agentId,
+      mode,
+      agentEnabled,
+      hours,
+      inboxChatwootId,
+      agentSettings,
+    };
   });
   if (!ctx) return false;
 
-  // A client that acts AS the persona bound to this conversation's inbox. Every bot-token endpoint
-  // (send, private note, custom attributes) authenticates with it; admin-token ones (labels, kanban)
-  // ignore it. Building the client without resolving the bot yields an empty token, which Chatwoot
-  // rejects with 401 — issue #79, where /reset did exactly that and reported success anyway.
-  const personaClient = async (): Promise<ChatwootClient> => {
-    const bot =
+  // The persona bound to this conversation's inbox, resolved ONCE and used for both halves of every
+  // customer-visible post: the token it speaks with, and the id the conversation knows it by. They are
+  // deliberately the same lookup. Chatwoot also dispatches an event to the conversation's ASSIGNED
+  // agent bot (agent_bot_listener.rb), so the bot that RECEIVED this delivery is not always the one
+  // that would send the reply — and a fence that clears the recipient while the client sends as the
+  // inbox's persona posts one persona's message into another's conversation.
+  let personaOnce: Promise<AgentBotIdentity | null> | null = null;
+  const persona = (): Promise<AgentBotIdentity | null> =>
+    (personaOnce ??=
       ctx.agentId !== null
-        ? await loadAgentBot(tenantId, instanceId, ctx.agentId, base)
-        : null;
-    return loadChatwootClient(tenantId, instanceId, {
+        ? loadAgentBot(tenantId, instanceId, ctx.agentId, base)
+        : Promise.resolve(null));
+
+  // A client that acts AS that persona. Every bot-token endpoint (send, private note, custom
+  // attributes) authenticates with it; admin-token ones (labels, kanban) ignore it. Building the
+  // client without resolving the bot yields an empty token, which Chatwoot rejects with 401 — issue
+  // #79, where /reset did exactly that and reported success anyway.
+  const personaClient = async (): Promise<ChatwootClient> =>
+    loadChatwootClient(tenantId, instanceId, {
       base,
-      botToken: bot?.accessToken,
+      botToken: (await persona())?.accessToken,
     });
+
+  // Is the conversation still the bot's, RIGHT NOW? `act` upstream was decided from the payload
+  // Chatwoot sent, so a human who took the conversation between that event and this post is invisible
+  // to it — and on a re-delivered webhook that gap is not milliseconds. The mirror applies assignment
+  // events as they arrive, so a fresh read can see the handoff the payload could not. Same fence the
+  // runtime puts before its own reply; it needs one because a model call is slow, this path needs one
+  // because being fast is not being atomic.
+  const stillOurs = async (): Promise<boolean> => {
+    const conv = await runScopedOn(base, sysCtx(tenantId), (db) =>
+      db.conversation.findUnique({
+        where: {
+          tenantId_chatwootInstanceId_chatwootConversationId: {
+            tenantId,
+            chatwootInstanceId: instanceId,
+            chatwootConversationId: conversationId,
+          },
+        },
+        // assigneeId is part of the question, not decoration: without it shouldBotHandle cannot tell
+        // OUR bot from another one, and a conversation handed to a different bot reads as ours.
+        select: { assigneeType: true, assigneeId: true, status: true },
+      }),
+    );
+    // No resolvable persona means nothing can speak here, and "an AgentBot owns this" cannot be
+    // narrowed to "the sender owns this" without an id to compare against. shouldBotHandle answers the
+    // loose attribution question when the id is missing (its other callers depend on that), so the
+    // strict half is decided here, where the absence is known.
+    //
+    // NOTE: no test distinguishes this line today, and that is not an oversight: a persona that failed
+    // to resolve also leaves the client with an empty bot token, which never reaches the network. The
+    // line is here because the fence's answer must be right on its own terms — "we own this" is false
+    // when there is no "we" — rather than right because a lookup two layers down happens to fail too.
+    const ourBotId = (await persona())?.chatwootAgentBotId ?? null;
+    if (ourBotId === null && conv?.assigneeType === "AgentBot") return false;
+    return shouldBotHandle(
+      {
+        assigneeType: conv?.assigneeType ?? null,
+        assigneeId: conv?.assigneeId ?? null,
+        status: conv?.status ?? null,
+      },
+      { ourAgentBotId: ourBotId },
+    );
   };
 
-  const postAck = async (text: string): Promise<void> => {
+  // Returns whether the message actually left. Whoever records that it was sent has to read this: the
+  // away message would otherwise burn the day it just claimed, and the redirect gate would close its
+  // one-shot and spend a resend on a link nobody received. The two command acks ignore it on purpose —
+  // their effect (test mode on, memory cleared) is already committed and a lost ack undoes none of it.
+  //
+  // The fence lives HERE, not at the away branch, because all four customer-visible posts of this gate
+  // (test-mode notice, its reminder, the redirect link, the away message) ask the same question and
+  // none of them was asking it. Private notes are deliberately exempt: only the operator sees one, and
+  // a note that lands after a handoff explains the silence instead of talking over anybody.
+  const postPublicMessage = async (text: string): Promise<boolean> => {
+    // Inside the try, deliberately: a fence that cannot answer must report "not sent" like any other
+    // failure. Thrown, it would skip the away branch's release and burn the day it just claimed on a
+    // message the customer never got.
     try {
+      if (!(await stillOurs())) {
+        logger.info(
+          "chatwoot: public message withheld (conv=%s) — the conversation is no longer the bot's",
+          String(conversationId),
+        );
+        return false;
+      }
       const client = await personaClient();
       await client.sendMessage(conversationId, text);
+      return true;
     } catch (err) {
       logger.warn(
-        "chatwoot: command ack failed (conv=%s): %s",
+        "chatwoot: public message not sent (conv=%s): %s",
         String(conversationId),
         errMsg(err),
       );
+      return false;
     }
   };
 
   // Private note (operator-only, invisible to the customer) posted as the persona bot. Used for the
-  // one-shot "agent is in test mode" notice on a silenced conversation.
-  const postPrivateNote = async (text: string): Promise<void> => {
+  // one-shot "agent is in test mode" and "agent is out of hours" notices on a silenced conversation.
+  // Returns whether it left, for the same reason the public post does: both notices are stamped once
+  // per conversation, and a stamp on a note that never arrived spends the only shot the operator gets.
+  // The fence does NOT apply here — a note that lands after a handoff explains the silence to whoever
+  // took over instead of talking over them.
+  const postPrivateNote = async (text: string): Promise<boolean> => {
     try {
       const client = await personaClient();
       await client.sendPrivateNote(conversationId, text);
+      return true;
     } catch (err) {
       logger.warn(
         "chatwoot: private note failed (conv=%s): %s",
         String(conversationId),
         errMsg(err),
       );
+      return false;
     }
   };
 
@@ -763,7 +927,7 @@ async function maybeConsumeCommandOrGate(params: {
         errMsg(err),
       );
     }
-    await postAck("🧪 Modo teste ativado para esta conversa.");
+    await postPublicMessage("🧪 Modo teste ativado para esta conversa.");
     logger.info("chatwoot: /teste activated (conv=%s)", String(conversationId));
     return true;
   }
@@ -922,6 +1086,7 @@ async function maybeConsumeCommandOrGate(params: {
             lastFollowUpAt: null,
             testNoticeSentAt: null,
             outOfHoursNoticeSentAt: null,
+            awayMessageSentAt: null,
           },
         }),
       ),
@@ -930,7 +1095,7 @@ async function maybeConsumeCommandOrGate(params: {
     // typed /reset to get a clean slate, and acting on a conversation that is not clean is worse than
     // knowing what survived.
     const distinctFailed = [...new Set(failed)];
-    await postAck(
+    await postPublicMessage(
       distinctFailed.length === 0
         ? "🔄 Memória, preferência de áudio e etiquetas/atributos desta conversa foram limpos."
         : `⚠️ Reset parcial: não consegui limpar ${distinctFailed.join(", ")}. O restante foi limpo.`,
@@ -958,10 +1123,12 @@ async function maybeConsumeCommandOrGate(params: {
   if (ctx.mode === "test" && ctx.conv.testActivatedAt === null) {
     // One-shot private note (operator-only) so whoever watches the inbox knows WHY the bot is quiet
     // and how to activate it. Anti-spam: posted once per conversation (testNoticeSentAt watermark).
-    if (ctx.conv.testNoticeSentAt === null) {
-      await postPrivateNote(
+    if (
+      ctx.conv.testNoticeSentAt === null &&
+      (await postPrivateNote(
         "🧪 Este agente está em modo teste. Ele não responde automaticamente nesta conversa. Envie /teste para ativar as respostas aqui.",
-      );
+      ))
+    ) {
       try {
         await runScopedOn(base, sysCtx(tenantId), (db) =>
           db.conversation.update({
@@ -1007,30 +1174,84 @@ async function maybeConsumeCommandOrGate(params: {
         clonedMessage: n.message?.content ?? null,
         now: new Date(),
         base,
-        send: postAck,
+        send: postPublicMessage,
       });
       if (outcome !== "misconfigured") return true;
     }
   }
 
   // ── Availability gate: the agent's business hours (the "Disponibilidade" schedule) gate REACTIVE
-  //    replies. Outside the configured window the agent stays silent and the operator gets a one-shot
-  //    private note (same anti-spam watermark as the test-mode notice). Empty/no schedule = always on. ──
+  //    replies. Outside the configured window the agent stays silent, the operator gets a one-shot
+  //    private note (same anti-spam watermark as the test-mode notice), and the CUSTOMER gets the
+  //    agent's away message when one is configured. Empty/no schedule = always on. ──
+  const now = new Date();
   const availability = outOfHoursGate(
     ctx.hours,
-    new Date(),
+    now,
     ctx.conv.outOfHoursNoticeSentAt !== null,
   );
   if (availability.silence) {
-    if (availability.postNote) {
-      await postPrivateNote(
-        "🌙 Mensagem recebida fora do horário de atendimento. O agente não respondeu automaticamente; ele volta a responder no próximo horário disponível.",
+    // ── The CUSTOMER-facing half (#153), on its own watermark and its own cadence. A DISABLED agent
+    //    still tells the operator why it is quiet — that note is pre-existing behavior nobody but the
+    //    operator sees — but it acquires no voice toward the customer: switching an agent off switches
+    //    off everything it says to them, which is why the runtime refuses to run it a few lines later.
+    const awayCfg = readAvailabilityConfig(ctx.agentSettings);
+    const away =
+      ctx.agentEnabled &&
+      ctx.hours &&
+      awayMessageDue(ctx.hours, now, ctx.conv.awayMessageSentAt)
+        ? renderAwayMessage({
+            enabled: awayCfg.enabled,
+            copy: awayCfg.awayMessage,
+            schedule: ctx.hours,
+            now,
+          })
+        : ({ send: false, reason: "disabled" } as const);
+    if (!away.send && away.reason === "no_next_open") {
+      logger.warn(
+        "chatwoot: away message not sent (conv=%s) — it interpolates the next opening and the schedule never opens within %d days",
+        String(conversationId),
+        NEXT_OPEN_SCAN_DAYS,
       );
+    }
+    if (away.send) {
+      const previous = ctx.conv.awayMessageSentAt;
+      const claimed = await claimAwayMessage({
+        tenantId,
+        conversationId: ctx.conv.id,
+        previous,
+        now,
+        base,
+      }).catch((err) => {
+        logger.warn(
+          "chatwoot: away-message claim failed (conv=%s): %s",
+          String(conversationId),
+          errMsg(err),
+        );
+        return false;
+      });
+      if (claimed && !(await postPublicMessage(away.text))) {
+        await releaseAwayMessage({
+          tenantId,
+          conversationId: ctx.conv.id,
+          previous,
+          claimed: now,
+          base,
+        });
+      }
+    }
+    // ── The operator note, unchanged: one shot per conversation, stamped after it is posted. ──
+    if (
+      availability.postNote &&
+      (await postPrivateNote(
+        "🌙 Mensagem recebida fora do horário de atendimento. O agente não respondeu automaticamente; ele volta a responder no próximo horário disponível.",
+      ))
+    ) {
       try {
         await runScopedOn(base, sysCtx(tenantId), (db) =>
           db.conversation.update({
             where: { id: ctx.conv.id },
-            data: { outOfHoursNoticeSentAt: new Date() },
+            data: { outOfHoursNoticeSentAt: now },
           }),
         );
       } catch (err) {

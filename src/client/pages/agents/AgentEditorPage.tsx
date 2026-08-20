@@ -288,6 +288,7 @@ function readBehaviorState(a: Agent) {
   const li = (s.limits ?? {}) as Record<string, unknown>;
   const ac = (s.attributeContext ?? {}) as Record<string, unknown>;
   const si = (s.sendImage ?? {}) as Record<string, unknown>;
+  const av = (s.availability ?? {}) as Record<string, unknown>;
 
   // NOTE: Attribute keys per scope: plain string lists (the runtime reader trims/dedups/caps them).
   const attrKeys = (v: unknown): string[] =>
@@ -301,6 +302,8 @@ function readBehaviorState(a: Agent) {
     businessHoursId: a.businessHoursId ?? "",
     followUpHoursId: a.followUpHoursId ?? "",
     settings: s,
+    awayEnabled: av.enabled === true,
+    awayMessage: str(av.awayMessage),
     debounce: {
       enabled: typeof d.enabled === "boolean" ? d.enabled : true,
       windowSeconds: num(d.windowSeconds) || "15",
@@ -570,6 +573,8 @@ function AgentEditor() {
   );
   const [transferWithSummary, setTransferWithSummary] = useState(true);
   const [businessHoursId, setBusinessHoursId] = useState("");
+  const [awayEnabled, setAwayEnabled] = useState(false);
+  const [awayMessage, setAwayMessage] = useState("");
   const [followUpHoursId, setFollowUpHoursId] = useState("");
   // Free-form settings bag, preserved on save so editing one section never wipes another
   // (e.g. grounding). The debounce sub-state mirrors settings.debounce (see modules/debounce).
@@ -801,6 +806,8 @@ function AgentEditor() {
     setModel(readModelState(a));
     const b = readBehaviorState(a);
     setBusinessHoursId(b.businessHoursId);
+    setAwayEnabled(b.awayEnabled);
+    setAwayMessage(b.awayMessage);
     setFollowUpHoursId(b.followUpHoursId);
     setSettings(b.settings);
     setDebounce(b.debounce);
@@ -835,6 +842,8 @@ function AgentEditor() {
     syncedAgentRef.current = a;
     const b = readBehaviorState(a);
     setBusinessHoursId(b.businessHoursId);
+    setAwayEnabled(b.awayEnabled);
+    setAwayMessage(b.awayMessage);
     setFollowUpHoursId(b.followUpHoursId);
     setSettings(b.settings);
     setDebounce(b.debounce);
@@ -1027,6 +1036,7 @@ function AgentEditor() {
       // reading the live channelRedirect form in a Behavior save would clobber that tab's unsaved
       // edits. The `...settings` spread preserves the last-synced channelRedirect; saveChannelRedirect
       // keeps that bag in step after its own write (same pattern as saveTools does for handoff/kanban).
+      availability: { enabled: awayEnabled, awayMessage: awayMessage.trim() },
       debounce: {
         enabled: debounce.enabled,
         windowSeconds: Number(debounce.windowSeconds) || 15,
@@ -1138,6 +1148,8 @@ function AgentEditor() {
     // bag including tool-owned handoff/kanban) so a Tools save never falsely lights up Behavior's dot.
     behavior: JSON.stringify({
       businessHoursId,
+      awayEnabled,
+      awayMessage,
       followUpHoursId,
       debounce,
       stt,
@@ -1790,6 +1802,8 @@ function AgentEditor() {
     if (!a) return;
     const b = readBehaviorState(a);
     setBusinessHoursId(b.businessHoursId);
+    setAwayEnabled(b.awayEnabled);
+    setAwayMessage(b.awayMessage);
     setFollowUpHoursId(b.followUpHoursId);
     setSettings(b.settings);
     setDebounce(b.debounce);
@@ -2675,6 +2689,10 @@ function AgentEditor() {
                 hours={hours}
                 businessHoursId={businessHoursId}
                 setBusinessHoursId={setBusinessHoursId}
+                awayEnabled={awayEnabled}
+                setAwayEnabled={setAwayEnabled}
+                awayMessage={awayMessage}
+                setAwayMessage={setAwayMessage}
                 followUpHoursId={followUpHoursId}
                 setFollowUpHoursId={setFollowUpHoursId}
                 debounce={debounce}
