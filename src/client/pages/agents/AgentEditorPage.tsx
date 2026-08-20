@@ -73,6 +73,7 @@ import {
   GUARDRAILS_DEFAULTS,
   type GuardrailsConfig,
 } from "@/modules/guardrails/settings";
+import { readMemoryConfig } from "@/modules/memory/settings";
 import { DEFAULT_EXTRACTION_PROMPT } from "@/modules/vision/prompt-default";
 import { BehaviorTab, type SendImageState } from "./BehaviorTab";
 import {
@@ -376,6 +377,10 @@ function readBehaviorState(a: Agent) {
     // here would show the switch off while values were being logged, and would then persist that lie
     // on the next save.
     observability: readObservabilityConfig(s),
+    // NOTE: Same reason as observability above — through the runtime's own reader, because this one
+    // defaults to ON and a hand-rolled `=== true` would show the switch off on every agent whose bag
+    // predates the feature, then persist that lie on the next save.
+    memory: { compactionEnabled: readMemoryConfig(s).compaction.enabled },
   };
 }
 
@@ -628,6 +633,9 @@ function AgentEditor() {
   // Whether this agent's tool lines log the values the model sent instead of their shape. Mirrors
   // agent.settings.observability (modules/flowlog/settings).
   const [observability, setObservability] = useState({ logToolValues: false });
+  // Whether an attendance that ended is folded into a summary. Mirrors agent.settings.memory
+  // (modules/memory/settings), which defaults to ON.
+  const [memory, setMemory] = useState({ compactionEnabled: true });
   // NOTE: Hosts the send_image tool may fetch from. Mirrors agent.settings.sendImage
   // (modules/images/settings), edited as one host per line.
   const [sendImage, setSendImage] = useState<SendImageState>({
@@ -804,6 +812,7 @@ function AgentEditor() {
     setVision(b.vision);
     setLimits(b.limits);
     setObservability(b.observability);
+    setMemory(b.memory);
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
     setChannelRedirect(readChannelRedirectState(a));
@@ -837,6 +846,7 @@ function AgentEditor() {
     setVision(b.vision);
     setLimits(b.limits);
     setObservability(b.observability);
+    setMemory(b.memory);
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
   }, []);
@@ -1096,6 +1106,7 @@ function AgentEditor() {
         maxHistoryTokens: Number(limits.maxHistoryTokens) || null,
       },
       observability: { logToolValues: observability.logToolValues },
+      memory: { compaction: { enabled: memory.compactionEnabled } },
       attributeContext: {
         conversation: attributeContext.conversation,
         contact: attributeContext.contact,
@@ -1139,6 +1150,7 @@ function AgentEditor() {
       attributeContext,
       sendImage,
       observability,
+      memory,
     }),
     // The WhatsApp→website-chat redirect (own Save button). widgetInboxId is excluded (server-owned,
     // persisted on provision), so provisioning the widget never lights up this tab's unsaved-changes dot.
@@ -1789,6 +1801,7 @@ function AgentEditor() {
     setVision(b.vision);
     setLimits(b.limits);
     setObservability(b.observability);
+    setMemory(b.memory);
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
   };
@@ -2695,6 +2708,8 @@ function AgentEditor() {
                 visionCredBaseUrl={visionCredBaseUrl}
                 limits={limits}
                 setLimits={setLimits}
+                memory={memory}
+                setMemory={setMemory}
                 observability={observability}
                 setObservability={setObservability}
                 sendImage={sendImage}
