@@ -85,6 +85,8 @@ export type SideEffectErrorReporter = (e: {
   err: unknown;
 }) => void;
 
+// LEGACY, descriptive only: nothing branches on a tool's risk tier. See the RiskTier docstring in
+// src/graph/tools/catalog.ts before relying on this for anything.
 export type ToolRisk = "low" | "medium" | "high";
 
 // A single tool argument, projected for the UI (mirrors how MCP tool args are shown): the name, the

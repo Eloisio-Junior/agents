@@ -776,8 +776,9 @@ model ToolDefinition {
   body          Json     @default("{}")
   credentialRef String?  @map("credential_ref")
   enabled       Boolean  @default(true)
-  // NOTE: low|medium|high. Surfaced in the tool-selection UI so granting a write/financial tool
-  // is a deliberate, visible act; default medium for a custom HTTP tool of unknown impact.
+  // NOTE: low|medium|high, LEGACY and purely descriptive. Nothing branches on it and the UI badge
+  // that surfaced it is gone; it stays because REST/MCP/export still carry the value. See the
+  // RiskTier docstring in src/graph/tools/catalog.ts.
   riskTier      String   @default("medium") @map("risk_tier")
   // HTTP statuses this tool declares as RESULTS rather than integration failures. Empty (the
   // default) keeps issue #40's behavior, where every non-2xx is logged warn and reaches the alert

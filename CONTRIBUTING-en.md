@@ -22,7 +22,7 @@ This changes little for contributors, but it explains two things:
 
 ## Pull requests
 
-1. For large changes, open an issue first to align on the approach and avoid rework.
+1. For large changes, open an issue first to align on the approach and avoid rework. You do not need permission to contribute, nor do you need to wait for an answer to start: if you would rather get a head start, send the PR along with the issue, or just the PR. The issue is there to settle the "how", and writing code before that alignment means accepting that some of it may be discarded, which is normal.
 2. Prefer small, focused PRs: one logical change per PR.
 3. **Tests accompany fixes and features.** Ideally tests that fail without the change and pass with it, proving they pin the behavior.
 4. Run `bun check` before submitting (lint, type-check, i18n and tests, the same things CI runs).

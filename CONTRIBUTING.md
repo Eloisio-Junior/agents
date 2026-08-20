@@ -22,7 +22,7 @@ Isso muda pouco para quem contribui, mas explica duas coisas:
 
 ## Pull requests
 
-1. Para mudanças grandes, abra uma issue antes, para alinhar a abordagem e evitar retrabalho.
+1. Para mudanças grandes, abra uma issue antes, para alinhar a abordagem e evitar retrabalho. Não é preciso pedir permissão para contribuir nem esperar resposta para começar: se preferir adiantar, mande a PR junto da issue, ou direto a PR. A issue serve para combinar o "como", e quem escreve código antes desse alinhamento assume o risco de descartar parte dele, o que é normal.
 2. Prefira PRs pequenas e focadas: uma mudança lógica por PR.
 3. **Testes acompanham fixes e features.** O ideal são testes que falham sem a mudança e passam com ela, provando que pinam o comportamento.
 4. Rode `bun check` antes de submeter (lint, type-check, i18n e testes, o mesmo que o CI roda).
