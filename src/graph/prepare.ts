@@ -6,6 +6,7 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import { decryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import config from "@/config";
+import { parseDbId } from "@/lib/db-id";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { readLimitsConfig } from "@/modules/agents/limits";
 import { readToolGuidance } from "@/modules/agents/tool-guidance";
@@ -17,7 +18,7 @@ import {
   cancelAppointmentReminders,
   enqueueAppointmentReminders,
 } from "@/modules/appointments/reminders";
-import type { Schedule } from "@/modules/business-hours/hours";
+import { parseSchedule, type Schedule } from "@/modules/business-hours/hours";
 import { readSchedule } from "@/modules/business-hours/service";
 import {
   attributeBagsFrom,
@@ -249,6 +250,11 @@ export interface LoadAgentArgs {
 // overridable in v1 (they need id/ownership re-validation); the playground uses the saved set.
 export interface AgentConfigOverrides {
   systemPrompt?: string;
+  // Playground: the Availability the operator has selected but not saved yet, as the console's own
+  // string ("" = none). Absent = read the saved column. Without it the playground answers
+  // {{esta_aberto}} & co. from the schedule the picker no longer shows, which is the same drift
+  // between description and enforcement these variables exist to remove.
+  businessHoursId?: string;
   modelConfig?: Record<string, unknown>;
   settings?: Record<string, unknown>;
   // Playground tool-simulation: tool name → canned result. Consumed by the playground graph builder
@@ -436,15 +442,32 @@ export async function loadAgentConfig(
     },
     select: { chatwootAgentBotId: true, accessToken: true },
   });
-  // Timezone for the clock (get_current_time tool + {{hora_atual}} var): the agent's BusinessHours,
-  // falling back to the product default. A single small scoped read when configured.
+  // The agent's Availability, in one scoped read when configured. It feeds the clock (get_current_time
+  // tool + {{hora_atual}} var) through its timezone, and the schedule variables ({{esta_aberto}},
+  // {{proximo_atendimento}}, {{horario_atendimento}}) through the grid and its exceptions. Until this
+  // read carried more than the timezone, the agent described its own hours from the operator's prose
+  // and drifted from the gate the moment either changed. `null` = no Availability = always on.
   let timezone = DEFAULT_TIMEZONE;
-  if (agent.businessHoursId !== null) {
+  let schedule: Schedule | null = null;
+  // A draft id is console input, so it goes through parseDbId (digits AND range: a value past 2^63-1
+  // parses as a BigInt and then fails in the query BIND, turning a bad field into a 500) and is read
+  // through the SAME scoped client: another tenant's row simply does not come back, and the turn
+  // falls through to always-on rather than to the saved schedule — an unresolvable selection is "no
+  // schedule", not "the old one".
+  const draftHoursId = ov?.businessHoursId;
+  const hoursId =
+    draftHoursId === undefined
+      ? agent.businessHoursId
+      : parseDbId(draftHoursId);
+  if (hoursId !== null) {
     const bh = await db.businessHours.findUnique({
-      where: { id: agent.businessHoursId },
-      select: { timezone: true },
+      where: { id: hoursId },
+      select: { timezone: true, windows: true, exceptions: true },
     });
-    if (bh?.timezone) timezone = bh.timezone;
+    if (bh) {
+      schedule = parseSchedule(bh);
+      if (bh.timezone) timezone = bh.timezone;
+    }
   }
   // Company name for the {{nome_empresa}} prompt variable (the tenant's own row under RLS).
   const tenant = await db.tenant.findFirst({ select: { name: true } });
@@ -516,6 +539,10 @@ export async function loadAgentConfig(
       now: ov?.promptNow
         ? (zonedWallClockToInstant(ov.promptNow, timezone) ?? undefined)
         : undefined,
+      // Passed on every real path, so a schedule variable is answered rather than left literal. The
+      // playground's time simulation reaches it through `now` above: an operator testing "what does
+      // it say at 22:00" sees the agent report itself closed, exactly as the gate would.
+      availability: { schedule },
     },
   );
   // NOTE: The current values of the attribute keys the operator selected, rendered as an XML block
