@@ -31,7 +31,10 @@ import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { selectClosedPrefix } from "@/modules/memory/cut";
 import { seedChatwootInstance } from "../utils/chatwoot";
-import { EmptyThenReplyModel } from "../utils/scripted-models";
+import {
+  EmptyThenReplyModel,
+  HandoffThenReplyModel,
+} from "../utils/scripted-models";
 
 describe("renderNudge (prompt-injection boundary)", () => {
   test("directive comes first and is authoritative", () => {
@@ -434,6 +437,39 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
     expect(isTurnInFlight(graphThreadId)).toBe(false);
   });
 
+  test("handoff customerMessage is terminal when the nudge mirror event lags", async () => {
+    await seedConv(999, null);
+    const s = stub();
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:999`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      postActions: { assignLabels: ["follow-up"], resolve: true },
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new HandoffThenReplyModel(
+            "Vou te encaminhar para o time!",
+            "Vou te encaminhar para o time.",
+          ) as never,
+        // stub() does not mirror toggleStatus, reproducing the Chatwoot webhook lag.
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+    expect(outcome).toBe("messaged");
+    // The tool's closing line, once: the model's final text is the second copy and never goes out.
+    expect(s.messages).toEqual([[999, "Vou te encaminhar para o time."]]);
+    // The label DOES apply. It is how the operator triages what the bot left behind, and the branch
+    // below (`noted-window`) keeps it for the same reason.
+    expect(s.labelSets).toEqual([["follow-up"]]);
+    // The only status call is the handoff's own `open`: postActions.resolve must not close a
+    // conversation the human queue now owns.
+    expect(s.resolved).toEqual([999]);
+    expect(s.order).toEqual(["message", "resolve", "label"]);
+  });
+
   test("invokes on the per-contact-inbox memory thread, not the per-conversation thread (unification)", async () => {
     const contactInboxId = 8800;
     await seedConv(907, null, new Date(), contactInboxId);
@@ -708,6 +744,114 @@ describe.skipIf(!dbUp)("runAgentNudge", () => {
       where: { tenantId, kind: "MEMORY_COMPACT", dedupeKey: threadId },
     });
     expect(job).not.toBeNull();
+  });
+
+  // Outside the window, the free-form send the handoff tool makes from inside the tool is exactly
+  // the one the provider refuses, so suppressing the follow-up's own output here would leave a
+  // fenced handoff with no trace anywhere: no customer message, no note, no label. The suppression
+  // belongs strictly to the branch where a free-form send would actually have happened.
+  // An inactivity follow-up runs with requireLiveBotOwnership (followups/handlers.ts), so the check
+  // before delivery is a live GET, not the mirror — and the tool's toggleStatus already reached
+  // Chatwoot, so that GET reports the conversation as no longer the bot's. `stale` is the right
+  // word for it: the episode is moot because the conversation left the bot, and the caller ends the
+  // ladder with no watermark and no next step. What must NOT happen is the shortcut answering
+  // before the probe: that reports `messaged`, which stamps the watermark and schedules another
+  // step against a conversation a human just took.
+  test("an inactivity follow-up that hands off ends the episode instead of stamping it", async () => {
+    await seedConv(9907, null);
+    const s = stub();
+    let liveStatus = "pending";
+    const client = {
+      ...(await s.makeClient()),
+      getConversation: async (c: number) => ({
+        id: c,
+        status: liveStatus,
+        meta: {},
+      }),
+      toggleStatus: async (c: number, status: string) => {
+        liveStatus = status;
+        s.resolved.push(c);
+        s.order.push("resolve");
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:9907`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      postActions: { assignLabels: ["follow-up"], resolve: true },
+      requireLiveBotOwnership: true,
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new HandoffThenReplyModel(
+            "Vou te encaminhar para o time!",
+            "Um humano vai te atender.",
+          ) as never,
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+    expect(outcome).toBe("stale");
+    // Only the tool's closing line: the model's final text is never a second customer-facing post.
+    expect(s.messages).toEqual([[9907, "Um humano vai te atender."]]);
+    expect(s.notes).toEqual([]);
+  });
+
+  // The model can hand off and then say nothing of its own, which lands on the silent branch. The
+  // label still applies there; the resolve must not, or the follow-up closes a conversation it just
+  // handed to a human.
+  test("a handoff with no final text labels but never resolves", async () => {
+    await seedConv(9905, null);
+    const s = stub();
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:9905`,
+      nudge: { source: "followup", kind: "inactivity", step: 1 },
+      postActions: { assignLabels: ["follow-up"], resolve: true },
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new HandoffThenReplyModel("", "Um humano vai te atender.") as never,
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+    expect(outcome).toBe("silent");
+    expect(s.labelSets).toEqual([["follow-up"]]);
+    // Exactly one status call: the handoff's own `open`. A second one would be the resolve.
+    expect(s.resolved).toEqual([9905]);
+  });
+
+  test("outside the 24h window, a handoff still leaves the operator the note and the label", async () => {
+    await seedConv(9903, null, new Date(Date.now() - 48 * 3_600_000));
+    const s = stub();
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:9903`,
+      nudge: { source: "followup", kind: "inactivity", step: 3 },
+      postActions: { assignLabels: ["follow-up"], resolve: true },
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new HandoffThenReplyModel(
+            "Vou te encaminhar para o time!",
+            "Um humano vai te atender.",
+          ) as never,
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    });
+    expect(outcome).toBe("noted-window");
+    expect(s.notes).toEqual([
+      [9903, `${OUTSIDE_WINDOW_NOTE_PREFIX}Vou te encaminhar para o time!`],
+    ]);
+    expect(s.labelSets).toEqual([["follow-up"]]);
+    // noted-window never resolves, handoff or not: nothing reached the customer.
+    expect(s.resolved).toEqual([9903]);
   });
 
   test("outside the 24h window (no template) → private note, not a free-form message", async () => {

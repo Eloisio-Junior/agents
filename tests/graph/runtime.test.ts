@@ -25,10 +25,12 @@ import { selectClosedPrefix } from "@/modules/memory/cut";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import {
   EmptyThenReplyModel,
+  HandoffThenReplyModel,
   ResolveThenReplyModel,
   SendImageAndResolveModel,
   SendImageBatchModel,
   SendImageOnlyModel,
+  SendImageThenHandoffModel,
   SendImageThenReplyModel,
 } from "../utils/scripted-models";
 
@@ -764,6 +766,278 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       if (!resolvedLogged) await new Promise((r) => setTimeout(r, 100));
     }
     expect(resolvedLogged).toBe(true);
+  });
+
+  test("handoff customerMessage is terminal when the mirror status event lags", async () => {
+    await seedConversation(996, null);
+    const CLOSING = "Vou te encaminhar para o time.";
+    const FINAL = "Vou te encaminhar para o time!";
+    const calls: Array<[string, number, string]> = [];
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 996 }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new HandoffThenReplyModel(FINAL, CLOSING) as unknown as BaseChatModel,
+        // Deliberately do NOT mirror toggleStatus: this is the production lag that allowed the final
+        // reply through after the tool had already sent customerMessage.
+        makeClient: makeResolveClient(calls),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(outcome).toBe("posted");
+    expect(calls).toEqual([
+      ["sendMessage", 996, CLOSING],
+      ["toggleStatus", 996, "open"],
+    ]);
+  });
+
+  // The closing line going out is not the same event as the transfer happening. sendPrivateNote and
+  // toggleStatus are NOT best-effort inside the tool, so either can throw after the customer has
+  // already been told a human is coming. The conversation then stays `pending` — still the bot's,
+  // never queued to anyone — and the model gets the tool error plus one more step. That recovery
+  // reply is the only thing between the customer and a promise nobody is going to keep.
+  test("a handoff whose transfer throws still delivers the model's recovery reply", async () => {
+    await seedConversation(997, null);
+    const CLOSING = "Um humano já te atende.";
+    const RECOVERY =
+      "Desculpe, não consegui transferir. Vou seguir te ajudando.";
+    const calls: Array<[string, number, string]> = [];
+    const client = {
+      sendMessage: async (c: number, t: string) => {
+        calls.push(["sendMessage", c, t]);
+        return {};
+      },
+      toggleStatus: async (c: number, s: string) => {
+        calls.push(["toggleStatus", c, s]);
+        throw new Error("chatwoot 502");
+      },
+    } as unknown as ChatwootClient;
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 997 }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new HandoffThenReplyModel(
+            RECOVERY,
+            CLOSING,
+          ) as unknown as BaseChatModel,
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(outcome).toBe("posted");
+    expect(calls).toEqual([
+      ["sendMessage", 997, CLOSING],
+      ["toggleStatus", 997, "open"],
+      ["sendMessage", 997, RECOVERY],
+    ]);
+    // Still the bot's: nothing was handed anywhere, which is why the reply above had to go out.
+    const row = await suDb.conversation.findFirst({
+      where: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: 997,
+      },
+      select: { status: true },
+    });
+    expect(row?.status).toBe("pending");
+  });
+
+  // A photo the model queued earlier in the same turn is not a second copy of the closing line, and
+  // the tool already told the model it was on its way.
+  test("a handoff still delivers an image queued earlier in the same turn", async () => {
+    await allowImageHost();
+    await seedConversation(998, null);
+    const calls: Array<[string, number, string]> = [];
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 998 }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new SendImageThenHandoffModel(
+            IMG_URL,
+            "Segue a foto. Vou te passar para um humano.",
+            "Camiseta azul",
+          ) as unknown as BaseChatModel,
+        makeClient: makeImageClient(calls),
+        checkpointer: new MemorySaver(),
+        imageDeps,
+      },
+    });
+    expect(outcome).toBe("posted");
+    expect(calls).toEqual([
+      ["sendMessage", 998, "Segue a foto. Vou te passar para um humano."],
+      ["toggleStatus", 998, "open"],
+      ["sendFileAttachment", 998, "imagem.png"],
+    ]);
+  });
+
+  // The deferred resolve falls with the TRANSFER, not with the suppression of the final text. The
+  // two come apart exactly when the closing line fails to send: the customer never heard it, so the
+  // model's reply still has to go out, but the conversation is already a human's and resolving it
+  // would close an open request out from under them.
+  test("a handoff never lets the deferred resolve close the conversation", async () => {
+    await seedConversation(9977, null);
+    const calls: Array<[string, number, string]> = [];
+    let sends = 0;
+    const client = {
+      sendMessage: async (c: number, t: string) => {
+        // Only the tool's closing line fails; the fallback reply below must still be deliverable.
+        if (sends++ === 0) {
+          calls.push(["sendMessage-THREW", c, t]);
+          throw new Error("chatwoot 500");
+        }
+        calls.push(["sendMessage", c, t]);
+        return {};
+      },
+      toggleStatus: async (c: number, status: string) => {
+        calls.push(["toggleStatus", c, status]);
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    class ResolveThenHandoffModel {
+      async invoke() {
+        return new AIMessage("Já resolvo para você.");
+      }
+      bindTools(_t: unknown) {
+        let n = 0;
+        return {
+          async invoke() {
+            n++;
+            if (n === 1)
+              return new AIMessage({
+                content: "",
+                tool_calls: [
+                  { name: "resolve_conversation", args: {}, id: "c1" },
+                ],
+              });
+            if (n === 2)
+              return new AIMessage({
+                content: "",
+                tool_calls: [
+                  {
+                    name: "handoff_to_human",
+                    args: { customerMessage: "Um humano já te atende." },
+                    id: "c2",
+                  },
+                ],
+              });
+            return new AIMessage("Já resolvo para você.");
+          },
+        };
+      }
+    }
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 9977 }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new ResolveThenHandoffModel() as unknown as BaseChatModel,
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(outcome).toBe("posted");
+    // The only toggleStatus is the handoff's `open`. A "resolved" here would be the deferred intent
+    // closing a conversation the human queue had just been handed.
+    expect(calls).toEqual([
+      ["sendMessage-THREW", 9977, "Um humano já te atende."],
+      ["toggleStatus", 9977, "open"],
+      ["sendMessage", 9977, "Já resolvo para você."],
+    ]);
+  });
+
+  // The bound on the case above, pinned so it is a decision and not a surprise: once the mirror
+  // reflects the status the tool set, the takeover gate ends the turn and the queued image does not
+  // go out. The gate cannot tell our own transition from a human grabbing the conversation in the
+  // same window, and it fails closed for the one that matters.
+  test("a handoff stops at the takeover gate once the mirror reflects it", async () => {
+    await allowImageHost();
+    await seedConversation(9988, null);
+    const calls: Array<[string, number, string]> = [];
+    const base = makeImageClient(calls);
+    const client = await base();
+    const mirrored = {
+      ...client,
+      // The webhook lands DURING generation: by the recheck the row is no longer bot-owned.
+      toggleStatus: async (c: number, status: string) => {
+        calls.push(["toggleStatus", c, status]);
+        await suDb.conversation.updateMany({
+          where: {
+            tenantId,
+            chatwootInstanceId: instanceId,
+            chatwootConversationId: c,
+          },
+          data: { status },
+        });
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 9988 }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new SendImageThenHandoffModel(
+            IMG_URL,
+            "Segue a foto. Vou te passar para um humano.",
+            "Camiseta azul",
+          ) as unknown as BaseChatModel,
+        makeClient: async () => mirrored,
+        checkpointer: new MemorySaver(),
+        imageDeps,
+      },
+    });
+    expect(outcome).toBe("taken-over");
+    expect(calls).toEqual([
+      ["sendMessage", 9988, "Segue a foto. Vou te passar para um humano."],
+      ["toggleStatus", 9988, "open"],
+    ]);
+  });
+
+  // An image-only turn that delivers nothing throws, because the images WERE the turn and a silent
+  // failure would let the deferred resolve close a conversation nobody answered. After a handoff
+  // that rule does not hold: the closing line answered the customer and a human owns the thread, so
+  // a failed attachment must not also brand the turn as errored (private note, lastError, alert).
+  test("a failed image does not error the turn when a handoff already answered", async () => {
+    await allowImageHost();
+    await seedConversation(9989, null);
+    const calls: Array<[string, number, string]> = [];
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 9989 }),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new SendImageThenHandoffModel(
+            IMG_URL,
+            "Segue a foto. Vou te passar para um humano.",
+            "Camiseta azul",
+          ) as unknown as BaseChatModel,
+        makeClient: makeImageClient(calls, { attachmentFails: true }),
+        checkpointer: new MemorySaver(),
+        imageDeps,
+      },
+    });
+    expect(outcome).toBe("posted");
   });
 
   test("taken over mid-turn discards the resolve intent", async () => {
