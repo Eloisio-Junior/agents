@@ -33,6 +33,10 @@ import { clampOversizedTextInPlace } from "@/modules/agents/text-caps";
 import { normalizeSettingsForStorage } from "@/modules/images/settings";
 import { isKnownCatalogType } from "@/modules/integrations/catalog";
 import { assertNoSecrets } from "@/modules/n8n-export/n8n";
+import {
+  canonicalBodyShape,
+  unsupportedBodyShape,
+} from "@/modules/tool-definitions/body-shape";
 import { normalizeToolShapes } from "@/modules/tool-definitions/normalize";
 import {
   createPendingVaultEntry,
@@ -1097,11 +1101,26 @@ async function createMissingComponents(
     // NOTE: the import writes straight to the DB (not via the service), so canonicalize authoring
     // shapes here too; a bundle exported from a pre-normalization instance may carry JSON-Schema
     // inputSchema / single-brace placeholders.
+    // A body shape this version refuses is CANONICALIZED rather than refused, the same trade the
+    // expectedStatuses line below makes: failing a whole bundle over an untidily stored body would
+    // be worse than importing it. `canonicalBodyShape` returns what `parseBody` was already
+    // executing, so the outbound request is byte-identical and only the storage stops holding keys
+    // nothing reads. Blanking it to `{}` would NOT be equivalent: that is behaviour-preserving only
+    // for a body with no recognized mode, and would switch a `{mode:"raw", …, extra}` tool to the
+    // fields assembly — changing what it sends (issue #150).
+    const badBody = unsupportedBodyShape(tdef.body);
+    if (badBody) {
+      warnings.push({
+        code: "httpToolBodyIgnored",
+        params: { name: tdef.name },
+        target: { kind: "tool", name: tdef.name },
+      });
+    }
     const { shapes } = normalizeToolShapes({
       urlTemplate: tdef.urlTemplate,
       query: tdef.query ?? {},
       headers: tdef.headers,
-      body: tdef.body,
+      body: badBody ? canonicalBodyShape(tdef.body) : tdef.body,
       inputSchema: tdef.inputSchema,
     });
     await db.toolDefinition.create({
