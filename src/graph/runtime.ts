@@ -59,6 +59,7 @@ import {
   isTurnInFlight,
   markTurnInFlight,
 } from "./inflight";
+import { drainPendingIngest } from "./ingest-drain";
 import { conversationDividerMessage, conversationStamp } from "./markers";
 import type { ResolvedModelConfig } from "./models";
 import {
@@ -624,6 +625,16 @@ export async function runLoadedTurn(
     //    carrying a system marker the customer never wrote.
     if (loaded.contactInboxId != null) {
       const contactInboxId = loaded.contactInboxId;
+      // BARRIER (issue #194). Continuous ingestion is a queued job now, so a message the agent stayed
+      // silent on may still be a row rather than a turn in this thread. Folded in here, BEFORE the
+      // lock and the in-flight claim below: the drain takes that same lock, and it is also the last
+      // moment at which the append is not the thing this turn erases.
+      //
+      // Its outcome is DISCARDED, and only here and at the nudge. A turn that finds ingestion still
+      // owed has nowhere to wait — a customer is holding the line, and the message it is missing
+      // reaches the thread for the next turn. Compaction consults the same answer and refuses to
+      // read on it, because there the same message is summarised out of existence.
+      await drainPendingIngest(tenantId, graphThreadId, base);
       const checkpointerForDivider =
         params.deps?.checkpointer ?? (await getCheckpointer());
       const dividerGraph = buildThreadStateGraph(checkpointerForDivider);
@@ -644,7 +655,10 @@ export async function runLoadedTurn(
             };
             const existing = await db.agentThread.findUnique({
               where: key,
-              select: { lastConversationId: true },
+              select: {
+                lastConversationId: true,
+                lastSyncedMessageId: true,
+              },
             });
             // Read BEFORE this turn adds its own claim: what matters is whether some OTHER invoke
             // is mid-flight on this thread (./attendance-boundary.ts, case 1).
@@ -687,7 +701,37 @@ export async function runLoadedTurn(
                 THREAD_STATE_NODE,
               );
             }
-            if (claim.advanceMarker) {
+            // THE TURN RECORDS THE INBOUND ID IT HANDLED (issue #194). Ingestion decides whether an
+            // out-of-order message may still speak for the thread's attendance by comparing it with
+            // the newest inbound id the thread has seen (./attendance-boundary.ts,
+            // movesAttendanceFrontier), and this writer used to leave no id at all — so the frontier
+            // was blind to the most ordinary way a new attendance opens, which is the customer
+            // writing and the bot ANSWERING. A delayed message from the previous conversation then
+            // compared newer than a stale mark, walked the marker back and armed compaction for the
+            // conversation being served.
+            //
+            // ON EVERY HANDLED TURN, and `lastConversationId` alone stays conditional. An earlier
+            // round cut this back to boundaries only, reasoning that the frontier merely suppresses a
+            // boundary claim — which was already false by then, because the same change had given it
+            // a second job: it also decides whether the message may carry an attendance STAMP. And
+            // `advanceMarker` is false in two different situations, not one. The second is a boundary
+            // DEFERRED because another invoke is reading (./attendance-boundary.ts, case 1): the
+            // conversation really is new, this turn really is handling its first message, and the
+            // marker deliberately stays behind. Recording nothing there leaves the frontier back in
+            // the previous attendance, so a delayed message from it reads as current, stamps itself
+            // at the end of the channel, and the compaction cut then treats the live conversation as
+            // the closed prefix.
+            //
+            // The scalar only. `recentSyncedMessageIds` is ingestion's own ledger of what IT folded
+            // in, and the two never overlap by construction — a message a turn answers is never
+            // ingested (../modules/chatwoot/webhook.ts) — so putting a turn's id in that set would
+            // describe an append that never happened.
+            const inboundId = params.messageId;
+            const markedId =
+              inboundId === undefined
+                ? null
+                : Math.max(existing?.lastSyncedMessageId ?? 0, inboundId);
+            if (claim.advanceMarker || markedId !== null) {
               await db.agentThread.upsert({
                 where: key,
                 create: {
@@ -696,8 +740,18 @@ export async function runLoadedTurn(
                   contactInboxId,
                   threadId: graphThreadId,
                   lastConversationId: conversationId,
+                  ...(markedId === null
+                    ? {}
+                    : { lastSyncedMessageId: markedId }),
                 },
-                update: { lastConversationId: conversationId },
+                update: {
+                  ...(claim.advanceMarker
+                    ? { lastConversationId: conversationId }
+                    : {}),
+                  ...(markedId === null
+                    ? {}
+                    : { lastSyncedMessageId: markedId }),
+                },
               });
             }
             return claim.closedConversationId;

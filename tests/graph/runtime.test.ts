@@ -14,7 +14,9 @@ import {
   isTurnInFlight,
   markTurnInFlight,
 } from "@/graph/inflight";
-import { isConversationDivider } from "@/graph/markers";
+import { ingestMessageIntoThread } from "@/graph/ingest";
+import { armIngest } from "@/graph/ingest-job";
+import { isConversationDivider, stampedConversationId } from "@/graph/markers";
 import type { ResolvedModelConfig } from "@/graph/models";
 import { runAgentTurn } from "@/graph/runtime";
 import type { TenantContext } from "@/lib/tenancy";
@@ -501,6 +503,310 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     });
     expect(cut.closed).toHaveLength(2);
     expect(cut.open).toHaveLength(3);
+  });
+
+  // Round-8 review finding (P1). Ingestion decides whether an out-of-order message may still speak
+  // for the thread's attendance by comparing it against the newest inbound id the thread has seen,
+  // and this writer recorded no id at all — so the frontier was blind to the most ordinary way a new
+  // attendance opens, which is the customer writing and the bot ANSWERING. A delayed message from the
+  // previous conversation then compared newer than a mark left behind in that same conversation,
+  // claimed a boundary, walked the marker back, and armed compaction for the LIVE one.
+  //
+  // Two writers in one test on purpose: the property only exists where they meet, and each of them
+  // alone is green with the bug in.
+  test("a turn's inbound id counts in the frontier a late ingestion is measured against", async () => {
+    const contactInboxId = 7011;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    for (const convId of [9310, 9311]) {
+      await suDb.conversation.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          chatwootConversationId: convId,
+          contactInboxId,
+          status: "pending",
+          threadId: `${tenantId}:${instanceId}:${convId}`,
+          lastEventAt: new Date(),
+        },
+      });
+    }
+    const saver = new MemorySaver();
+    const turn = (conversationId: number, messageId: number) =>
+      runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({
+          conversationId,
+          contactInboxId,
+          message: {
+            id: messageId,
+            content: "oi",
+            messageType: "incoming",
+            private: false,
+          },
+        }),
+        base: appDb,
+        deps: {
+          makeModel: fakeModel,
+          makeClient: makeStubClient([]),
+          checkpointer: saver,
+        },
+      });
+
+    // The first attendance, answered by the bot. Then the SECOND one opens the same way — the shape
+    // that leaves no ingestion mark behind at all.
+    expect(await turn(9310, 5001)).toBe("posted");
+    expect(await turn(9311, 5003)).toBe("posted");
+
+    // The voice note from the first conversation, still transcribing while the second one opened.
+    const closed: number[] = [];
+    expect(
+      await ingestMessageIntoThread({
+        tenantId,
+        instanceId,
+        conversationId: 9310,
+        contactInboxId,
+        graphThreadId,
+        base: appDb,
+        checkpointer: saver,
+        messageId: 5002,
+        text: "<audio> do primeiro",
+        role: "customer",
+        onAttendanceClosed: (prev) => {
+          closed.push(prev);
+        },
+      }),
+    ).toBe("ingested");
+
+    // Nothing armed for the live conversation, and the thread still says it is on it.
+    expect(closed).toEqual([]);
+    const at = await suDb.agentThread.findUniqueOrThrow({
+      where: {
+        tenantId_chatwootInstanceId_contactInboxId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId,
+        },
+      },
+      select: { lastConversationId: true, lastSyncedMessageId: true },
+    });
+    expect(at.lastConversationId).toBe(9311);
+    // The frontier the ingestion was measured against: written by the TURN, not by an ingestion.
+    expect(at.lastSyncedMessageId).toBe(5003);
+  });
+
+  // Round-10 review finding (P1), and the case an earlier round DISMISSED: `advanceMarker` is false
+  // in two different situations, and only one of them is harmless. Here the boundary is DEFERRED
+  // because another invoke is reading the thread (../../src/graph/attendance-boundary.ts, case 1) —
+  // the conversation really is new, this turn really is handling its first message, and the marker
+  // deliberately stays on the previous one. A turn that records no inbound id there leaves the
+  // frontier back in the previous attendance, so a delayed message from it reads as CURRENT, stamps
+  // itself at the end of the channel, and the cut then reads the live conversation as closed.
+  test("a turn whose boundary was deferred still moves the inbound frontier", async () => {
+    const contactInboxId = 7013;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    for (const convId of [9320, 9321]) {
+      await suDb.conversation.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          chatwootConversationId: convId,
+          contactInboxId,
+          status: "pending",
+          threadId: `${tenantId}:${instanceId}:${convId}`,
+          lastEventAt: new Date(),
+        },
+      });
+    }
+    const saver = new MemorySaver();
+    const turn = (conversationId: number, messageId: number) =>
+      runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({
+          conversationId,
+          contactInboxId,
+          message: {
+            id: messageId,
+            content: "oi",
+            messageType: "incoming",
+            private: false,
+          },
+        }),
+        base: appDb,
+        deps: {
+          makeModel: fakeModel,
+          makeClient: makeStubClient([]),
+          checkpointer: saver,
+        },
+      });
+
+    expect(await turn(9320, 6001)).toBe("posted");
+    // The new conversation's first turn, with ANOTHER invoke already reading the thread: the
+    // boundary is deferred and the marker stays on the old conversation.
+    markTurnInFlight(graphThreadId);
+    try {
+      expect(await turn(9321, 6003)).toBe("posted");
+    } finally {
+      clearTurnInFlight(graphThreadId);
+    }
+    const deferred = await suDb.agentThread.findUniqueOrThrow({
+      where: {
+        tenantId_chatwootInstanceId_contactInboxId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId,
+        },
+      },
+      select: { lastConversationId: true, lastSyncedMessageId: true },
+    });
+    // The marker did stay behind — that is the deferral working — and the frontier did NOT.
+    expect(deferred.lastConversationId).toBe(9320);
+    expect(deferred.lastSyncedMessageId).toBe(6003);
+
+    // So the delayed message from the old conversation is late, and claims nothing: no stamp, which
+    // is what keeps the live conversation out of the closed prefix.
+    expect(
+      await ingestMessageIntoThread({
+        tenantId,
+        instanceId,
+        conversationId: 9320,
+        contactInboxId,
+        graphThreadId,
+        base: appDb,
+        checkpointer: saver,
+        messageId: 6002,
+        text: "<audio> do primeiro",
+        role: "customer",
+      }),
+    ).toBe("ingested");
+    const cp = await saver.get({ configurable: { thread_id: graphThreadId } });
+    const messages = ((cp?.channel_values as { messages?: BaseMessage[] })
+      ?.messages ?? []) as BaseMessage[];
+    const last = messages[messages.length - 1];
+    expect(String(last?.content)).toContain("<audio> do primeiro");
+    expect(last && stampedConversationId(last)).toBe(null);
+  });
+
+  // THE BARRIER (issue #194), at the reader a customer is waiting on. Continuous ingestion is a
+  // queued job now, so a message the agent stayed silent on can still be a ROW when a turn starts,
+  // and a turn that answers without it answers without the context the feature exists to provide.
+  // Every reader of the memory thread drains it before reading; this pins the wiring at this one,
+  // which is not covered by the drain's own tests — those call it directly, and every one of them
+  // passes with this call site deleted.
+  //
+  // Asserted at MODEL time, not afterwards: "the message reached the thread eventually" is also true
+  // when the turn read the thread before it landed, which is the failure.
+  //
+  // The row is pushed into the future, which is what a deferral leaves behind and what a due-only
+  // claim would skip. It is also what makes this the barrier's test and not the tick's: no other
+  // path in this process would take this row.
+  test("a turn folds in a message still queued for it, before calling the model", async () => {
+    const contactInboxId = 7009;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: 9309,
+        contactInboxId,
+        status: "pending",
+        threadId: `${tenantId}:${instanceId}:9309`,
+        lastEventAt: new Date(),
+      },
+    });
+    const agent = await suDb.agent.findFirstOrThrow({
+      where: { tenantId },
+      select: { id: true },
+    });
+    const QUEUED = "jabuticaba-com-canela-8812";
+    await armIngest({
+      tenantId,
+      instanceId,
+      conversationId: 9309,
+      contactInboxId,
+      graphThreadId,
+      messageId: 4001,
+      text: QUEUED,
+      role: "customer",
+      agentId: agent.id,
+      compactionEnabled: false,
+      base: appDb,
+    });
+    await suDb.$executeRawUnsafe(
+      `UPDATE scheduler_jobs SET run_at = now() + interval '1 hour'
+        WHERE tenant_id = ${tenantId} AND kind = 'INGEST_MESSAGE'`,
+    );
+
+    // Sampled from INSIDE the model call, because that is the only place the answer distinguishes
+    // the two outcomes: "the message reached the thread eventually" is also true when the turn read
+    // the thread before it landed, which IS the failure.
+    let owedAtModelTime = -1;
+    let ingestedAtModelTime: number[] = [];
+    const model = {
+      invoke: async () => {
+        owedAtModelTime = await suDb.schedulerJob.count({
+          where: { tenantId, kind: "INGEST_MESSAGE" },
+        });
+        ingestedAtModelTime =
+          (
+            await suDb.agentThread.findUnique({
+              where: {
+                tenantId_chatwootInstanceId_contactInboxId: {
+                  tenantId,
+                  chatwootInstanceId: instanceId,
+                  contactInboxId,
+                },
+              },
+              select: { recentSyncedMessageIds: true },
+            })
+          )?.recentSyncedMessageIds ?? [];
+        return new AIMessage("Claro!");
+      },
+      bindTools: () => model,
+    };
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({
+        conversationId: 9309,
+        contactInboxId,
+        message: {
+          id: 4002,
+          content: "e aí, conseguiu ver?",
+          messageType: "incoming",
+          private: false,
+        },
+      }),
+      base: appDb,
+      deps: {
+        makeModel: () => model as never,
+        makeClient: makeStubClient([]),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(outcome).toBe("posted");
+    // Owed nothing and recorded as folded in, both BEFORE the model ran. What the drain actually
+    // writes into the channel is pinned in tests/graph/ingest-job.test.ts; the checkpointer cannot be
+    // asserted from here, because the drain runs the handler against the process checkpointer rather
+    // than the saver this turn was handed.
+    expect(owedAtModelTime).toBe(0);
+    expect(ingestedAtModelTime).toEqual([4001]);
   });
 
   // The producer half of the memory-compaction guard. The consumer half (a compaction that finds the
