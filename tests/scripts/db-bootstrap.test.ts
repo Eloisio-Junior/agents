@@ -1294,8 +1294,20 @@ describe.skipIf(!dbUp)(
       // NOTE: and a membership that does NOT inherit is accepted, which fixes the choice rather
       // than leaving it to look like an oversight. The question asked is `pg_has_role(..., 'USAGE')`
       // — the boot guard's own — so bootstrap refuses exactly what the server refuses and no more.
-      // A stricter 'MEMBER' would reject an install the server starts on. The remaining reach, an
-      // explicit `SET ROLE` into a privileged role, is open in the guard too and belongs there.
+      // A stricter 'MEMBER' would reject an install the server starts on: measured, it is true of
+      // every membership, including the two that cannot escalate.
+      //
+      // NOTE: what neither question actually measures, for whoever revisits this or the guard.
+      // SUPERUSER and BYPASSRLS are role ATTRIBUTES, and attributes are not inherited through a
+      // membership — only object privileges are. Measured against a table under RLS: a role
+      // inheriting a BYPASSRLS role still sees one row, and sees two only after `SET ROLE` to it.
+      // So escalation needs `set_option`, not inheritance, and both checks are aimed slightly off:
+      // on PostgreSQL's defaults (an INHERIT role, a plain GRANT) the two coincide and the answer
+      // is right, which is why this holds. They diverge on a NOINHERIT runtime role, where a plain
+      // GRANT lands `inherit_option false, set_option true` and escalates unseen. Deliberately not
+      // changed here: `set_option` is 16-only, the real predicate is transitive, and tightening it
+      // would refuse installs that boot today — that is its own change, in `src/lib/db-guard.ts`,
+      // not a line to sneak into this one.
       await db.query(`REVOKE ${TEAM_ROLE} FROM ${HEIR_ROLE}`);
       await db.query(`REVOKE ${SIDE_ROLE} FROM ${HEIR_ROLE}`);
       await db.query(
