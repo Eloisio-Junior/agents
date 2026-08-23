@@ -1,7 +1,8 @@
 import config from "@/config";
 import { sanitizePromptValue } from "@/graph/prompt";
 import { assertSafeOutboundUrl, SsrfError } from "@/lib/ssrf";
-import { clipText } from "@/modules/agents/text-caps";
+import { clipText, OVERFLOW_PROBE_MARGIN } from "@/lib/text";
+
 import type { InjectableCredential } from "@/modules/vault/injectable";
 import { resolveSecretInjection } from "@/modules/vault/secret-types";
 import type { ContactAuthConfig } from "./settings";
@@ -138,8 +139,12 @@ function contextValue(v: unknown): string | null {
   // the cap counts UTF-16 units and an emoji is two of them: a plain cut through one leaves a lone
   // surrogate, which is not a character at all and is replaced or refused on the way to a provider.
   // The other branch needs no such care: it returns a string that was never cut (anything the
-  // sanitizer DID cut is longer than the cap and lands here).
-  const clean = sanitizePromptValue(v, AUTH_CONTEXT_VALUE_MAX + 1);
+  // sanitizer DID cut is longer than the cap and lands here) — which holds only because the probe
+  // asks for OVERFLOW_PROBE_MARGIN units above the cap, not one. See src/lib/text.ts.
+  const clean = sanitizePromptValue(
+    v,
+    AUTH_CONTEXT_VALUE_MAX + OVERFLOW_PROBE_MARGIN,
+  );
   if (!clean) return null;
   return clean.length > AUTH_CONTEXT_VALUE_MAX
     ? `${clipText(clean, AUTH_CONTEXT_VALUE_MAX - 1)}…`
@@ -252,7 +257,7 @@ export function buildAuthorizationRequest(
   };
   const text =
     cfg.includeMessageText && identity.messageText?.trim()
-      ? identity.messageText.trim().slice(0, MESSAGE_TEXT_MAX)
+      ? clipText(identity.messageText.trim(), MESSAGE_TEXT_MAX)
       : null;
   // NOTE: The nesting IS the contract: `contact` is what Chatwoot mirrored (trusted context),
   // `message` is what the customer typed. An endpoint must never read identity out of `message`.
