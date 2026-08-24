@@ -46,6 +46,9 @@ const LONE_SURROGATE_RE =
   /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
 // Most strings hold no surrogate at all, and this runs on every string of every execution-log detail.
 const ANY_SURROGATE_RE = /[\ud800-\udfff]/;
+// The other character a `text` or `jsonb` column refuses. Spelled as a code unit: a literal NUL in
+// a source file is invisible in every diff and every review.
+const NUL = "\u0000";
 
 // Every unpaired surrogate replaced with U+FFFD. Cutting is only ONE of the two ways a value gets
 // one: any JSON source that spells it out (`"\ud800"`) hands `JSON.parse` an orphan directly, which
@@ -54,6 +57,64 @@ export function replaceLoneSurrogates(value: string): string {
   return ANY_SURROGATE_RE.test(value)
     ? value.replace(LONE_SURROGATE_RE, "�")
     : value;
+}
+
+// The REPAIR half of the rule `unstorableProblem` REPORTS: same two characters, opposite policy.
+// Refusing is right where the author reads the refusal and can go fix the value (an operator's
+// form). Repairing is right where the writer is a third party's webhook, which never reads a
+// refusal and whose only recourse is to retry the identical bytes until its budget runs out. There
+// a refusal costs the event, and the repair keeps it.
+//
+// The two are not repaired the same way, because they do not mean the same thing. An unpaired
+// surrogate WAS half of a real character, so U+FFFD stands where that character was. A NUL never
+// stood for anything a reader would see, and is simply dropped.
+//
+// The ORDER carries a rule of its own: surrogates are repaired while the NULs are still in place.
+// Dropping the NUL out of `\ud800 \udc00` first would leave the two orphan halves adjacent, and
+// they would then read as the well-formed pair U+10000 and survive untouched, inventing a character
+// nobody wrote out of three defects. Repairing first keeps each defect represented by its own
+// U+FFFD.
+export function makeStorable(value: string): string {
+  const repaired = replaceLoneSurrogates(value);
+  return repaired.includes(NUL) ? repaired.replaceAll(NUL, "") : repaired;
+}
+
+// A deeper document than any allowlisted projection has, which is the only shape this is called on.
+const MAX_STORABLE_DEPTH = 8;
+
+// `makeStorable` over a whole JSON document, KEYS included: one orphan half anywhere in it is enough
+// for Postgres to refuse the entire `jsonb` write, so the unit that has to come back storable is the
+// document, not the field. Reaching every string structurally is also what keeps a field added to
+// the shape later from arriving unrepaired.
+//
+// Values that are not part of a JSON document (a `Date`, a class instance) are returned as they are:
+// they carry no string for the write to choke on, and rebuilding them from their entries would
+// destroy them. Below the depth cap the branch is DROPPED rather than passed through: something
+// nested that deep is not the bounded projection this is for, and losing one branch of it beats
+// losing the whole event to a refused INSERT.
+export function makeStorableDeep<T>(value: T, depth = 0): T {
+  if (typeof value === "string") return makeStorable(value) as T;
+  if (value === null || typeof value !== "object") return value;
+  if (depth >= MAX_STORABLE_DEPTH) return null as T;
+  if (Array.isArray(value)) {
+    return value.map((v) => makeStorableDeep(v, depth + 1)) as T;
+  }
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== null && proto !== Object.prototype) return value;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value)) {
+    // `defineProperty`, not assignment: `JSON.parse` gives `__proto__` as an ORDINARY own property
+    // (a key a third party's body can carry, and one a malformed key can repair INTO), while
+    // assignment on that same key invokes the legacy prototype setter instead. The field would
+    // vanish from what gets persisted and the copy would come back with a different prototype.
+    Object.defineProperty(out, makeStorable(k), {
+      value: makeStorableDeep(v, depth + 1),
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+  }
+  return out as T;
 }
 
 // What PostgreSQL refuses to STORE, which is a different question from what anything can draw.
@@ -72,18 +133,22 @@ export function replaceLoneSurrogates(value: string): string {
 // be perfectly storable and impossible to print (an emoji in a tool description a model reads and
 // nobody draws). A caller that only needs the value to survive its column asks this one.
 export function unstorableProblem(value: string, what: string): string | null {
-  const bad: string[] = [];
+  // A Set, not a scan of a growing array: the distinct offenders number 2049 (a NUL and every
+  // surrogate code unit), so `includes` on the accumulator turns a long malformed value into
+  // quadratic work on a caller's behalf. Insertion order is preserved either way, and the message
+  // names them in the order they appear.
+  const bad = new Set<string>();
   for (const ch of value) {
     const code = ch.codePointAt(0) ?? 0;
     // `for...of` yields a well-formed pair as ONE two-unit string, so a single-unit string in the
     // surrogate range never had its other half.
     const lone = ch.length === 1 && code >= 0xd800 && code <= 0xdfff;
-    if ((code === 0 || lone) && !bad.includes(ch)) bad.push(ch);
+    if (code === 0 || lone) bad.add(ch);
   }
-  if (bad.length === 0) return null;
+  if (bad.size === 0) return null;
   // Named by code point, never pasted: quoting the character itself would put a NUL into a log line
   // and an API response, and half a character into a JSON body.
-  const named = bad.map(
+  const named = [...bad].map(
     (ch) =>
       `U+${(ch.codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, "0")}`,
   );
