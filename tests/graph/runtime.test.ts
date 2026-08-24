@@ -1073,14 +1073,45 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
   // left `pending` with nobody assigned is Chatwoot auto-escalating (most often because our webhook
   // ack was slow), which throws away a reply that was already written. Reporting both as
   // `taken_over` is what sent an incident investigation to the wrong half of the system (#225).
+  // NOTE: scoped to the conversation asked for, via its DB id — `execution_logs.conversation_id`
+  // holds the INTERNAL id (`loaded.conversationDbId`), never the Chatwoot one the tests name. It
+  // read the tenant's newest handoff row unscoped before, so a turn whose row had not landed yet
+  // silently returned the PREVIOUS test's row: 8801 writes `taken_over`, 8802 asserts
+  // `ownership_lost`, and whichever write won the race decided the result. That is the ~1-in-4 CI
+  // failure this file kept producing, on a machine slower than a dev laptop.
   async function handoffDetail(convId: number): Promise<unknown> {
+    const conversation = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: convId },
+    });
     const row = await suDb.executionLog.findFirstOrThrow({
-      where: { tenantId, stage: "handoff" },
+      where: { tenantId, stage: "handoff", conversationId: conversation.id },
       orderBy: { id: "desc" },
     });
-    void convId;
     return row.detail;
   }
+
+  // NOTE: the guard for the reader above, not for the product. Before it was scoped, this returned
+  // the newest handoff row of ANY conversation in the tenant, so the two tests below could pass by
+  // reading each other's row. A conversation that never ran a turn has no handoff row at all, so a
+  // scoped reader has nothing to return; an unscoped one hands back a neighbour's and looks fine.
+  test("handoffDetail refuses to answer with another conversation's row", async () => {
+    await seedConversation(8803, "User", 5);
+    await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 8803 }),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: makeStubClient([]),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    // 8804 exists but never ran a turn, so the tenant's newest handoff row belongs to 8803.
+    await seedConversation(8804, null, null, "open");
+    expect(handoffDetail(8804)).rejects.toThrow();
+  });
 
   test("a human assignee is reported as a real takeover", async () => {
     await seedConversation(8801, "User", 5);
