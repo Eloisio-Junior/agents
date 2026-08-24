@@ -39,6 +39,7 @@ import {
   armRedirectChatFollowUp,
   deliverRedirectClosing,
   followUpDedupeKey,
+  isRedirectFollowUpLive,
   retireRedirectFollowUp,
 } from "@/modules/channel-redirect/followup";
 import { runRedirectGate } from "@/modules/channel-redirect/gate";
@@ -469,6 +470,29 @@ export function hasPendingInboundMediaUpdate(
   return Boolean(
     audio && !audio.transcribedText && !n.message?.transcribedText,
   );
+}
+
+// The widget conversation's /teste stamp, for the resolve-triggered closing gate. Its own read
+// rather than the boolean above, because the liveness predicate takes the stamp itself.
+async function widgetTestActivatedAt(
+  tenantId: bigint,
+  instanceId: bigint,
+  conversationId: number,
+  base: PrismaClient,
+): Promise<Date | null> {
+  const row = await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.conversation.findUnique({
+      where: {
+        tenantId_chatwootInstanceId_chatwootConversationId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          chatwootConversationId: conversationId,
+        },
+      },
+      select: { testActivatedAt: true },
+    }),
+  );
+  return row?.testActivatedAt ?? null;
 }
 
 async function isTestConversationActivated(params: {
@@ -2531,7 +2555,34 @@ export async function processChatwootDelivery(
           );
           // (2) Closing message on the WhatsApp sibling (at most once, CAS-guarded). Chatwoot is
           //     already resolving the widget conversation, so resolveWidget:false.
-          if (redirectCfg.closingEnabled && redirectCfg.entryInboxId !== null) {
+          //
+          //     Gated on the agent being live, the same question the ladder's own closing stage asks
+          //     (issue #219). This is the OTHER way that goodbye reaches the customer — a resolve on
+          //     the widget conversation, from anyone — and it sends fixed text with no nudge behind
+          //     it, so nothing else on this path would ask. The cancel above stays ungated: standing
+          //     the chase down is not a send, and a switched-off agent wants it stopped either way.
+          const closingLive =
+            redirectCfg.closingEnabled &&
+            redirectCfg.entryInboxId !== null &&
+            isRedirectFollowUpLive({
+              agentEnabled: closingRt.enabled,
+              agentMode: closingRt.mode,
+              // Only a test agent's liveness depends on the stamp, and this read is paid on a path
+              // whose failure is permanent: the surrounding best-effort catch sits AFTER the ladder
+              // was cancelled, the delivery is marked PROCESSED, and a conversation resolves once —
+              // so a transient error here would lose the closing for good. A production agent has
+              // nothing to look up.
+              testActivatedAt:
+                closingRt.mode === "test"
+                  ? await widgetTestActivatedAt(
+                      params.tenantId,
+                      params.instanceId,
+                      conversationId,
+                      base,
+                    )
+                  : null,
+            });
+          if (closingLive && redirectCfg.entryInboxId !== null) {
             const outcome = await deliverRedirectClosing({
               tenantId: params.tenantId,
               instanceId: params.instanceId,
