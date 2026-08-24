@@ -69,6 +69,22 @@ function stub() {
   return { client, messages, notes, makeClient: async () => client };
 }
 
+// Same shape as stub(), plus the two calls applyPostActions makes — without them the label write
+// would land in its own try/catch and read as "nothing was written".
+function labelStub() {
+  const labelWrites: Array<[number, string[]]> = [];
+  const base = stub();
+  const client = {
+    ...(base.client as unknown as Record<string, unknown>),
+    getConversationLabels: async () => [] as string[],
+    setConversationLabels: async (c: number, l: string[]) => {
+      labelWrites.push([c, l]);
+      return {};
+    },
+  } as unknown as ChatwootClient;
+  return { client, labelWrites, makeClient: async () => client };
+}
+
 function authFetch(response: () => Response) {
   const calls: string[] = [];
   const fetchImpl = (async (input: RequestInfo | URL) => {
@@ -78,7 +94,7 @@ function authFetch(response: () => Response) {
   return { calls, fetchImpl };
 }
 
-async function seedConv(convId: number) {
+async function seedConv(convId: number, contactInboxId: number | null = null) {
   await suDb.conversation.create({
     data: {
       tenantId,
@@ -86,6 +102,7 @@ async function seedConv(convId: number) {
       inboxId: inboxDbId,
       chatwootConversationId: convId,
       contactId,
+      contactInboxId,
       status: "pending",
       threadId: `${tenantId}:${instanceId}:${convId}`,
       lastEventAt: new Date(),
@@ -222,6 +239,167 @@ describe.skipIf(!dbUp)("contact authorization on the proactive nudge", () => {
     expect(auth.calls).toHaveLength(1);
     expect(s.messages).toEqual([]);
     expect(s.notes).toEqual([]);
+  });
+
+  // The ALLOWED path, and the window this gate opened for every run that passes it. The
+  // authorization request is a round-trip to somebody else's endpoint with a ten-second ceiling, and
+  // it sits between the run's entry check and the moment the thread is claimed — so a /reset landing
+  // inside it used to be followed by this run writing the attendance marker, the divider and the
+  // turn itself back onto a thread the command had just cleared. Nothing reaches the customer (the
+  // post-generation check stops that), which is exactly what made it invisible: the operator is told
+  // the conversation was cleared and the agent goes on answering from the memory it recreated.
+  //
+  // The ask that stops it is inside the `ingest:` lock, the one position where the answer cannot
+  // decay before the write, because the command's own clear needs the same lock.
+  test("a /reset during the authorization call leaves the thread untouched", async () => {
+    const CIB = 7791;
+    await seedConv(9413, CIB);
+    const s = labelStub();
+    let wanted = true;
+    const auth = authFetch(() => {
+      // Retired while the endpoint was being asked — and ALLOWED, so nothing else stops the run.
+      wanted = false;
+      return new Response('{"authorized":true}', { status: 200 });
+    });
+    // Recorded per ask: the one made inside the thread claim runs in an advisory-lock transaction,
+    // so it must arrive WITH a connection to read on. A provider that opens its own there asks a
+    // pinned pool for a second one, which on `DB_POOL_MAX=1` fails — and jobRetired swallows a
+    // failed read as "not retired", so the fence would go quiet exactly where it matters.
+    const gotDb: boolean[] = [];
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:9413`,
+      nudge: { source: "followup", kind: "inactivity" },
+      postActions: { assignLabels: ["seguimento"] },
+      stillWanted: async (scoped) => {
+        gotDb.push(scoped !== undefined);
+        return wanted;
+      },
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+        contactAuthFetch: auth.fetchImpl,
+      },
+    });
+
+    expect(outcome).toBe("stale");
+    expect(auth.calls).toHaveLength(1);
+    // The entry ask has no transaction to share; the last one is the claim's, and it does.
+    expect(gotDb[0]).toBe(false);
+    expect(gotDb.at(-1)).toBe(true);
+    // The durable half: had the run gone on, this row would name the conversation the reset cleared.
+    const row = await suDb.agentThread.findUnique({
+      where: {
+        tenantId_chatwootInstanceId_contactInboxId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId: CIB,
+        },
+      },
+    });
+    expect(row).toBeNull();
+    expect(s.labelWrites).toEqual([]);
+  });
+
+  // The control: the same allowed turn, nothing retired, and the marker IS written.
+  test("the same allowed turn does claim the thread when nothing retires it", async () => {
+    const CIB = 7792;
+    await seedConv(9414, CIB);
+    const s = labelStub();
+    const auth = authFetch(
+      () => new Response('{"authorized":true}', { status: 200 }),
+    );
+    await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:9414`,
+      nudge: { source: "followup", kind: "inactivity" },
+      base: appDb,
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Tudo certo?"] }),
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+        contactAuthFetch: auth.fetchImpl,
+      },
+    });
+
+    const row = await suDb.agentThread.findUnique({
+      where: {
+        tenantId_chatwootInstanceId_contactInboxId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId: CIB,
+        },
+      },
+    });
+    expect(row?.lastConversationId).toBe(9414);
+  });
+
+  // The gate's refusal is a WRITING end: it skips the model but still applies the operator's
+  // deterministic post-actions. And it reaches them after a round-trip to somebody else's endpoint
+  // with a ten-second ceiling, which is exactly the window a /reset lands in. The rendezvous is the
+  // authorization call itself, because that is the position the wait occupies in production.
+  test("a /reset during the authorization call stops the refusal's post-actions", async () => {
+    await seedConv(9411);
+    const s = labelStub();
+    let wanted = true;
+    const auth = authFetch(() => {
+      // Retired while the endpoint was being asked.
+      wanted = false;
+      return new Response('{"authorized":false}', { status: 200 });
+    });
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:9411`,
+      nudge: { source: "followup", kind: "inactivity" },
+      postActions: { assignLabels: ["seguimento"] },
+      stillWanted: async () => wanted,
+      base: appDb,
+      deps: {
+        makeModel: () => {
+          throw new Error("the model must not be invoked for a refused nudge");
+        },
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+        contactAuthFetch: auth.fetchImpl,
+      },
+    });
+    // "stale", not "silent": the follow-up handler must not stamp the watermark or advance the
+    // ladder for a step the reset called off.
+    expect(outcome).toBe("stale");
+    expect(auth.calls).toHaveLength(1);
+    expect(s.labelWrites).toEqual([]);
+  });
+
+  // The control, without which the assertion above only proves the refusal writes nothing ever.
+  test("the same refusal DOES apply the post-actions when nothing retired it", async () => {
+    await seedConv(9412);
+    const s = labelStub();
+    const auth = authFetch(
+      () => new Response('{"authorized":false}', { status: 200 }),
+    );
+    const outcome = await runAgentNudge({
+      tenantId,
+      threadId: `${tenantId}:${instanceId}:9412`,
+      nudge: { source: "followup", kind: "inactivity" },
+      postActions: { assignLabels: ["seguimento"] },
+      base: appDb,
+      deps: {
+        makeModel: () => {
+          throw new Error("the model must not be invoked for a refused nudge");
+        },
+        makeClient: s.makeClient,
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+        contactAuthFetch: auth.fetchImpl,
+      },
+    });
+    expect(outcome).toBe("silent");
+    expect(s.labelWrites).toEqual([[9412, ["seguimento"]]]);
   });
 
   test("an endpoint failure also silences the nudge (fail-closed)", async () => {

@@ -1,4 +1,4 @@
-import type { PrismaClient } from "@/../generated/prisma/client";
+import { Prisma, type PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { isTurnInFlight } from "@/graph/inflight";
@@ -14,7 +14,12 @@ import {
 } from "@/modules/business-hours/hours";
 import { readChannelRedirectConfig } from "@/modules/channel-redirect/service";
 import { isFollowUpLive } from "@/modules/followups/eligibility";
-import { type ClaimedJob, enqueueJob } from "@/modules/scheduler/service";
+import {
+  type ClaimedJob,
+  enqueueJob,
+  jobNotRetiredSql,
+  jobRetired,
+} from "@/modules/scheduler/service";
 import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
 import {
   type FollowUpStep,
@@ -364,6 +369,38 @@ export async function followUpHandler(
     }
   }
 
+  // The tombstone question, asked in this handler and not only inside runAgentNudge. Three writes
+  // below touch the CONVERSATION directly — the never-opening schedule, the retry exhaustion, and the
+  // watermark after the nudge — and `lastFollowUpAt` is exactly the column /reset clears. A stamp
+  // landing after the command puts the sweep's anchor back on a conversation the operator was told
+  // was cleared, and the third one also arms the next step, reviving the sequence the command ended.
+  //
+  // Read immediately before each write rather than once at the top: the command arrives whenever it
+  // arrives, and the interesting moment is precisely while the nudge's model call runs. Returns
+  // whether the stamp landed, so a caller that would continue the sequence can stop instead.
+  //
+  // ONE statement, not a read then a write. Everywhere else the two marks are read to decide whether
+  // to keep going, and the gap between deciding and acting is covered by there being no I/O in it.
+  // Here the gap cannot be closed that way, because the command does two things in ORDER: it retires
+  // the job first and clears `last_follow_up_at` later, so a stamp that reads between them finds the
+  // job live, and writes after the clear. The condition therefore has to be evaluated by the same
+  // statement that writes — then the stamp lands strictly before the retirement or not at all.
+  //
+  // The condition is `jobNotRetiredSql`, the scheduler's own predicate, and not a copy of it written
+  // here: the JS reader and this one are one rule, and they are kept side by side there so a change
+  // to either is a change in front of the other. NOT-retired rather than live, so an absent row
+  // still stamps — an unknown is not a retirement.
+  const stampUnlessRetired = async (): Promise<boolean> => {
+    const stamped = await runScopedOn(base, sysCtx(tenantId), (db) =>
+      db.$executeRaw(Prisma.sql`
+        UPDATE conversations
+           SET last_follow_up_at = now()
+         WHERE id = ${ctx.conv.id}
+           AND ${jobNotRetiredSql(job)}`),
+    );
+    return stamped > 0;
+  };
+
   // Business hours: reschedule into the next open window rather than messaging out of hours (same
   // payload — the step index is preserved).
   if (ctx.hours) {
@@ -384,12 +421,7 @@ export async function followUpHandler(
         stepIndex,
         threadId,
       );
-      await runScopedOn(base, sysCtx(tenantId), (db) =>
-        db.conversation.update({
-          where: { id: ctx.conv.id },
-          data: { lastFollowUpAt: new Date() },
-        }),
-      );
+      await stampUnlessRetired();
       return { outcome: "done" };
     }
   }
@@ -430,6 +462,12 @@ export async function followUpHandler(
     // be stale forever (a lost resolve webhook has no reconciliation), and following up a resolved
     // conversation was the community-reported incident this gate exists for.
     requireLiveBotOwnership: true,
+    // NOTE: And the live gate is not enough on its own, because it asks about OWNERSHIP and /reset can
+    // give ownership back. A follow-up already inside the model call has passed the first probe; the
+    // operator resets, which returns the conversation to the agent, and the second probe then finds
+    // it bot-owned again and posts a nudge from the episode that was just erased. The tombstone is
+    // the question the hand-back cannot answer yes to.
+    stillWanted: async (scoped) => !(await jobRetired(job, base, scoped)),
     base,
     deps,
   });
@@ -455,12 +493,7 @@ export async function followUpHandler(
         nudgeOutcome,
         threadId,
       );
-      await runScopedOn(base, sysCtx(tenantId), (db) =>
-        db.conversation.update({
-          where: { id: ctx.conv.id },
-          data: { lastFollowUpAt: new Date() },
-        }),
-      );
+      await stampUnlessRetired();
       return { outcome: "done" };
     }
     return {
@@ -471,13 +504,9 @@ export async function followUpHandler(
   }
 
   // Watermark: stamp regardless of whether the nudge sent or stayed silent, so the next step's
-  // cadence anchors here and the episode-interruption check works.
-  await runScopedOn(base, sysCtx(tenantId), (db) =>
-    db.conversation.update({
-      where: { id: ctx.conv.id },
-      data: { lastFollowUpAt: new Date() },
-    }),
-  );
+  // cadence anchors here and the episode-interruption check works. A retire that landed while the
+  // nudge ran ends the episode here instead — no stamp, and no next step.
+  if (!(await stampUnlessRetired())) return { outcome: "done" };
 
   // NOTE: The outside-window fallback note ENDS the sequence: with no usable template, every further step
   // would be equally undeliverable (only a customer reply reopens the 24h window, and that reply

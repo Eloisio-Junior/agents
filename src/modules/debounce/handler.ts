@@ -7,7 +7,7 @@ import {
   type RuntimeDeps,
   runLoadedTurn,
 } from "@/graph/runtime";
-import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { overlayMediaAnnotations } from "@/modules/chatwoot/annotations";
 import { loadChatwootClient } from "@/modules/chatwoot/instance";
 import {
@@ -32,7 +32,7 @@ import {
 import { announceFailedTurn } from "@/modules/conversations/failure-note";
 import { emitFlowEvent } from "@/modules/flowlog/service";
 import type { FlowStage } from "@/modules/flowlog/stages";
-import type { ClaimedJob } from "@/modules/scheduler/service";
+import { type ClaimedJob, jobRetired } from "@/modules/scheduler/service";
 import {
   type JobResult,
   registerDeadLetterHandler,
@@ -82,6 +82,10 @@ export interface CoalesceTurnContext {
   selectPending: (
     messages: ChatwootMessageRow[],
   ) => ChatwootMessageRow[] | Promise<ChatwootMessageRow[]>;
+  // Whether the run that queued this turn is still wanted, handed straight to `runLoadedTurn`,
+  // which asks it inside the `ingest:` lock and again before each post. REQUIRED and nullable so a
+  // future caller has to answer it: `null` says "nothing queued this, nothing can call it off".
+  stillWanted: ((db?: ScopedDb) => Promise<boolean>) | null;
   // Label for the single summary log line ("debounce flush" / "reengage").
   label: string;
   // When set (the debounce flush passes "debounce"), emit a flow line for the coalescing under the
@@ -212,6 +216,7 @@ export async function coalesceAndRunTurn(
     );
   }
   const outcome = await runLoadedTurn({
+    stillWanted: ctx.stillWanted,
     loaded,
     authContext: ctx.authContext,
     tenantId,
@@ -235,7 +240,15 @@ export async function coalesceAndRunTurn(
   // #8: the pre-handoff backlog was re-coalesced — and the bot re-transferred for the old reason —
   // after a human returned the conversation). "superseded" stays put by design: the re-armed flush
   // answers the FULL burst.
-  if (outcome !== "superseded") {
+  // "stale" stays put too, and NOT by the same reasoning: superseded means a newer message will
+  // re-answer this burst, while stale means the burst was withdrawn with the thread the command
+  // cleared. Advancing on it would declare handled a set of messages nothing ever answered, and the
+  // next inbound would arm a flush that starts after them.
+  // NOTE: Which this skip can only preserve where the CAS has not already run. A retirement that
+  // lands inside `shouldPost` is caught by the ask after it, and by then the claim has advanced —
+  // skipping here is a no-op for that one window. Accepted where it stands: the alternative is a
+  // reply posted into a conversation the customer just reset.
+  if (outcome !== "superseded" && outcome !== "stale") {
     await advanceHandledWatermark({
       tenantId,
       conversationDbId: convDbId,
@@ -480,6 +493,18 @@ export async function flushDebounceJob(
         convDbId: ctx.convDbId,
         loaded: ctx.loaded,
         settings: ctx.settings,
+        // The command's fence. Every cancel reaches PENDING rows only, so a flush already CLAIMED
+        // when /reset arrived is past all of them — and it is a queued TURN: coalescing the burst
+        // and invoking rewrites the very thread the command cleared, with the operator having been
+        // told the conversation was started over. The reply is the smaller half; the checkpoint is
+        // the one that outlives the command.
+        //
+        // Handed down rather than asked here, because here is not where the turn writes. Asked at
+        // the top it would answer about a moment before the message fetch, the burst selection and
+        // the model — all waits the command lands inside — and the run would still recreate the
+        // thread. `runLoadedTurn` asks it inside the `ingest:` lock, which is the boundary the
+        // divider and the claim are written at, and again before each post.
+        stillWanted: async (scoped) => !(await jobRetired(job, base, scoped)),
         authContext,
         // Re-read, not the value captured before the authorization call: that call is a round-trip
         // to somebody else's endpoint with a ceiling of ten seconds, and a message that arrived and
@@ -518,13 +543,24 @@ export async function flushDebounceJob(
     }
     return { outcome: "done" };
   } catch (e) {
-    await recordConversationError({
-      tenantId,
-      instanceId,
-      chatwootConversationId: conversationId,
-      error: e,
-      base,
-    });
+    // The same ask the clean paths make, on the branch that reaches this write without passing any of
+    // them: a throw from the invoke, the TTS call or a Chatwoot send unwinds past every `stillWanted`
+    // above and lands here. `lastError`/`lastErrorAt` are state /reset clears, so recording a retired
+    // run's failure puts back the failure banner the operator was just told had been cleared — and it
+    // is about a turn that will never be retried, because the claim token this run holds was bumped.
+    //
+    // Asked HERE and not carried down from the fence above: everything between them is I/O, which is
+    // exactly the stretch the answer decays over. Unreadable stays "not retired", the same direction
+    // `jobRetired` takes everywhere else — an unknown must not swallow a real failure silently.
+    if (!(await jobRetired(job, base))) {
+      await recordConversationError({
+        tenantId,
+        instanceId,
+        chatwootConversationId: conversationId,
+        error: e,
+        base,
+      });
+    }
     throw e;
   }
 }

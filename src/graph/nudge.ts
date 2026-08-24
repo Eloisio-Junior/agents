@@ -3,7 +3,7 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { withEntityLock } from "@/lib/locks";
-import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { clipText } from "@/lib/text";
 import { isTestSilenced } from "@/modules/agents/test-mode";
 import { loadChatwootClient } from "@/modules/chatwoot/instance";
@@ -132,6 +132,17 @@ export interface RunAgentNudgeParams {
   // this; event nudges (payment received etc.) keep the mirror-only gate — for those, a private
   // note on a human-owned or even resolved conversation is still useful signal.
   requireLiveBotOwnership?: boolean;
+  // NOTE: Opt-in "is this work still wanted?", asked at the SAME two points as the ownership probe:
+  // before any proactive work, and again after the guardrail's model call. A scheduler job that was
+  // retired while it sat CLAIMED is the caller: cancelling a job reaches PENDING rows only, so the
+  // handler runs on regardless and the only thing that can stop it is asking. Answering false aborts
+  // with "stale", which is what it is — the state the job was armed for is gone.
+  // Given the caller's own connection when the ask happens inside a transaction that already holds
+  // one — today that is the thread claim, under the `ingest:` advisory lock. A provider that opens a
+  // second connection there stalls on an exhausted pool while holding the lock, and `DB_POOL_MAX=1`
+  // is supported; the ingestion barrier takes the same argument for the same reason. Optional
+  // because the other six asks are outside any transaction and have nothing to hand over.
+  stillWanted?: (db?: ScopedDb) => Promise<boolean>;
   base?: PrismaClient;
   deps?: RuntimeDeps;
 }
@@ -456,6 +467,40 @@ export async function runAgentNudge(
     if (pre === "not-owned") return "stale";
   }
 
+  // Absent, the answer is yes: every caller that does not schedule work has nothing to retire.
+  const stillWanted = async (db?: ScopedDb): Promise<boolean> =>
+    params.stillWanted === undefined || (await params.stillWanted(db));
+
+  // THE RULE for the asks below, because a check placed by intuition is a check the next branch is
+  // born without: ONE ask per stretch of I/O that precedes a write, and never any I/O between an ask
+  // and the write it guards. The answer is a fact about another process, so it decays over exactly
+  // the time this function spends waiting — and only over that time.
+  //
+  // Which puts the asks in two groups. The DETERMINISTIC post-actions are reached by seven ends
+  // after seven different waits, so their ask lives inside `applyPostActions` (twice: once on entry,
+  // once before the resolve, because the labels in between are two more round trips). No call site
+  // asks on their behalf, and none can forget to — the contact-auth refusal is the end that proved
+  // that rule needs enforcing rather than repeating.
+  //
+  // What is left are the asks that guard something else, and they are enumerable:
+  //
+  //   1. the entry, covering everything the caller did before this (asked immediately below);
+  //   2. the thread claim, asked INSIDE the `ingest:` lock because that is what makes it sound, and
+  //      handed that transaction's own connection because opening a second one there stalls the lock;
+  //   3. the model invoke, asked once it returns, on the throw path as well as the clean one;
+  //   4. the post-model ownership probe, whose answer the sends below consume;
+  //   5. the moderation call inside deliverPromisedLine;
+  //   6. the guardrail judge's call.
+  //
+  // A new end that writes needs no check of its own — it needs to be placed after one of these, with
+  // no I/O in between, or to write through applyPostActions. A new WAIT does.
+
+  // NOTE: Asked HERE, alongside the live gate and for its reason: before any model spend. It buys more
+  // than the money, though — an invoked graph writes the proactive turn into the conversation's
+  // thread, so a retired job asked only at the send boundary would still leave memory of a message
+  // nobody received.
+  if (!(await stillWanted())) return "stale";
+
   // Pre-invoke gate: may we message the customer (bot owns it), or only note (human owns it)?
   // When the live gate ran, it already proved bot ownership with FRESH data (and reconciled the
   // mirror), so the mirror-based check is subsumed.
@@ -525,13 +570,29 @@ export async function runAgentNudge(
   }: {
     canMessage: boolean;
     allowResolve?: boolean;
-  }): Promise<void> => {
+  }): Promise<"applied" | "stale"> => {
     const actions = params.postActions;
-    if (!actions || !canMessage) return;
+    if (!actions || !canMessage) return "applied";
+    // The ask lives HERE and not at the seven call sites, which is the difference between a rule
+    // and a habit: every one of those sites reaches this after a wait of its own (the model, the
+    // ownership probe, the authorization request, a send), and a rule that has to be re-applied by
+    // hand at each is one the next end is born without — which is exactly how the contact-auth
+    // refusal arrived. Asked once here, no caller can forget it and none needs to remember.
+    //
+    // Reported back, because ONE end has nothing else to say: the contact-authorization refusal
+    // writes only these actions, so "silent" there would tell the operator the agent chose not to
+    // speak when what happened is that the command called the run off. Every other end's outcome is
+    // decided by what reached the customer and ignores this.
+    if (!(await stillWanted())) return "stale";
     const labels = actions.assignLabels?.filter((l) => l.trim());
     if (labels && labels.length > 0) {
       try {
         const current = await client.getConversationLabels(conversationId);
+        // The GET is a Chatwoot round trip, so the answer above is about a moment before it. Same
+        // rule as the resolve below, and the labels need it for the same reason: /reset peels the
+        // episode's labels off on purpose, and a SET carrying the merged list puts them back on a
+        // conversation the operator was told had been cleared.
+        if (!(await stillWanted())) return "stale";
         const merged = [...new Set([...current, ...labels])];
         await client.setConversationLabels(conversationId, merged);
       } catch (err) {
@@ -541,7 +602,11 @@ export async function runAgentNudge(
         );
       }
     }
-    if (allowResolve && actions.resolve) {
+    // And again, because the labels above are two Chatwoot round trips and the resolve is the
+    // heaviest thing this function does: closing a conversation the operator has just cleared and
+    // handed back to the agent is not a label to peel off, it is the attendance ended. Same rule as
+    // the ask at the top, applied to the wait between them.
+    if (allowResolve && actions.resolve && (await stillWanted())) {
       try {
         await client.toggleStatus(conversationId, "resolved");
         // NOTE: A follow-up ladder only advances while the customer stays silent (an inbound ends the
@@ -568,6 +633,7 @@ export async function runAgentNudge(
         );
       }
     }
+    return "applied";
   };
   // The contact authorization gate applies to proactive sends too (docs/contact-auth.md): a
   // follow-up is a turn the agent starts, and a contact the reactive gate would refuse must not be
@@ -615,12 +681,16 @@ export async function runAgentNudge(
       // kind of slow work the normal path re-probes after. Stamping labels on a conversation a
       // human took during those seconds is writing on their conversation. A probe that cannot
       // answer means we do not know, and we do not touch it.
+      //
+      // The retirement question this end also has to answer is asked by applyPostActions itself,
+      // below the probe rather than above it: an ask placed here would be separated from the write
+      // by that round trip, which is the whole failure this branch was added to prevent.
       const stillOurs = await botStillOwnsIt().catch(() => "unavailable");
-      await applyPostActions({
+      const applied = await applyPostActions({
         canMessage: stillOurs === "ours",
         allowResolve: false,
       });
-      return "silent";
+      return applied === "stale" ? "stale" : "silent";
     }
     // Allowed, and the ownership probe above happened BEFORE a round-trip that may have taken ten
     // seconds. The same reason the refusal re-asks: a human who took the conversation during the
@@ -785,7 +855,7 @@ export async function runAgentNudge(
   // unreachable after it. Anything that adds a third owns the at-most-once question, because a
   // promise delivered twice is the duplicate #158 was about.
   const deliverPromisedLine = async (): Promise<
-    "messaged" | "noted-window" | "silent" | null
+    "messaged" | "noted-window" | "silent" | "stale" | null
   > => {
     if (!handoffAnsweredTheTurn(handoffState)) return null;
     const line = handoffState.customerMessage;
@@ -805,14 +875,17 @@ export async function runAgentNudge(
       return "noted-window" as const;
     };
     try {
-      // The same question at two instants, and only the second one governs the send. Asked before
-      // the screening so a line that cannot go out anyway costs no model call, and asked again
-      // after it because that call is precisely where the window closes: 15 seconds is nothing
-      // against 24 hours except at the boundary, and the boundary is exactly where a follow-up
-      // chasing a customer who has gone quiet tends to land.
+      // NOTE: Asked ONCE here, after the screening and not before it. The handoff path skips the
+      // ownership probe entirely (`handedOff` short-circuits it), so between the check above this
+      // function and the top of it nothing happens that could change the answer — an earlier ask was
+      // a second reading of one instant, and a mutation removing it broke no test because it decided
+      // nothing. The screening below is a model call, which is a stretch of time worth re-reading.
       if (sendModeNow() !== "freeform") return await noteOutsideWindow();
       const line2 = screenedText(await screenOutput(line), line);
       if (line2 === null) return "silent";
+      // NOTE: Asked again for the same reason the window below is: the screening is a model call, and
+      // both answers above it are spent by the time it returns. The reply branch does exactly this.
+      if (!(await stillWanted())) return "stale";
       if (sendModeNow() !== "freeform") return await noteOutsideWindow();
       await client.sendMessage(conversationId, line2);
       logger.info(
@@ -862,6 +935,16 @@ export async function runAgentNudge(
     // would read it as busy and reschedule until the process restarts.
     const claim = await runScopedOn(base, sysCtx(tenantId), (db) =>
       withEntityLock(db, `ingest:${graphThreadId}`, async () => {
+        // The one ask that has to happen HERE and cannot be hoisted out: everything below writes the
+        // thread (the divider, the marker, and then the invoke), and /reset clears exactly those
+        // under this same lock. Outside it the answer decays — the authorization call and the drain
+        // above both take time, and a reset that lands in either window clears the memory and then
+        // has this run write it back, leaving the operator told the conversation was cleared and the
+        // agent still answering from it. Inside the lock there is no such window in either
+        // direction: either this claims the thread first (and the clear refuses on isTurnInFlight)
+        // or the clear ran first (and this sees the tombstone). Asked BEFORE markTurnInFlight, so a
+        // retired run takes no claim it would then have to release.
+        if (!(await stillWanted(db))) return null;
         // A thread keyed by CONVERSATION rather than by contact-inbox (resolveGraphThreadId, when the
         // contact-inbox is unknown) carries a single attendance by construction: there is no earlier
         // one for a divider to separate this from, and no sidecar row keyed by contact-inbox to
@@ -949,6 +1032,7 @@ export async function runAgentNudge(
         return decided;
       }),
     );
+    if (claim === null) return "stale";
     if (claim.closedConversationId !== null && contactInboxId !== null) {
       // Outside the lock: this opens its own transaction, and nesting one inside an advisory-lock
       // transaction would hold that lock across a second connection's work.
@@ -963,6 +1047,13 @@ export async function runAgentNudge(
         base,
       });
     }
+
+    // The ask for the INVOKE, and it is not the one inside the lock repeated. That one guards the
+    // divider and the claim; between it and here sit the state read, the divider write, the marker
+    // move and `armCompaction` — the last of which opens a transaction of its own, outside the lock.
+    // The invoke persists the channel, which is the write /reset is clearing, so it gets its own.
+    // Same placement `runLoadedTurn` uses, for the same reason.
+    if (!(await stillWanted())) return "stale";
 
     // 4. Invoke with the normalized event as a HUMAN turn. It must NOT be a SystemMessage: the agent
     // node already prepends the one-and-only system prompt, and a second system message in the thread
@@ -985,7 +1076,12 @@ export async function runAgentNudge(
         invokeConfig,
       )
       .catch(async (e) => {
-        await deliverPromisedLine();
+        // The transfer can complete and the turn still throw, and then this is the one delivery that
+        // happens BEFORE the post-generation retirement check below — the same "asked after the
+        // write" mistake the checks around it were moved to fix. Outside the window it posts an
+        // operator note, which a /reset that retired this job during the failed invoke should not be
+        // followed by.
+        if (await stillWanted()) await deliverPromisedLine();
         throw e;
       });
   } finally {
@@ -1014,11 +1110,32 @@ export async function runAgentNudge(
   // OTHER kind of proactive text is still decided by them.
   const handedOff = handoffAnsweredTheTurn(handoffState);
 
+  // NOTE: Answers for the GENERATION, which every path pays for whether guardrails are on or not — and it
+  // sits here, before the ownership probe, because everything below this line WRITES to the
+  // conversation. Six ends BELOW THIS LINE reach `applyPostActions` (the contact-authorization
+  // refusal is the seventh, and asks the same question at its own position), and three of them (the
+  // promised handoff line,
+  // the agent staying silent, the guardrail suppressing the reply) post no message at all, so a
+  // check placed among the SENDS missed them: a follow-up retired mid-generation still relabelled
+  // and resolved the conversation /reset had just cleared, and `followUpHandler` wrote its watermark
+  // back because the outcome was not "stale". Before the probe rather than after, so a retired run
+  // neither spends the round trip nor returns the retry that `live-unavailable` asks for.
+  //
+  // The later checks answer for later model calls — the guardrail judge's, and the screening inside
+  // deliverPromisedLine — not for this one.
+  if (!(await stillWanted())) return "stale";
+
   let canMessagePost: boolean;
   if (handedOff) {
     canMessagePost = true;
   } else {
     const owned = await botStillOwnsIt();
+    // The probe is its own stretch of time, and every end below consumes its answer: the silent
+    // branch, the template, the two notes and the post-actions all write without asking again. The
+    // check above this block answers for the model call, not for this round trip. Above the
+    // `unavailable` return as well, so a retired run reports what it is rather than asking for a
+    // retry it must not get.
+    if (!(await stillWanted())) return "stale";
     // Fail closed: nothing has been posted yet, so a probe that could not run costs a retry and
     // nothing else.
     if (owned === "unavailable") return "live-unavailable";
@@ -1042,6 +1159,13 @@ export async function runAgentNudge(
   // ownership left to protect (we are the ones who just handed the conversation over). It does
   // respect the 24h service window, which the tool's own send used to walk straight past.
   const promised = await deliverPromisedLine();
+  // "stale" leaves through its own door, and that is the whole difference between ending the episode
+  // and continuing it. `followUpHandler` stamps `lastFollowUpAt` on a silent turn AND arms the next
+  // step, so a retired run that reported silence wrote its watermark onto the conversation /reset had
+  // just cleared and re-armed the sequence the command ended — and the post-actions below would have
+  // relabelled and resolved it on the way out. The transfer itself still stands: the tool ran inside
+  // the graph and this fence was never able to reverse it.
+  if (promised === "stale") return "stale";
   if (promised) {
     if (promised !== "silent") markFollowUp(promised);
     await applyPostActions({ canMessage: canMessagePost });
@@ -1125,6 +1249,13 @@ export async function runAgentNudge(
       canMessagePost = owned === "ours";
     }
 
+    // NOTE: Asked again over the same stretch the ownership and the window are re-asked over: the judge's
+    // model call. Nothing has reached the customer yet, so aborting here costs nothing.
+    //
+    // ABOVE the suppression branch, for the reason the check outside this block sits above the silent
+    // one: suppression posts no message but still fires the post-actions, so a check placed after it
+    // guards only the sends and lets the judge's stretch of time reach the labels and the resolve.
+    if (!(await stillWanted())) return "stale";
     if (screened === null) {
       await applyPostActions({ canMessage: canMessagePost });
       return "silent";

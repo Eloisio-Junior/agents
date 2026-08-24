@@ -4,12 +4,13 @@ import basePrisma from "@/api/lib/prisma";
 import { type AgentNudge, parseThreadId, runAgentNudge } from "@/graph/nudge";
 import type { RuntimeDeps } from "@/graph/runtime";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
-import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { loadAppointmentContext } from "@/modules/appointments/context";
 import {
   type ClaimedJob,
   cancelPendingJobsByPrefix,
   enqueueJob,
+  jobRetired,
 } from "@/modules/scheduler/service";
 import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
 import { ensureFreshGoogleAccessToken } from "@/modules/vault/google-oauth";
@@ -148,6 +149,72 @@ export async function cancelAppointmentReminders(
   });
 }
 
+// Retire every appointment reminder THIS conversation armed: pending rows cancelled, every row
+// tombstoned. /reset is the caller.
+//
+// Scoped by the thread the rows carry in their payload, and never by the event: the reminders are
+// keyed `reminder:<eventId>:<offset>`, so a command that only knows the thread cannot reach them by
+// dedupe key — but the event is the wrong widening. A reschedule re-arms the surviving offsets with
+// the payload of whatever conversation asked for it (enqueueJob's upsert is authoritative), while
+// already-fired rows keep the OLD thread; going from a fired row's event id back to the whole
+// `reminder:<eventId>:` prefix would cancel and tombstone the LIVE reminders of the conversation that
+// now owns the appointment. The thread predicate is the same lookup `loadAppointmentContext` uses per
+// turn, and it cannot reach outside the conversation that typed the command.
+//
+// ALL rows, not just PENDING ones: `loadAppointmentContext` re-reads fired rows too, and a fired
+// reminder whose start is still ahead is exactly what keeps the appointment block in the prompt after
+// the operator was told the conversation was cleared. The tombstone is what tells the two apart —
+// cancelling marks a job DONE, which is indistinguishable from "fired". One atomic statement, never
+// read-modify-write, so a concurrent re-arm's payload is stamped or replaced whole.
+//
+// The calendar event itself is deliberately NOT touched. Deleting a real booking is not what the
+// operator asked for by typing /reset, and it is not undoable.
+//
+// UNCONDITIONAL, and that is why the caller runs it BEFORE its slow work rather than after. /reset is
+// not atomic with the conversation: a turn arriving during the cleanup can book or reschedule, and
+// retiring what that turn armed loses reminders for real appointments (the command also clears
+// `lastInboundAt`, so nothing re-arms them). Sparing them by age does not work — enqueueJob upserts on
+// `reminder:<eventId>:<offset>`, so a reschedule keeps the row's `created_at` and a claim moves its
+// `updated_at`; both columns answer a question about the ROW, not about the arm. Ordering answers it
+// instead: retire first, and an arm that lands afterwards revives its own row, because that same
+// upsert writes `status: PENDING` with a fresh payload and run time. What is left is the window
+// between reading the command and this statement committing, where "before or after the command" has
+// no answer to get right.
+//
+// TWO scopes in one statement, over different row sets. The `cancelledAt` stamp is the APPOINTMENT's
+// cancel marker, not a note about a run: projectAppointmentEvents and the follow-up sweep both read
+// it, and to both a row whose start is still ahead is a LIVE appointment until the stamp lands. So it
+// goes on every row of the thread, DEAD ones included — fencing it on status would leave a
+// dead-lettered reminder in the prompt, and follow-ups paused on it, after the operator was told the
+// conversation had been cleared. The STATUS transition is the narrower scope: only a queued or
+// in-flight row has a run to call off, and moving a DEAD row to DONE would erase the dead-letter an
+// operator may still need to read (the same reason retireJobsByDedupeKey fences the whole statement —
+// there the stamp has no reader but jobRetired, so it can).
+//
+// Returns the number of rows the command reached — retired or merely tombstoned.
+export async function cancelThreadAppointmentReminders(
+  tenantId: bigint,
+  threadId: string,
+  base: PrismaClient = basePrisma,
+): Promise<number> {
+  return runScopedOn(base, sysCtx(tenantId), async (db) => {
+    const stamp = JSON.stringify({ cancelledAt: new Date().toISOString() });
+    return db.$executeRaw`
+      UPDATE scheduler_jobs
+         SET status = CASE
+                        WHEN status IN ('PENDING', 'CLAIMED')
+                          THEN 'DONE'::"SchedulerJobStatus"
+                        ELSE status
+                      END,
+             payload = payload || ${stamp}::jsonb,
+             claim_seq = claim_seq + 1,
+             updated_at = now()
+       WHERE tenant_id = ${tenantId}
+         AND kind = 'APPOINTMENT_REMINDER'
+         AND payload->>'threadId' = ${threadId}`;
+  });
+}
+
 // True while this conversation (by thread) has at least one LIVE appointment — a queued reminder row
 // (PENDING/CLAIMED) or an already-fired one whose start is still ahead, tombstones excluded: the shared
 // projectAppointmentEvents predicate, via loadAppointmentContext. The follow-up handler uses it to
@@ -278,6 +345,27 @@ export async function appointmentReminderHandler(
   const askConfirmation = p.askConfirmation === true;
   const tenantId = job.tenantId;
 
+  // Was this reminder retired while it sat claimed? `cancelPendingJob` and its prefix sibling reach
+  // PENDING rows only, so a row the worker had already picked up survives every cancellation — and
+  // the reminder then fires at the customer about an appointment the operator was told had been
+  // cleared. The tombstone is the fence: `cancelThreadAppointmentReminders` (and the per-event
+  // cancel) stamp `cancelledAt` on EVERY row of the match, claimed ones included, precisely so an
+  // in-flight handler has something to see. The handler is the half that was missing.
+  //
+  // Re-read rather than trusted from `job.payload`: that snapshot is from claim time, which is
+  // exactly the moment before the stamp lands. A read that fails does NOT suppress the reminder —
+  // an unknown answer must not silently drop a customer-facing message that was legitimately armed.
+  // Takes the caller's connection when there is one: asked from inside the nudge's thread claim,
+  // which runs in an advisory-lock transaction, a second connection would stall the lock (see
+  // jobRetired).
+  const retired = (scoped?: ScopedDb): Promise<boolean> =>
+    jobRetired(job, base, scoped);
+
+  // NOTE: Asked TWICE, and the two calls buy different things. Here it saves the Google round trip, which
+  // holds this handler for up to ten seconds. After it — see below — is where the window actually
+  // closes, because a /reset arriving during that call would otherwise find the answer already read.
+  if (await retired()) return { outcome: "done" };
+
   // Verify the event before nudging: skip if it was cancelled / deleted / already started (e.g. edited
   // directly in Google). A transient lookup failure (undefined) falls through to nudging anyway.
   // Summary preference: live Google value > the snapshot enriched into the payload > generic.
@@ -299,9 +387,17 @@ export async function appointmentReminderHandler(
     }
   }
 
+  // NOTE: The boundary that matters: the last thing before the customer hears from us. The check above
+  // ran before a network call long enough for the reset to land inside it.
+  if (await retired()) return { outcome: "done" };
+
   await runAgentNudge({
     tenantId,
     threadId,
+    // And once more inside, where the nudge re-asks its own questions across the model call. Three
+    // reads is not belt-and-braces: each covers a different slow step (the Google fetch, the nudge's
+    // setup, the judge's call), and the stamp can land in any of them.
+    stillWanted: async (scoped) => !(await retired(scoped)),
     nudge: reminderNudge({
       isLast,
       askConfirmation,

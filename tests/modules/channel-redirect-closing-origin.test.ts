@@ -148,6 +148,7 @@ describe.skipIf(!dbUp)("the redirect closing records its own origin", () => {
         status: "open",
         threadId: `${tenantId}:${instanceId}:${WIDGET_CONV_2}`,
         lastInboundAt: new Date(),
+        redirectLinkedAt: new Date(Date.now() - 59_000),
       },
     });
     const waInbox = await suDb.inbox.create({
@@ -170,6 +171,7 @@ describe.skipIf(!dbUp)("the redirect closing records its own origin", () => {
         chatwootStatusAt: SIBLING_AT,
         threadId: `${tenantId}:${instanceId}:${SIBLING_CONV}`,
         lastInboundAt: new Date(),
+        redirectSentAt: new Date(Date.now() - 60_000),
       },
     });
     const s = stubClient();

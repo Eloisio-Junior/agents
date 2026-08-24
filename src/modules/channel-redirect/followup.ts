@@ -3,13 +3,18 @@ import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { type AgentNudge, parseThreadId, runAgentNudge } from "@/graph/nudge";
 import type { RuntimeDeps } from "@/graph/runtime";
-import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { loadAgentBot, loadChatwootClient } from "@/modules/chatwoot/instance";
 import {
   type ObservedConversation,
   recordResolutionOrigin,
 } from "@/modules/conversations/record-resolution";
-import { type ClaimedJob, enqueueJob } from "@/modules/scheduler/service";
+import {
+  type ClaimedJob,
+  enqueueJob,
+  jobRetired,
+  retireJobsByDedupeKey,
+} from "@/modules/scheduler/service";
 import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
 import {
   buildTemplatePayload,
@@ -48,6 +53,52 @@ function sysCtx(tenantId: bigint): TenantContext {
 
 export function followUpDedupeKey(widgetThreadId: string): string {
   return `redirect-followup:${widgetThreadId}`;
+}
+
+// Retire the ladder armed for a widget thread: the pending row cancelled, and EVERY row of the key
+// stamped so an in-flight handler can see it.
+//
+// `cancelPendingJob` alone is not enough here and the gap is the worst one in the feature: it reaches
+// PENDING rows only, so a ladder the worker had already claimed runs to completion — and this
+// ladder's terminal stage posts a closing message on BOTH conversations and resolves them. A /reset
+// would report the episode cleared and the customer would then be said goodbye to and closed.
+//
+// The tombstone is the same mechanism appointment reminders use, kept local to this kind rather than
+// pushed into cancelPendingJob: that primitive has eight callers across four modules, and each of
+// them would need its own handler-side fence to make the change mean anything.
+//
+// NO arming cutoff here, unlike the appointment reminders: this ladder lives on ONE permanent row
+// per widget thread, so "created before the command" is true of every ladder that exists and a
+// re-arm does not move it. A cutoff on it would buy nothing and could only fail in the direction
+// that leaves a claimed closing running — the one that messages and resolves both conversations.
+//
+// DONE even for a row the worker is holding, and that pairs with the bump rather than duplicating it.
+// Bumping alone leaves a CLAIMED row nobody can finish — the in-flight worker's complete, reschedule
+// and fail all CAS on the old token and no-op, while no claim can pick it up again because it is
+// still CLAIMED — so it sits wedged until the stale-job sweep records a failure that never happened.
+// Terminal here, superseded there: the handler's writes land on nothing and the row is already
+// finished.
+//
+// The claim token is bumped with it, and that is what makes the fence hold at the LAST boundary the
+// handler does not own: its return value. `completeJob`/`rescheduleJob`/`failJob` all CAS on the
+// token the claim handed out (issue #164), so a stamp landing after the handler's final read still
+// wins — the reschedule writes nothing instead of replacing the payload and re-arming the stage the
+// stamp was meant to stop. The mechanism already existed for exactly this sentence: "a run that was
+// superseded while it worked writes nothing".
+//
+// A re-arm replaces the payload wholesale (enqueueJob's upsert is authoritative), so a lead who
+// replies in the chat clears the stamp along with the rest of the old payload.
+export async function retireRedirectFollowUp(
+  tenantId: bigint,
+  widgetThreadId: string,
+  base: PrismaClient = basePrisma,
+): Promise<number> {
+  return retireJobsByDedupeKey(
+    tenantId,
+    "REDIRECT_FOLLOWUP",
+    followUpDedupeKey(widgetThreadId),
+    base,
+  );
 }
 
 export type RedirectFollowUpStage = "chat" | "whatsapp" | "closing";
@@ -232,9 +283,16 @@ async function resolveWhatsAppSibling(
   });
 }
 
-export type WhatsAppFollowUpOutcome = "sent" | "no-sibling" | "misconfigured";
+export type WhatsAppFollowUpOutcome =
+  | "retired"
+  | "sent"
+  | "no-sibling"
+  | "misconfigured";
 
 export interface SendWhatsAppFollowUpParams {
+  // Asked immediately before the send, after the sibling lookup and the token mint — both of which
+  // are round trips a /reset can land inside. Absent, the answer is yes.
+  stillWanted?: () => Promise<boolean>;
   tenantId: bigint;
   instanceId: bigint;
   agentId: bigint;
@@ -283,6 +341,9 @@ export async function sendWhatsAppFollowUp(
     base: p.base,
     botToken: bot?.accessToken,
   });
+  // NOTE: The link mint above is an HTTP round trip to Chatwoot, so the answer the caller had is older than
+  // this line. Nothing has left yet, which makes this the last free place to stop.
+  if (p.stillWanted && !(await p.stillWanted())) return "retired";
   const sw = readServiceWindowConfig(p.settings);
   const mode = proactiveSendMode(sw, sibling.lastInboundAt, p.now, {
     channelType: sibling.channelType,
@@ -309,6 +370,19 @@ export async function redirectFollowUpHandler(
 ): Promise<JobResult> {
   const payload = parseRedirectFollowUpPayload(job.payload);
   if (!payload) return { outcome: "done" };
+
+  // Retired while this row sat claimed? `job.payload` is the claim-time snapshot, which is exactly
+  // the moment before the stamp lands, so the row is re-read. Every stage of this ladder is
+  // customer-visible and the last one resolves both conversations, so the check goes before all of
+  // them — including the reschedule, since advancing a retired ladder just moves the problem.
+  //
+  // A read that fails does NOT retire the job: an unknown answer must not silently drop work that
+  // was legitimately armed.
+  // Takes the caller's connection when there is one — see jobRetired: asked from inside the nudge's
+  // thread claim, a second connection would stall on the pool while the advisory lock is held.
+  const retired = (scoped?: ScopedDb): Promise<boolean> =>
+    jobRetired(job, base, scoped);
+  if (await retired()) return { outcome: "done" };
   const parsed = parseThreadId(payload.widgetThreadId);
   if (!parsed || parsed.tenantId !== job.tenantId) return { outcome: "done" };
   const tenantId = job.tenantId;
@@ -334,20 +408,27 @@ export async function redirectFollowUpHandler(
 
   // Reschedule this same job to the next stage after its configured delay. The payload is authoritative
   // on re-enqueue, so this advances the ladder on the SAME row (mirrors the two-stage original).
-  const rescheduleTo = (
+  // Advancing the ladder REPLACES the row's payload (enqueueJob's upsert is authoritative), which
+  // would wipe the very stamp that retires it — a /reset landing mid-stage would be undone by the
+  // stage it interrupted, and the ladder would go on to its closing. So the question is asked once
+  // more here: a retired ladder ends, it does not advance.
+  const rescheduleTo = async (
     stage: RedirectFollowUpStage,
     value: number,
     unit: RedirectDelayUnit,
-  ): JobResult => ({
-    outcome: "reschedule",
-    runAt: minutesFromNow(redirectDelayMinutes(value, unit), new Date()),
-    payload: {
-      stage,
-      widgetThreadId: payload.widgetThreadId,
-      agentId: payload.agentId,
-      entryInboxId,
-    },
-  });
+  ): Promise<JobResult> =>
+    (await retired())
+      ? { outcome: "done" }
+      : {
+          outcome: "reschedule",
+          runAt: minutesFromNow(redirectDelayMinutes(value, unit), new Date()),
+          payload: {
+            stage,
+            widgetThreadId: payload.widgetThreadId,
+            agentId: payload.agentId,
+            entryInboxId,
+          },
+        };
 
   if (payload.stage === "chat") {
     if (cfg.chatFollowupEnabled) {
@@ -356,18 +437,19 @@ export async function redirectFollowUpHandler(
         threadId: payload.widgetThreadId,
         nudge: chatFollowupNudge(cfg.chatFollowupInstructions),
         base,
+        stillWanted: async (scoped) => !(await retired(scoped)),
         deps,
       });
     }
     if (cfg.waFollowupEnabled) {
-      return rescheduleTo(
+      return await rescheduleTo(
         "whatsapp",
         cfg.waFollowupDelayValue,
         cfg.waFollowupDelayUnit,
       );
     }
     if (cfg.closingEnabled) {
-      return rescheduleTo(
+      return await rescheduleTo(
         "closing",
         cfg.closingDelayValue,
         cfg.closingDelayUnit,
@@ -377,8 +459,14 @@ export async function redirectFollowUpHandler(
   }
 
   if (payload.stage === "whatsapp") {
+    // NOTE: The two stages below send FIXED text rather than a nudge, so `stillWanted` never reaches them:
+    // the question is asked here instead, immediately before the send. Both cross channels — this one
+    // messages the WhatsApp sibling, the closing messages and RESOLVES both — so a stamp that landed
+    // while the config and the sibling were being resolved has to be seen.
+    if (await retired()) return { outcome: "done" };
     if (cfg.waFollowupEnabled && entryInboxId !== null) {
       const outcome = await sendWhatsAppFollowUp({
+        stillWanted: async () => !(await retired()),
         tenantId,
         instanceId: parsed.instanceId,
         agentId,
@@ -398,7 +486,7 @@ export async function redirectFollowUpHandler(
       }
     }
     if (cfg.closingEnabled) {
-      return rescheduleTo(
+      return await rescheduleTo(
         "closing",
         cfg.closingDelayValue,
         cfg.closingDelayUnit,
@@ -408,8 +496,10 @@ export async function redirectFollowUpHandler(
   }
 
   // stage === "closing" — the ladder's terminal give-up: post the closing on BOTH channels + resolve, once.
+  if (await retired()) return { outcome: "done" };
   if (cfg.closingEnabled && entryInboxId !== null) {
     await deliverRedirectClosing({
+      stillWanted: async () => !(await retired()),
       tenantId,
       instanceId: parsed.instanceId,
       widgetConversationId: parsed.conversationId,
@@ -470,6 +560,10 @@ async function deliverClosing(
 }
 
 export interface DeliverRedirectClosingParams {
+  // Asked twice inside: before the watermark is claimed (a retired ladder must not burn the
+  // at-most-once anchor) and again before the sends, after the reads and the client build. Absent,
+  // the answer is yes — the resolve-transition caller has no job to retire.
+  stillWanted?: () => Promise<boolean>;
   tenantId: bigint;
   instanceId: bigint;
   // The WIDGET conversation's chatwootConversationId. The closing watermark lives on this row; the agent
@@ -500,20 +594,6 @@ export async function deliverRedirectClosing(
 ): Promise<DeliverRedirectClosingOutcome> {
   const base = p.base ?? basePrisma;
   const now = new Date();
-  // Claim the closing: set the watermark only if still unset. rowcount 1 ⇒ we own this delivery.
-  const won = await runScopedOn(base, sysCtx(p.tenantId), async (db) => {
-    const res = await db.conversation.updateMany({
-      where: {
-        tenantId: p.tenantId,
-        chatwootInstanceId: p.instanceId,
-        chatwootConversationId: p.widgetConversationId,
-        redirectClosedAt: null,
-      },
-      data: { redirectClosedAt: now },
-    });
-    return res.count === 1;
-  });
-  if (!won) return "already-closed";
 
   // Everything the sends need — the agent (bot token), the widget conv's channel + lastInboundAt, and the
   // service-window config — derived from the widget conversation. Both channels post via THIS agent's bot.
@@ -540,8 +620,8 @@ export async function deliverRedirectClosing(
     });
     return { widget, agentId: widget.inbox.agentId, settings: agent?.settings };
   });
-  // No agent bound to the widget inbox (shouldn't happen once redirect is live): the watermark is set,
-  // nothing to post.
+  // NOTE: No agent bound to the widget inbox (shouldn't happen once redirect is live): nothing to post, and
+  // now nothing claimed either — the anchor stays free for a trigger that CAN deliver.
   if (!cx) return "delivered";
 
   const bot = await loadAgentBot(p.tenantId, p.instanceId, cx.agentId, base);
@@ -551,6 +631,142 @@ export async function deliverRedirectClosing(
     makeClient: p.deps?.makeClient,
   });
   const sw = readServiceWindowConfig(cx.settings);
+
+  // NOTE: The retirement fence and the CLAIM sit together, here rather than at the top, and the ordering is
+  // the point: everything above is a read, and claiming before them meant a ladder retired mid-read
+  // burned the at-most-once anchor on a closing it then refused to deliver — leaving a funnel that
+  // could never close again. Claiming last costs a loser of the race a few reads it will discard,
+  // which is the cheaper side of the trade.
+  if (p.stillWanted && !(await p.stillWanted())) return "already-closed";
+
+  // What the resolve trigger has instead of a job to ask about — and the reason it needs anything at
+  // all. `redirectClosedAt: null` cannot tell "never closed" from "was closed and /reset just cleared
+  // it": the values are identical, so on its own the CAS is not a fence against the command, it is a
+  // door the command OPENS. Something read BEFORE the command has to be compared after it.
+  //
+  // `lastInboundAt` is that something, when it is set: same snapshot above, cleared by the same reset
+  // in the same statement, and already read to pick the send mode, so comparing it costs no new
+  // state. A genuine new inbound moves it too, and standing down there is correct rather than
+  // collateral — the trigger was a RESOLVE, and a customer who has written since is on a conversation
+  // that reopened.
+  //
+  // Null is the case that comparison cannot cover, because /reset writes null as well and the
+  // predicate would match straight across the command it is fencing. There is no other column here
+  // that necessarily changes: every one the command touches goes TO null or to zero, so any of them
+  // can be null on both sides. So a caller with no job and no token does not get to claim — it is the
+  // one combination where nothing distinguishes the episode it read from the one after the reset, and
+  // the write it is holding is a goodbye to a customer. The ladder path is unaffected: its `stillWanted`
+  // IS the token, and it is armed by an inbound, so this watermark is set whenever it runs.
+  if (!p.stillWanted && cx.widget.lastInboundAt === null) {
+    logger.info(
+      "channel-redirect: closing stood down — no job to ask and no episode token to compare (widget conv=%d)",
+      p.widgetConversationId,
+    );
+    return "already-closed";
+  }
+
+  // Claim the closing: set the watermark only if still unset AND the episode is the one this run read.
+  const won = await runScopedOn(base, sysCtx(p.tenantId), async (db) => {
+    const res = await db.conversation.updateMany({
+      where: {
+        tenantId: p.tenantId,
+        chatwootInstanceId: p.instanceId,
+        chatwootConversationId: p.widgetConversationId,
+        redirectClosedAt: null,
+        lastInboundAt: cx.widget.lastInboundAt,
+      },
+      data: { redirectClosedAt: now },
+    });
+    return res.count === 1;
+  });
+  if (!won) return "already-closed";
+
+  // NOTE: Asked once more, because the claim is a write and the answer above it predates it. Nothing
+  // has reached anybody yet, so this is the last point where the episode can still end without a
+  // goodbye — and the anchor goes back with it, since an anchor set on a closing nobody delivered is
+  // a funnel that can never close again.
+  //
+  // The release is CAS'd on the exact instant this claim wrote, so it cannot clear an anchor another
+  // trigger won afterwards. A release that fails leaves the anchor set, which is precisely what not
+  // releasing at all would do — it can only improve on doing nothing.
+  //
+  // Deliberately NOT asked again between the two channel deliveries below: once the first goodbye
+  // has left, the closing has happened, and stopping halfway leaves the episode half-closed rather
+  // than clean.
+  const releaseClaim = async (): Promise<void> => {
+    await runScopedOn(base, sysCtx(p.tenantId), (db) =>
+      db.conversation.updateMany({
+        where: {
+          tenantId: p.tenantId,
+          chatwootInstanceId: p.instanceId,
+          chatwootConversationId: p.widgetConversationId,
+          redirectClosedAt: now,
+        },
+        data: { redirectClosedAt: null },
+      }),
+    ).catch((err) => {
+      logger.warn(
+        "channel-redirect: could not release the closing watermark (widget conv=%d): %s",
+        p.widgetConversationId,
+        err instanceof Error ? err.message : String(err),
+      );
+    });
+  };
+  if (p.stillWanted && !(await p.stillWanted())) {
+    await releaseClaim();
+    return "already-closed";
+  }
+
+  // And the fence for the caller that has no job to ask about. The resolve trigger reaches here
+  // straight from a webhook, so `stillWanted` is undefined for it and every check above is one this
+  // path skips — while /reset CLEARS this very anchor, deliberately, so the funnel can be tested
+  // again. The two together let a closing that claimed before the command send its goodbye and
+  // resolve the sibling after the reset had finished, on an episode the operator was told was erased.
+  //
+  // The claim is the token, and this re-reads it the way a claimed job re-reads `claim_seq`: the
+  // anchor still holding the exact instant written above means nobody took it. Cleared, or won by
+  // someone else, means this run is not the one delivering. No release here — the anchor is already
+  // not ours to give back.
+  //
+  // A closure and not a single check, because this function delivers TWICE and the two are separated
+  // by a lookup: asked once at the top it would answer about a moment before the sibling read, which
+  // is the same mistake the anchors made. One ask per stretch of I/O that precedes a send.
+  const stillDelivering = async (): Promise<boolean> => {
+    const held = await runScopedOn(base, sysCtx(p.tenantId), (db) =>
+      db.conversation.count({
+        where: {
+          tenantId: p.tenantId,
+          chatwootInstanceId: p.instanceId,
+          chatwootConversationId: p.widgetConversationId,
+          redirectClosedAt: now,
+        },
+      }),
+    ).catch(() => 1);
+    if (held === 1) return true;
+    logger.info(
+      "channel-redirect: the closing claim was taken while this run read (widget conv=%d)",
+      p.widgetConversationId,
+    );
+    return false;
+  };
+  if (!(await stillDelivering())) return "already-closed";
+
+  // AND THE JOB, ASKED AGAIN AND ASKED LAST. The ask above answered about a moment before the claim
+  // read, and that read is a database round trip — which is exactly the gap THE RULE names (one ask
+  // per stretch of I/O that precedes a write, and never any I/O between an ask and the write it
+  // guards). A /reset landing in it retires this job while the claim check, which asks about the
+  // ANCHOR and not about the job, still says the run is the one delivering: the goodbye then goes
+  // out and both conversations are resolved, on an episode the operator was told had been erased.
+  //
+  // The claim question cannot also be last, and this is the honest ordering rather than a complete
+  // one: what stays open is a concurrent closing run taking the anchor inside this final round trip,
+  // which the claim CAS already makes rare and which costs a duplicate goodbye. What closes is the
+  // reset, which is what this whole change is about and which costs the operator a conversation they
+  // were told was clean.
+  if (p.stillWanted && !(await p.stillWanted())) {
+    await releaseClaim();
+    return "already-closed";
+  }
 
   // Chat (website widget): post the goodbye + resolve. Skipped on the resolve-path, where the chat is
   // already being resolved by the trigger. A web widget has no 24h window → proactiveSendMode → freeform.
@@ -578,6 +794,11 @@ export async function deliverRedirectClosing(
   }
 
   // WhatsApp channel: the sibling conversation (same contact, the entry inbox). Post the goodbye + resolve.
+  //
+  // The lookup below is a read of its own, and it is the read /reset invalidates: the command clears
+  // the identity it consults. Between it returning a sibling and the send there is nothing else, but
+  // between the ask above and it there is now the chat delivery AND the lookup — so the answer is
+  // taken again below, right before the send.
   const sibling = await resolveWhatsAppSibling(
     p.tenantId,
     p.instanceId,
@@ -585,7 +806,12 @@ export async function deliverRedirectClosing(
     p.entryInboxId,
     base,
   );
-  if (sibling) {
+  // The second ask, and it is skipped once the chat has ALREADY been messaged and resolved. Standing
+  // down here would leave the episode half-closed — the widget said goodbye and is resolved, the
+  // WhatsApp side still open — and report `delivered` for it. A reset that lands mid-delivery cannot
+  // un-send the first half, so the honest completion of a started delivery is both halves; the ask
+  // is what stops one that has not started.
+  if (sibling && (p.closeChat || (await stillDelivering()))) {
     const waMode = proactiveSendMode(sw, sibling.lastInboundAt, now, {
       channelType: sibling.channelType,
       provider: sibling.provider,
