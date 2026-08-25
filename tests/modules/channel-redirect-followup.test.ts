@@ -1238,6 +1238,406 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
     });
   });
 
+  // ── Issue #246: the gate answers at handler entry and the stages send later, across I/O of their
+  //    own. These pin what the ladder does when the switch flips INSIDE that window, which is the
+  //    moment an operator watching a lead being chased is likeliest to reach for it.
+  test("switched off during the link mint sends nothing AND does not advance", async () => {
+    const job = await claimed("whatsapp");
+    const s = stubClient();
+    wire.length = 0;
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      wire.push(url);
+      if (url.includes("/redirect_tokens")) {
+        await suDb.agent.update({
+          where: { id: agentId },
+          data: { enabled: false },
+        });
+      }
+      const body = url.includes("/redirect_tokens")
+        ? { token: "tok-246", website_url: "https://loja.example" }
+        : url.includes("/inboxes")
+          ? { id: 111, website_url: "https://loja.example" }
+          : { id: 1, payload: {} };
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    let result: Awaited<ReturnType<typeof redirectFollowUpHandler>>;
+    try {
+      result = await redirectFollowUpHandler(job, appDb, {
+        ...deps(),
+        makeClient: s.makeClient,
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: { enabled: true },
+      });
+    }
+    // The mint happened, so this is the window and not a stage that stopped earlier.
+    expect(wire.some((u) => u.includes("/redirect_tokens"))).toBe(true);
+    expect(wire.filter((u) => u.includes("/messages"))).toEqual([]);
+    // And the ladder ENDS. Rescheduling would arm the closing on a stood-down episode: re-enable the
+    // agent before that delay expires and it messages and resolves both conversations, with no fresh
+    // inbound behind it.
+    expect(result).toEqual({ outcome: "done" });
+  });
+
+  test("switched off while the closing reads sends nothing and frees the anchor", async () => {
+    const job = await claimed("closing");
+    const s = stubClient();
+    // The rendezvous is the closing's own first read: everything after it — the bot, the client, the
+    // sibling — is I/O this run does while holding an answer it took before.
+    let reads = 0;
+    const flipping = appDb.$extends({
+      query: {
+        conversation: {
+          async findUnique({ args, query }) {
+            const res = await query(args);
+            reads += 1;
+            if (reads === 1) {
+              await suDb.agent.update({
+                where: { id: agentId },
+                data: { enabled: false },
+              });
+            }
+            return res;
+          },
+        },
+      },
+    }) as unknown as PrismaClient;
+    try {
+      await redirectFollowUpHandler(job, flipping, {
+        ...deps(),
+        makeClient: s.makeClient,
+      });
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: { enabled: true },
+      });
+    }
+    expect(s.sent).toEqual([]);
+    expect(s.resolved).toEqual([]);
+    // Released, not burned: the at-most-once anchor left set on a closing nobody delivered is a
+    // funnel that can never close.
+    const widget = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: WIDGET_CONV },
+      select: { redirectClosedAt: true },
+    });
+    expect(widget.redirectClosedAt).toBeNull();
+  });
+
+  // The other half of the rule, and the one a fence gets wrong silently: an answer that could not be
+  // READ is not a refusal. `jobRetired` makes the same call for the same reason — an unknown answer
+  // must not drop work that was legitimately armed — so a database blip during the mint costs a
+  // follow-up the customer should have received.
+  test("a liveness read that fails does not stand the ladder down", async () => {
+    const job = await claimed("whatsapp");
+    const s = stubClient();
+    wire.length = 0;
+    globalThis.fetch = httpDouble;
+    // Only the liveness re-read fails: it asks for `enabled` + `mode` alone, while the handler's own
+    // load at the top takes `settings` with them. A blanket failure would prove nothing, since every
+    // read on the path would be down — including the one that decides whether to run at all.
+    const failing = appDb.$extends({
+      query: {
+        agent: {
+          async findUnique({ args, query }) {
+            const sel = args.select as Record<string, unknown> | undefined;
+            if (
+              sel?.enabled === true &&
+              sel?.mode === true &&
+              sel?.settings === undefined
+            ) {
+              throw new Error("liveness read is down");
+            }
+            return query(args);
+          },
+        },
+      },
+    }) as unknown as PrismaClient;
+    try {
+      await redirectFollowUpHandler(job, failing, {
+        ...deps(),
+        makeClient: s.makeClient,
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    expect(wire.some((u) => u.includes("/messages"))).toBe(true);
+  });
+
+  // The widest window in the ladder: the nudge's config load is fail-closed on `enabled`, but the
+  // model turn runs after it and the post comes after that. A switch flipped mid-turn has to reach
+  // the send, or the chat follow-up goes out from an agent that is already off — and with no later
+  // stage enabled, nothing downstream would ever notice.
+  test("switched off during the model turn posts no chat follow-up", async () => {
+    const job = await claimed("chat");
+    const s = stubClient();
+    // The rendezvous is the nudge's own config load: it is the read that selects the prompt, and the
+    // model turn is what happens next.
+    const flipping = appDb.$extends({
+      query: {
+        agent: {
+          async findUnique({ args, query }) {
+            const res = await query(args);
+            const sel = args.select as Record<string, unknown> | undefined;
+            if (sel?.systemPrompt === true) {
+              await suDb.agent.update({
+                where: { id: agentId },
+                data: { enabled: false },
+              });
+            }
+            return res;
+          },
+        },
+      },
+    }) as unknown as PrismaClient;
+    try {
+      await redirectFollowUpHandler(job, flipping, {
+        ...deps(),
+        makeClient: s.makeClient,
+      });
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: { enabled: true },
+      });
+    }
+    expect(s.sent).toEqual([]);
+  });
+
+  // Fail-open covers an answer nobody could READ, never one already in hand. A disabled agent is
+  // conclusive before the activation lookup runs, and that lookup is the fallible part: let the fence
+  // reach it and a failed read turns a switched-off agent back into a send.
+  test("a disabled test agent stands down even if the stamp read fails", async () => {
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: { enabled: true, mode: "test" },
+    });
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: WIDGET_CONV },
+      data: { testActivatedAt: new Date() },
+    });
+    const job = await claimed("whatsapp");
+    const s = stubClient();
+    wire.length = 0;
+    globalThis.fetch = httpDouble;
+    // Both rendezvous on the same column. The handler's own load reads it first — the switch flips
+    // right after, so the run gets past the entry gate — and the FENCE's read is the one that fails.
+    let stampReads = 0;
+    const failingStamp = appDb.$extends({
+      query: {
+        conversation: {
+          async findUnique({ args, query }) {
+            const sel = args.select as Record<string, unknown> | undefined;
+            if (sel?.testActivatedAt !== true) return query(args);
+            stampReads += 1;
+            if (stampReads > 1) throw new Error("activation lookup is down");
+            const res = await query(args);
+            await suDb.agent.update({
+              where: { id: agentId },
+              data: { enabled: false },
+            });
+            return res;
+          },
+        },
+      },
+    }) as unknown as PrismaClient;
+    try {
+      await redirectFollowUpHandler(job, failingStamp, {
+        ...deps(),
+        makeClient: s.makeClient,
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: { enabled: true, mode: "production" },
+      });
+      await suDb.conversation.updateMany({
+        where: { tenantId, chatwootConversationId: WIDGET_CONV },
+        data: { testActivatedAt: null },
+      });
+    }
+    // One read, the handler's own: the fence answered from `enabled` and never reached the fallible
+    // one. Drop the short-circuit and this becomes two — the read throws, the catch answers "go", and
+    // the link goes out from an agent that is already off.
+    expect(stampReads).toBe(1);
+    expect(wire.filter((u) => u.includes("/messages"))).toEqual([]);
+    expect(s.sent).toEqual([]);
+  });
+
+  // The two questions fail differently on purpose. A stamp read nobody could complete means unknown
+  // LIVENESS, which is live — but it must not swallow the retirement question with it. The closing is
+  // where that matters: its stage-level check runs once at the top, and every fence after it is the
+  // composite one, so if a failed stamp read answered "go" a /reset landing mid-run would be carried
+  // straight past the tombstone.
+  test("a failed stamp read does not carry a retired closing past the tombstone", async () => {
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: { enabled: true, mode: "test" },
+    });
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: WIDGET_CONV },
+      data: { testActivatedAt: new Date(), redirectClosedAt: null },
+    });
+    const job = await claimed("closing");
+    const s = stubClient();
+    // The /reset lands on the closing's OWN first read — past the stage's retirement check, so the
+    // fence is the only thing left that can see it — and the fence's stamp read is the one that fails.
+    let stampReads = 0;
+    let retiredMidRun = false;
+    const retiringThenFailing = appDb.$extends({
+      query: {
+        conversation: {
+          async findUnique({ args, query }) {
+            const sel = args.select as Record<string, unknown> | undefined;
+            if (sel?.testActivatedAt === true) {
+              stampReads += 1;
+              if (stampReads > 1) throw new Error("activation lookup is down");
+              return query(args);
+            }
+            const res = await query(args);
+            if (sel?.lastInboundAt === true && !retiredMidRun) {
+              retiredMidRun = true;
+              await retireRedirectFollowUp(tenantId, widgetThread, appDb);
+            }
+            return res;
+          },
+        },
+      },
+    }) as unknown as PrismaClient;
+    try {
+      await redirectFollowUpHandler(job, retiringThenFailing, {
+        ...deps(),
+        makeClient: s.makeClient,
+      });
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: { mode: "production" },
+      });
+      await suDb.conversation.updateMany({
+        where: { tenantId, chatwootConversationId: WIDGET_CONV },
+        data: { testActivatedAt: null },
+      });
+    }
+    // The reset really landed mid-run, so this is the window and not a run that stopped earlier.
+    // `stampReads` stays at 1: the fence answers "retired" before it ever reaches the fallible read,
+    // which is the ordering this pins. Move the retirement read back after the stamp read and the
+    // double's throw reaches the outer catch, the fence answers "go", and the closing goes out.
+    //
+    // What the double CANNOT reproduce is a query PostgreSQL rejects: it throws in JS before any SQL
+    // runs, so the transaction is never left aborted. That case is why the ordering exists rather
+    // than a catch — with a real abort, every later statement in the transaction fails too — and it
+    // is argued in the code, not covered here.
+    expect(retiredMidRun).toBe(true);
+    expect(stampReads).toBe(1);
+    expect(s.sent).toEqual([]);
+    expect(s.resolved).toEqual([]);
+  });
+
+  // The fence's own read can fail, and when it does the liveness half is unknown — which is live. The
+  // retirement half is not allowed to be unknown with it: an aborted transaction cannot answer it, so
+  // it is asked again on a fresh one. A /reset that landed mid-run must not be overtaken by a
+  // question added on top of it.
+  test("a failed fence read still sees a retired ladder", async () => {
+    const job = await claimed("whatsapp");
+    const s = stubClient();
+    wire.length = 0;
+    globalThis.fetch = httpDouble;
+    // The fence's agent read is the one that fails — it asks for `enabled` + `mode` alone, while the
+    // handler's own load at the top takes `settings` with them — and the /reset lands just before it.
+    let retiredMidRun = false;
+    const failingFence = appDb.$extends({
+      query: {
+        agent: {
+          async findUnique({ args, query }) {
+            const sel = args.select as Record<string, unknown> | undefined;
+            if (
+              sel?.enabled === true &&
+              sel?.mode === true &&
+              sel?.settings === undefined
+            ) {
+              if (!retiredMidRun) {
+                retiredMidRun = true;
+                await retireRedirectFollowUp(tenantId, widgetThread, appDb);
+              }
+              throw new Error("fence read is down");
+            }
+            return query(args);
+          },
+        },
+      },
+    }) as unknown as PrismaClient;
+    try {
+      await redirectFollowUpHandler(job, failingFence, {
+        ...deps(),
+        makeClient: s.makeClient,
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    expect(retiredMidRun).toBe(true);
+    expect(wire.filter((u) => u.includes("/messages"))).toEqual([]);
+    expect(s.sent).toEqual([]);
+  });
+
+  // Advancing is a decision too. A stage can end without ever reaching its own fence — the sibling
+  // lookup finds nobody, the link cannot be minted, or the chat stage simply finishes — and arming
+  // the next stage there points a closing at an episode the agent is no longer allowed to touch:
+  // re-enable it before that delay expires and it messages and resolves BOTH conversations.
+  test("switched off mid-stage does not arm the next stage", async () => {
+    const job = await claimed("chat");
+    // The rendezvous is the chat stage's own send: the follow-up goes out, and the operator switches
+    // the agent off right after reading it. Everything the ladder does from there — arming the next
+    // stage included — happens under an answer that is already false.
+    const flipOnSend = () => {
+      const sent: Array<[number, string]> = [];
+      const client = {
+        getConversation: async (c: number) => ({
+          id: c,
+          status: "pending",
+          meta: {},
+        }),
+        sendMessage: async (c: number, t: string) => {
+          sent.push([c, t]);
+          await suDb.agent.update({
+            where: { id: agentId },
+            data: { enabled: false },
+          });
+          return {};
+        },
+        sendPrivateNote: async () => ({}),
+        getConversationLabels: async () => [],
+        setConversationLabels: async () => ({}),
+        toggleStatus: async () => ({}),
+      } as unknown as ChatwootClient;
+      return { sent, makeClient: async () => client };
+    };
+    const s2 = flipOnSend();
+    let result: Awaited<ReturnType<typeof redirectFollowUpHandler>>;
+    try {
+      result = await redirectFollowUpHandler(job, appDb, {
+        ...deps(),
+        makeClient: s2.makeClient,
+      });
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: { enabled: true },
+      });
+    }
+    // The stage really ran, so this is the advance being fenced and not a handler that stopped early.
+    expect(s2.sent).toHaveLength(1);
+    expect(result).toEqual({ outcome: "done" });
+  });
+
   test("a retire mid-stage stops the closing, and the resolve with it", async () => {
     const job = await claimed("closing");
     const s = stubClient();
