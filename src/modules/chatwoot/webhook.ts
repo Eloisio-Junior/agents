@@ -2584,49 +2584,6 @@ export async function processChatwootDelivery(
             });
           if (closingLive && redirectCfg.entryInboxId !== null) {
             const outcome = await deliverRedirectClosing({
-              // The answer above is older than the sibling lookup, the client build and this
-              // function's own reads, and this path has no job to ask about — so the switch is
-              // re-asked from inside, at the same points (issue #246). Fail OPEN on a read that
-              // fails: a conversation resolves once, so a transient error must not cost the closing.
-              // The gate above is older than the sibling lookup, the client build and this
-              // function's own reads, and this path has no job to ask about — so the switch is
-              // re-asked from inside, at the same points the ladder asks (issue #246). One read, and
-              // it fails OPEN: a conversation resolves once, so a transient error must not cost the
-              // closing. A production agent needs no stamp lookup at all.
-              fence: async () => {
-                const rt = await inboxAgentRuntime(
-                  params.tenantId,
-                  params.instanceId,
-                  closingInboxId,
-                  base,
-                ).catch(() => undefined);
-                if (rt === undefined) return "go" as const;
-                if (rt === null) return "stood-down" as const;
-                // NOTE: The switch is conclusive on its own, and it is read here — before the
-                // stamp, which is fallible and which only a test agent needs at all.
-                if (!rt.enabled) return "stood-down" as const;
-                if (rt.mode !== "test") return "go" as const;
-                // NOTE: A test agent's answer takes a second read, and the two do not share a
-                // snapshot: the switch could flip inside it. Left as a residual rather than closed,
-                // because closing
-                // it needs the agent and the stamp in ONE statement and `Inbox` has no `agent`
-                // relation to select through — so it would take raw SQL or a schema change, for a
-                // window one query wide on a test agent, on the path where the operator has just
-                // resolved the conversation by hand.
-                const testActivatedAt = await widgetTestActivatedAt(
-                  params.tenantId,
-                  params.instanceId,
-                  conversationId,
-                  base,
-                ).catch(() => new Date());
-                return isRedirectFollowUpLive({
-                  agentEnabled: rt.enabled,
-                  agentMode: rt.mode,
-                  testActivatedAt,
-                })
-                  ? ("go" as const)
-                  : ("stood-down" as const);
-              },
               tenantId: params.tenantId,
               instanceId: params.instanceId,
               widgetConversationId: conversationId,

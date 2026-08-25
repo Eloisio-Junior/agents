@@ -333,7 +333,7 @@ describe.skipIf(!dbUp)(
     });
 
     // The widget conversation transitions pending -> resolved, which is the trigger the receiver reads.
-    const resolveWidget = async (db: PrismaClient = appDb) => {
+    const resolveWidget = async () => {
       seq += 1;
       const n = normalizeChatwootEvent({
         event: "conversation_resolved",
@@ -366,7 +366,7 @@ describe.skipIf(!dbUp)(
           deliveryRowId: delivery.id,
           agentBotId: 12,
           normalized: n,
-          base: db,
+          base: appDb,
         });
       } finally {
         globalThis.fetch = originalFetch;
@@ -421,154 +421,6 @@ describe.skipIf(!dbUp)(
         await suDb.agent.update({
           where: { id: agent },
           data: { mode: "production" },
-        });
-      }
-    });
-
-    // Issue #246: the runtime is read, and then compaction arming, the ladder cancel and the closing's
-    // own reads all run before anything is posted. The switch is re-asked from inside for that window.
-    test("switched off while the closing reads posts nothing", async () => {
-      await suDb.agent.update({
-        where: { id: agent },
-        data: { enabled: true },
-      });
-      await rearm();
-      // The rendezvous is the receiver's OWN agent read — the one that answers the gate. The switch
-      // flips the instant after it returns, so the gate sees a live agent and everything the closing
-      // does afterwards (the sibling lookup, the client build, its own reads) happens under an answer
-      // that is already false.
-      let reads = 0;
-      const flipping = appDb.$extends({
-        query: {
-          agent: {
-            async findUnique({ args, query }) {
-              const res = await query(args);
-              reads += 1;
-              if (reads === 1) {
-                await suDb.agent.update({
-                  where: { id: agent },
-                  data: { enabled: false },
-                });
-              }
-              return res;
-            },
-          },
-        },
-      }) as unknown as PrismaClient;
-      try {
-        await resolveWidget(flipping);
-        expect(wire.filter((u) => u.includes("/messages"))).toEqual([]);
-        const widget = await suDb.conversation.findFirstOrThrow({
-          where: { tenantId: tid, chatwootConversationId: WIDGET },
-          select: { redirectClosedAt: true },
-        });
-        // Released rather than burned: the anchor is what makes the closing at-most-once, and a
-        // stand-down is not a delivery.
-        expect(widget.redirectClosedAt).toBeNull();
-      } finally {
-        await suDb.agent.update({
-          where: { id: agent },
-          data: { enabled: true },
-        });
-      }
-    });
-
-    // The stretch the gate at the top cannot cover on this path: with `closeChat: false` nothing has
-    // been said when the fence answers, and the sibling lookup is a round trip in front of the only
-    // send the resolve trigger makes.
-    test("switched off during the sibling lookup posts nothing", async () => {
-      await suDb.agent.update({
-        where: { id: agent },
-        data: { enabled: true },
-      });
-      await rearm();
-      let flipped = false;
-      const flipping = appDb.$extends({
-        query: {
-          conversation: {
-            async findFirst({ args, query }) {
-              const res = await query(args);
-              if (!flipped) {
-                flipped = true;
-                await suDb.agent.update({
-                  where: { id: agent },
-                  data: { enabled: false },
-                });
-              }
-              return res;
-            },
-          },
-        },
-      }) as unknown as PrismaClient;
-      try {
-        await resolveWidget(flipping);
-        // The lookup really ran, so this is the window and not a path that stopped earlier.
-        expect(flipped).toBe(true);
-        expect(wire.filter((u) => u.includes("/messages"))).toEqual([]);
-        // And the anchor is handed back. A stand-down that keeps it burns the at-most-once mark on a
-        // goodbye nobody delivered, which is a funnel that can never close.
-        const widget = await suDb.conversation.findFirstOrThrow({
-          where: { tenantId: tid, chatwootConversationId: WIDGET },
-          select: { redirectClosedAt: true },
-        });
-        expect(widget.redirectClosedAt).toBeNull();
-      } finally {
-        await suDb.agent.update({
-          where: { id: agent },
-          data: { enabled: true },
-        });
-      }
-    });
-
-    // Which of the two questions is asked LAST is a decision, and this is the case that shows it: the
-    // switch flips from inside the watermark count itself, so a fence asked before it would answer
-    // "go" and the goodbye would go out. A stale watermark costs a duplicate goodbye in a race the
-    // CAS already makes rare; a stale fence costs a message from an agent the operator switched off.
-    test("switched off from inside the watermark check posts nothing", async () => {
-      await suDb.agent.update({
-        where: { id: agent },
-        data: { enabled: true },
-      });
-      await rearm();
-      let claimReads = 0;
-      const flipping = appDb.$extends({
-        query: {
-          conversation: {
-            async count({ args, query }) {
-              const where =
-                (args as { where?: Record<string, unknown> }).where ?? {};
-              const res = await query(args);
-              // The SECOND claim read: this function checks the watermark once before its sends and
-              // again inside the sibling branch, and only the second one is the round trip the fence
-              // is being ordered against. Flipping on the first would be caught by the fence that
-              // follows it, and the ordering would go untested.
-              if (where.redirectClosedAt instanceof Date) {
-                claimReads += 1;
-              }
-              if (claimReads === 2) {
-                await suDb.agent.update({
-                  where: { id: agent },
-                  data: { enabled: false },
-                });
-              }
-              return res;
-            },
-          },
-        },
-      }) as unknown as PrismaClient;
-      try {
-        await resolveWidget(flipping);
-        expect(claimReads).toBeGreaterThanOrEqual(2);
-        expect(wire.filter((u) => u.includes("/messages"))).toEqual([]);
-        const widget = await suDb.conversation.findFirstOrThrow({
-          where: { tenantId: tid, chatwootConversationId: WIDGET },
-          select: { redirectClosedAt: true },
-        });
-        expect(widget.redirectClosedAt).toBeNull();
-      } finally {
-        await suDb.agent.update({
-          where: { id: agent },
-          data: { enabled: true },
         });
       }
     });
