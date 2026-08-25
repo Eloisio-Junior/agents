@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
+  dropRejectedSelection,
   getActiveTenantId,
   reconcileActiveTenantId,
   setActiveTenantId,
@@ -63,5 +64,39 @@ describe("reconcileActiveTenantId", () => {
       cleared: false,
     });
     expect(getActiveTenantId()).toBe("3");
+  });
+});
+
+// The other end of the same question. `reconcileActiveTenantId` asks it at page load, against the
+// authoritative list; this one is asked by a single refused REQUEST, mid-session, and is the only
+// path that reaches the tenant deleted from another tab, deleted over MCP, or gone because the
+// console was pointed at a different database. Issue #252.
+describe("dropRejectedSelection", () => {
+  beforeEach(() => {
+    setActiveTenantId(null);
+  });
+
+  test("the selection the server refused is the selection it drops", () => {
+    setActiveTenantId("9");
+    expect(dropRejectedSelection("9")).toBe(true);
+    expect(getActiveTenantId()).toBeNull();
+  });
+
+  test("a refusal naming another id leaves the selection alone", () => {
+    // The request went out under the old selection and was refused after the operator switched, so
+    // the newer choice is not this answer's to discard — the same reason the reconciliation reads
+    // storage at call time rather than capturing it when the request left.
+    setActiveTenantId("3");
+    expect(dropRejectedSelection("9")).toBe(false);
+    expect(getActiveTenantId()).toBe("3");
+  });
+
+  test("nothing stored is still ours, because localStorage is shared across tabs", () => {
+    // The multi-tab case, and the reason this is not "did I have something to clear". Two tabs are
+    // open on the same tenant; the first to be refused clears the shared key. Reading null here as
+    // "someone else dealt with it" is what would leave the second tab on screen, rendered against a
+    // tenant that is gone and sending no selector at all.
+    expect(dropRejectedSelection("9")).toBe(true);
+    expect(getActiveTenantId()).toBeNull();
   });
 });

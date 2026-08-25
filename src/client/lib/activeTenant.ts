@@ -54,3 +54,27 @@ export function reconcileActiveTenantId(tenantIds: string[]): {
   setActiveTenantId(null);
   return { activeId: null, cleared: true };
 }
+
+// The same question `reconcileActiveTenantId` asks at page load, asked by a single REFUSED REQUEST.
+//
+// The list-based reconciliation only runs on mount, so everything that kills a tenant mid-session is
+// invisible to it: deleted from another tab or by another operator, `tenant_delete` over MCP, the
+// console pointed at a different database. This path finds out on the next request instead of on the
+// next page load, from the id the boundary names (REJECTED_TENANT_SELECTOR_HEADER).
+//
+// Answers whether the refusal is about the selection THIS window is running under. A DIFFERENT id is
+// not: the request went out under the old selection and came back after the operator had already
+// switched to a live tenant, and that newer choice is not this answer's to discard — the same reason
+// the reconciliation reads storage at call time rather than capturing it.
+//
+// Nothing stored still counts as ours, and that case is the multi-tab one: localStorage is shared
+// across tabs, so another tab may have cleared it while this one was still rendered against that
+// tenant and still sending it. Reading null as "someone else handled it" is what would leave that tab
+// on screen, sending no selector at all. What keeps the reload to one per window is
+// src/client/lib/tenantSelectorRecovery.ts, which is window state and not this.
+export function dropRejectedSelection(rejectedId: string): boolean {
+  const active = getActiveTenantId();
+  if (active !== null && active !== rejectedId) return false;
+  setActiveTenantId(null);
+  return true;
+}
