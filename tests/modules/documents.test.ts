@@ -739,6 +739,22 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     ).rejects.toThrow();
   });
 
+  // The company profile is a form of several inputs, and the refusal knows which one it read: the
+  // loop that finds the unprintable character is iterating the patch by key. Without the key on the
+  // wire the operator is told a character cannot be printed and left to find where they typed it.
+  test("an unprintable company field names the input it was read from", async () => {
+    const refused = await updateCompanySettings(
+      ctx(tenantA),
+      { document: "12.345.678/0001-90 \u2603" },
+      appDb,
+    ).then(
+      () => null,
+      (e: unknown) => e as AppError,
+    );
+    expect(refused?.field).toBe("document");
+    expect(refused?.statusCode).toBe(400);
+  });
+
   // The letterhead is read at issue time and frozen into the snapshot, so a profile edited later
   // does not rewrite documents already sent.
   test("freezes the company profile into the issued document", async () => {
@@ -1056,6 +1072,98 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
       appDb,
     );
     expect(pdfHeader(bytes)).toBe("%PDF-");
+  });
+
+  // WHO CHOSE THE SLUG decides which input the refusal is about, and getting it wrong sends the
+  // operator to change something that cannot clear the clash: a slug they typed themselves stays
+  // exactly where it is no matter what they rename the template to. Issue #231.
+  test("a taken slug names the slug when it was typed, and the name when it was derived", async () => {
+    const starter = documentStarter("receipt", "pt-BR");
+    if (!starter) throw new Error("no starter");
+    const body = {
+      blocks: starter.blocks,
+      fields: starter.fields,
+      style: starter.style,
+    };
+    await createDocumentTemplate(
+      ctx(tenantA),
+      { name: "Contrato de servico", slug: "contrato_de_servico", ...body },
+      appDb,
+    );
+    const typed = await createDocumentTemplate(
+      ctx(tenantA),
+      {
+        name: "Nome completamente outro",
+        slug: "contrato_de_servico",
+        ...body,
+      },
+      appDb,
+    ).then(
+      () => null,
+      (e: unknown) => e as AppError,
+    );
+    // No slug in the write at all: the name is the only thing this caller ever chose, and it is what
+    // the derivation turned into the clashing slug.
+    const derived = await createDocumentTemplate(
+      ctx(tenantA),
+      { name: "Contrato de serviço", ...body },
+      appDb,
+    ).then(
+      () => null,
+      (e: unknown) => e as AppError,
+    );
+    expect(typed?.field).toBe("slug");
+    expect(derived?.field).toBe("name");
+    // The sentence is the same one in both, and it is the one that was already there.
+    expect(typed?.translationKey).toBe("errors.documentTemplateNameCollides");
+    expect(derived?.translationKey).toBe("errors.documentTemplateNameCollides");
+  });
+
+  // Which INPUT a refusal is about cannot depend on the HTTP method that carried the write. The
+  // patch path had a hand-written copy of the create path's refusal (same sentence, same key) that
+  // named no field, so the console would have had somewhere to put the message on create and nowhere
+  // on rename. Issue #231.
+  test("a bad slug names the same input whether it was created or renamed", async () => {
+    const starter = documentStarter("receipt", "pt-BR");
+    if (!starter) throw new Error("no starter");
+    const bad = "2026_orcamento";
+    const created = await createDocumentTemplate(
+      ctx(tenantA),
+      {
+        name: "Recibo com slug ruim",
+        slug: "recibo_slug_ruim",
+        blocks: starter.blocks,
+        fields: starter.fields,
+        style: starter.style,
+      },
+      appDb,
+    );
+    const onCreate = await createDocumentTemplate(
+      ctx(tenantA),
+      {
+        name: "Outro",
+        slug: bad,
+        blocks: starter.blocks,
+        fields: starter.fields,
+        style: starter.style,
+      },
+      appDb,
+    ).then(
+      () => null,
+      (e: unknown) => e as AppError,
+    );
+    const onRename = await updateDocumentTemplate(
+      ctx(tenantA),
+      BigInt(created.id),
+      { slug: bad },
+      appDb,
+    ).then(
+      () => null,
+      (e: unknown) => e as AppError,
+    );
+    expect(onCreate?.field).toBe("slug");
+    expect(onRename?.field).toBe("slug");
+    expect(onRename?.translationKey).toBe(onCreate?.translationKey);
   });
 
   // Creation already answers a taken slug with a conflict; an update raising the same constraint has

@@ -66,6 +66,11 @@ interface Refusal {
   message: string;
   key: string;
   params: Record<string, string>;
+  // Which of the two inputs the operator has to go and change. This module already decided it before
+  // the wire could carry it: `conflictTarget` reads which index fired, and `slugRefusal` re-points a
+  // derived-slug problem at the NAME because that is the only field the caller ever saw. Required so
+  // a refusal added later has to answer the same question. See src/api/lib/refusal.ts.
+  field: "name" | "slug";
 }
 
 // The two unique constraints this table carries, asked as one question. Separate rows can hold them
@@ -101,6 +106,21 @@ async function existingClash(
   return { byName: byName ?? undefined, bySlug: bySlug ?? undefined };
 }
 
+// The one way a Refusal becomes a thrown error. It exists because the field was the FOURTH thing a
+// throw site had to remember to carry, and the round that added it found a hand-written copy of
+// `slugRefusal`'s explicit branch on the patch path (same message, same key, no field), which had
+// made the wire contract depend on the HTTP method. One converter, and the producer is the only
+// place that decides.
+function refuse(refusal: Refusal, statusCode: number): never {
+  throw new AppError(
+    refusal.message,
+    statusCode,
+    refusal.key,
+    refusal.params,
+    refusal.field,
+  );
+}
+
 // `nameTaken`'s same-name branch, lifted out so it can be produced without a slug to interpolate.
 // The one clash reachable with no slug in play is this one: `existingClash` matches the name
 // exactly, so the row it finds is always holding precisely this name.
@@ -109,13 +129,19 @@ function nameAlreadyUsed(name: string): Refusal {
     message: `you already have a document template called "${name}"`,
     key: "errors.documentTemplateNameTaken",
     params: { name },
+    field: "name",
   };
 }
 
+// `slugExplicit` is what decides WHICH input the refusal is about, and it is not cosmetic: a caller
+// who typed the slug cannot clear a slug clash by renaming, so a refusal that points at the name
+// sends them to change something that will not help. A DERIVED slug is the opposite case: the caller
+// never saw a slug, and the name is the only thing they can change.
 function nameTaken(
   existingName: string,
   name: string | undefined,
   slug: string,
+  slugExplicit: boolean,
 ): Refusal {
   const tool = documentToolName(slug);
   if (name === undefined) {
@@ -123,17 +149,21 @@ function nameTaken(
       message: `the slug "${slug}" is already taken by the template "${existingName}"`,
       key: "errors.documentTemplateSlugTaken",
       params: {},
+      field: "slug",
     };
   }
   // Same name, or merely the same normalisation ("Orçamento" vs "Orcamento"). The second is the one
   // that would otherwise read as a false refusal, so its message names both templates.
-  return existingName === name
-    ? nameAlreadyUsed(name)
-    : {
-        message: `"${name}" collides with the template "${existingName}": both produce the tool name ${tool}`,
-        key: "errors.documentTemplateNameCollides",
-        params: { name, existing: existingName, tool },
-      };
+  if (existingName === name) return nameAlreadyUsed(name);
+  return {
+    // NOTE: the SENTENCE stays the tool-name explanation in both cases, because the tool name is what is
+    // actually in the way and #208 chose that wording for an authoring client on purpose. Only the
+    // input it is attached to depends on who chose the slug.
+    message: `"${name}" collides with the template "${existingName}": both produce the tool name ${tool}`,
+    key: "errors.documentTemplateNameCollides",
+    params: { name, existing: existingName, tool },
+    field: slugExplicit ? "slug" : "name",
+  };
 }
 
 // The same constraint arriving from the database instead of the pre-check, which is the concurrent
@@ -151,7 +181,11 @@ function conflictTarget(e: unknown): "name" | "slug" {
 
 // The unique indexes deciding what the pre-check could not: the concurrent case, and every write
 // that does not pass through the console (MCP, an imported bundle).
-function writeConflict(slug: string, name?: string): (e: unknown) => never {
+function writeConflict(
+  slug: string,
+  name: string | undefined,
+  slugExplicit: boolean,
+): (e: unknown) => never {
   return (e: unknown) => {
     if (e instanceof Error && (e as { code?: string }).code === "P2002") {
       if (name !== undefined && conflictTarget(e) === "name") {
@@ -160,12 +194,14 @@ function writeConflict(slug: string, name?: string): (e: unknown) => never {
           409,
           "errors.documentTemplateNameTaken",
           { name },
+          "name",
         );
       }
       if (name === undefined) {
         throw new ConflictError(
           `a document template with the slug "${slug}" already exists`,
           "errors.documentTemplateSlugTaken",
+          "slug",
         );
       }
       throw new AppError(
@@ -173,6 +209,7 @@ function writeConflict(slug: string, name?: string): (e: unknown) => never {
         409,
         "errors.documentTemplateNameCollidesUnknown",
         { tool: documentToolName(slug) },
+        slugExplicit ? "slug" : "name",
       );
     }
     throw e;
@@ -194,6 +231,7 @@ function slugRefusal(
       message: `slug: ${problem}.`,
       key: "errors.invalidDocumentSlug",
       params: {},
+      field: "slug",
     };
   }
   // The only rule a DERIVED slug can still break: the derivation guarantees the shape and the
@@ -203,6 +241,7 @@ function slugRefusal(
     message: `"${name}" would produce the tool ${documentToolName(slug)}, which is already a built-in. Pick another name.`,
     key: "errors.documentNameIsBuiltinTool",
     params: { name, tool: documentToolName(slug) },
+    field: "name",
   };
 }
 
@@ -258,7 +297,7 @@ export async function documentTemplateWriteProblem(
   // never returns `byName` without one.
   if (clash.byName && name !== undefined) return nameAlreadyUsed(name).message;
   return clash.bySlug && slug !== undefined
-    ? nameTaken(clash.bySlug.name, name, slug).message
+    ? nameTaken(clash.bySlug.name, name, slug, input.slug !== undefined).message
     : null;
 }
 
@@ -553,7 +592,7 @@ export async function createDocumentTemplate(
   const problem = slugProblem(slug);
   if (problem) {
     const refusal = slugRefusal(problem, name, !derived, slug);
-    throw new AppError(refusal.message, 400, refusal.key, refusal.params);
+    refuse(refusal, 400);
   }
   // Asked BEFORE the insert, so the refusal can name the template that is in the way. The unique
   // index is still the authority — it is what catches two creates racing — but all it can say is
@@ -562,13 +601,13 @@ export async function createDocumentTemplate(
   const clash = await existingClash(ctx, base, slug, name);
   const holder = clash.byName ?? clash.bySlug;
   if (holder) {
-    const refusal = nameTaken(holder.name, name, slug);
-    throw new AppError(refusal.message, 409, refusal.key, refusal.params);
+    const refusal = nameTaken(holder.name, name, slug, !derived);
+    refuse(refusal, 409);
   }
   const row = await runScopedOn(base, ctx, (db) =>
     db.documentTemplate
       .create({ data: { ...data, slug }, select: SELECT })
-      .catch(writeConflict(slug, name)),
+      .catch(writeConflict(slug, name, !derived)),
   );
   return toDto(row);
 }
@@ -777,11 +816,9 @@ async function patched(
   if (patch.slug !== undefined) {
     const problem = slugProblem(patch.slug);
     if (problem) {
-      throw new AppError(
-        `slug: ${problem}.`,
-        400,
-        "errors.invalidDocumentSlug",
-      );
+      // NOTE: a patch always writes the slug EXPLICITLY, so this is the producer's explicit branch. Calling
+      // it rather than restating it is what keeps POST and PATCH answering the same refusal.
+      refuse(slugRefusal(problem, undefined, true, patch.slug), 400);
     }
     data.slug = patch.slug;
   }
@@ -847,12 +884,15 @@ async function patched(
       select: { name: true },
     });
     if (taken) {
-      const refusal = nameTaken(
-        taken.name,
-        data.name,
-        patch.slug ?? current.slug,
+      refuse(
+        nameTaken(
+          taken.name,
+          data.name,
+          patch.slug ?? current.slug,
+          patch.slug !== undefined,
+        ),
+        409,
       );
-      throw new AppError(refusal.message, 409, refusal.key, refusal.params);
     }
   }
   return (
@@ -864,6 +904,7 @@ async function patched(
         writeConflict(
           patch.slug ?? current.slug,
           typeof data.name === "string" ? data.name : undefined,
+          patch.slug !== undefined,
         ),
       )
   );
