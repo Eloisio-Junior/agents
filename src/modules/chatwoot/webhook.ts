@@ -85,6 +85,7 @@ import {
 } from "@/modules/debounce/service";
 import { advanceHandledWatermark } from "@/modules/debounce/watermark";
 import { emitFlowEvent } from "@/modules/flowlog/service";
+import { emitUnroutedMessage } from "@/modules/flowlog/unrouted";
 import { armCompaction } from "@/modules/memory/compact";
 import { clearContactMemory } from "@/modules/memory/reset";
 import { readMemoryConfig } from "@/modules/memory/settings";
@@ -3128,6 +3129,26 @@ export async function processChatwootDelivery(
             outcome,
             mirror.applied ? "applied" : "skipped",
           );
+          // NOTE: The turn had nowhere to go: no agent is bound to this inbox (issue #318). One line
+          // per customer message that nothing will answer — `runAgentTurn` only reaches this outcome
+          // for a new incoming message with text — which is the same unit as the gate's line below.
+          //
+          // The outcome is the WHOLE condition on purpose. `no-agent` used to also cover a binding
+          // that exists and could not load (a switched-off agent, which is deliberate and gets no
+          // line), and this branch first excluded that by re-reading the binding here. Re-reading is
+          // what the second reading cost: the turn runs gates, mirroring and media in between, so a
+          // rebind landing inside it answered about a different moment. `runAgentTurn` now
+          // classifies the two from the same scoped read that decides them, and `agent-unavailable`
+          // is the one this line stays silent about.
+          if (outcome === "no-agent" && mirror.conversationRowId !== null) {
+            emitUnroutedMessage({
+              tenantId: params.tenantId,
+              conversationRowId: mirror.conversationRowId,
+              inboxRowId: mirror.inboxRowId,
+              chatwootInboxId: n.inboxId,
+              base,
+            });
+          }
           // Recovered: a successful answer clears any previously surfaced turn error (item 6).
           if (outcome === "posted" && n.conversationId !== null) {
             await clearConversationError({
