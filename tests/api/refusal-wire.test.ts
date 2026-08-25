@@ -1,4 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { NotFoundError as ElysiaNotFoundError } from "elysia";
+import logger from "@/api/lib/logger";
 import { errors } from "@/api/lib/openapi";
 import { REJECTED_TENANT_SELECTOR_HEADER } from "@/lib/console-params";
 import {
@@ -45,14 +47,6 @@ app.get("/__refusal/ambient-tenant", () => {
 app.get("/__refusal/named-tenant", () => {
   throw new NotFoundError("Tenant not found", "errors.tenantNotFound");
 });
-// NOTE: Elysia freezes its route table on the first request it serves, and the app is a singleton
-// several test files import. A route registered after some OTHER file has already called `handle`
-// is silently dropped and answers the SPA catch-all instead, so the tests below passed or failed on
-// file ordering. Measured: two files that each register a route and hit it, run together, and the
-// one that registered second answered 200 `{}`. `compile()` rebuilds the table, and it has to stay
-// below the LAST route this file registers.
-app.compile();
-
 const refusal = async (
   path: string,
   lang: string,
@@ -156,5 +150,270 @@ describe("a 404 about the tenant selector the session is carrying", () => {
     expect(status).toBe(404);
     expect(rejected).toBeNull();
     expect(body).toEqual({ error: "Tenant not found" });
+  });
+});
+
+// ── issue #263 ───────────────────────────────────────────────────────────────────────────────────
+// The other half of what this app puts on the wire when something goes wrong. The refusals above are
+// the ones it MEANS to answer; these are the ones it did not plan for.
+//
+// `src/app.ts` redacts a 500 to "Something went wrong" outside development, but only in the
+// `INTERNAL_SERVER_ERROR` arm — and an unhandled error does not arrive with that code. It arrives as
+// `UNKNOWN`, falls through `default:`, and Elysia's built-in handler answers with the error's own
+// text, so whatever the message happened to carry went to the client.
+//
+// These live in THIS file rather than their own, and that is not filing convenience. A second test
+// file that drives the exported app singleton makes the routes registered above stop matching (they
+// answer 200 from the SPA catch-all instead of the refusal), reproducible with a six-line file and
+// not avoided by registering in `beforeAll`. Until that is understood, one file owns this app.
+
+// Stands in for anything an unhandled error's message can carry: a connection string, a query
+// fragment, a filesystem path, a third-party SDK payload. The assertions look for THIS, so they fail
+// on the disclosure itself rather than on a particular phrasing of the refusal.
+const SECRET = "postgres://user:hunter2@db.internal:5432/agents";
+
+app.get("/__unhandled/sync", () => {
+  throw new Error(`connection failed: ${SECRET}`);
+});
+app.get("/__unhandled/async", async () => {
+  await Promise.resolve();
+  throw new TypeError(`connection failed: ${SECRET}`);
+});
+app.get("/__unhandled/nonerror", () => {
+  throw `connection failed: ${SECRET}`;
+});
+// The shapes a two-name list walked past: the thrown value already carries a `code`, and Elysia
+// hands THAT to the handler instead of UNKNOWN. These are the errors whose message actually holds
+// something — a query fragment, a filesystem path.
+app.get("/__unhandled/prisma", () => {
+  throw Object.assign(new Error(`connection failed: ${SECRET}`), {
+    code: "P2025",
+  });
+});
+app.get("/__unhandled/fs", () => {
+  throw Object.assign(new Error(`connection failed: ${SECRET}`), {
+    code: "EACCES",
+  });
+});
+// The NUMERIC half of the same hole: Elysia copies these into `code` too, and a rule that read a
+// numeric code as "a status the handler chose" passed both straight through.
+app.get("/__unhandled/domexception", () => {
+  throw new DOMException(`connection failed: ${SECRET}`, "DataCloneError");
+});
+app.get("/__unhandled/numericcode", () => {
+  throw Object.assign(new Error(`connection failed: ${SECRET}`), { code: 23 });
+});
+// Not a throw at all: the handler returns fine and the FAILURE happens while the response is
+// serialized. This is the shape that surfaced the bug (issue #253), and the one that answered with
+// the error's class name rather than a bare message.
+app.get("/__unhandled/serialize", () => ({ id: 1n }));
+// An unhandled error that carries its OWN `status`. Elysia seeds `set.status` from that property
+// before this handler runs, and the access log reads `set.status`, not the Response's — so the two
+// disagree unless the arm syncs it.
+app.get("/__logged/carries-status", () => {
+  throw Object.assign(new Error(`connection failed: ${SECRET}`), {
+    status: 401,
+  });
+});
+// Not this PR's arm, but the same invariant, found by sweeping for it: the BigInt guard answers a
+// raw 400 and was logging 500.
+// An unhandled failure that CALLS ITSELF one of Elysia's refusals. Elysia forwards the thrown
+// value's own `code`, so each of these used to be routed by the branch that reads `code` — the
+// VALIDATION one was answered 422 in the app's schema vocabulary and the NOT_FOUND one 404, neither
+// of which is what they are.
+const IMPOSTOR = [
+  "VALIDATION",
+  "NOT_FOUND",
+  "PARSE",
+  "INVALID_COOKIE_SIGNATURE",
+  "INVALID_FILE_TYPE",
+  "INTERNAL_SERVER_ERROR",
+] as const;
+for (const code of IMPOSTOR) {
+  app.get(`/__impostor/${code}`, () => {
+    throw Object.assign(new Error(`connection failed: ${SECRET}`), { code });
+  });
+}
+// The genuine article, to prove the guard tells them apart rather than just answering 500 to
+// everything: this one MUST keep its 404.
+app.get("/__real/notfound", () => {
+  // NOTE: Elysia's, aliased — this file already imports the APP's NotFoundError for the #252 block,
+  // and that one is an AppError answered by an entirely different arm.
+  throw new ElysiaNotFoundError();
+});
+// A genuine NotFoundError carrying a `status` of its own. Elysia seeds `set.status` from that
+// property, so this is the 404 arm's version of the `status: 401` case below: the wire says 404 and
+// the access log says 418 unless that arm syncs `set.status` too.
+app.get("/__real/notfound-status", () => {
+  throw Object.assign(new ElysiaNotFoundError(), { status: 418 });
+});
+app.get("/__logged/bigint", () => {
+  throw new SyntaxError("Cannot convert 9007199254740993x to a BigInt");
+});
+
+const UNHANDLED = [
+  "sync",
+  "async",
+  "nonerror",
+  "serialize",
+  "prisma",
+  "fs",
+  "domexception",
+  "numericcode",
+] as const;
+
+const unhandled = async (
+  shape: string,
+): Promise<{ status: number; body: string }> => {
+  const res = await app.handle(
+    new Request(`http://localhost/__unhandled/${shape}`),
+  );
+  return { status: res.status, body: await res.text() };
+};
+
+describe("an unhandled error, whatever shape it arrives in", () => {
+  test.each([...UNHANDLED])("%s still answers 500", async (shape) => {
+    expect((await unhandled(shape)).status).toBe(500);
+  });
+
+  // The finding itself.
+  test.each([...UNHANDLED])("%s does not leak the message", async (shape) => {
+    const { body } = await unhandled(shape);
+    expect(body).not.toContain(SECRET);
+    expect(body).not.toContain("connection failed");
+  });
+
+  // Asserted positively, not as another "does not contain": the serialize shape answered
+  // `{"name":"TypeError","message":…}`, so a body carrying no secret can still name the class that
+  // failed. Pinning the whole body rules both out at once.
+  test.each([...UNHANDLED])(
+    "%s answers the redaction, nothing else",
+    async (shape) => {
+      expect((await unhandled(shape)).body).toBe("Something went wrong");
+    },
+  );
+});
+
+// The complement, and the reason the arm lists UNKNOWN and stops there. Both of these are rejected
+// before the handler and already have a specific, correct answer; folding them into the 500 arm
+// replaces a usable refusal with "Something went wrong". Measured while mutation-testing the fix:
+// adding either code to the arm changed nothing any test could see, which is what a guard with no
+// coverage looks like.
+// A status the handler CHOSE has to survive the redaction, or the guard would swallow deliberate
+// answers along with the accidents. This is the one member of the pass-through list that is not a
+// refusal Elysia raised on the caller's behalf, so it is asserted rather than assumed.
+app.get("/__chosen/teapot", ({ status }) => status(418, "deliberate"));
+
+// NOTE: Elysia freezes its route table on the first request it serves, and the app is a singleton
+// several test files import. A route registered after some OTHER file has already called `handle`
+// is silently dropped and answers the SPA catch-all instead, so the tests here passed or failed on
+// file ordering. Measured: two files that each register a route and hit it, run together, and the
+// one that registered second answered 200 `{}`. `compile()` rebuilds the table, and it has to stay
+// below the LAST route this file registers.
+//
+// Moved down here when the #263 block arrived below it. Measured with it left in place: every route
+// registered after it was missing, and 19 of this file's tests failed running the file ALONE. The
+// note above already said "below the LAST route"; the call simply stopped being there.
+
+// Telling a refusal from something wearing its name. The table in tests/api/lib/unhandled-error
+// .test.ts states that an error calling itself VALIDATION is an unhandled failure; these assert the
+// app actually routes it that way, which is a different claim and the one that was false — every
+// branch that read `code` answered the impostor as though it were the real thing.
+describe("an error that calls itself a framework refusal", () => {
+  test.each([...IMPOSTOR])(
+    "code %s is still an unhandled failure",
+    async (code) => {
+      const res = await app.handle(
+        new Request(`http://localhost/__impostor/${code}`),
+      );
+      const body = await res.text();
+      expect(res.status).toBe(500);
+      expect(body).toBe("Something went wrong");
+      expect(body).not.toContain(SECRET);
+    },
+  );
+
+  test("while the real NotFoundError keeps its 404", async () => {
+    const res = await app.handle(
+      new Request("http://localhost/__real/notfound"),
+    );
+    expect(res.status).toBe(404);
+    expect(await res.text()).toBe("Not Found");
+  });
+});
+
+app.compile();
+
+describe("a status the handler chose is not an unhandled failure", () => {
+  test("it keeps its own code and body", async () => {
+    const res = await app.handle(
+      new Request("http://localhost/__chosen/teapot"),
+    );
+    expect(res.status).toBe(418);
+    expect(await res.text()).toBe("deliberate");
+  });
+});
+
+describe("a request refused before the handler keeps its own answer", () => {
+  const login = async (body: string): Promise<number> =>
+    (
+      await app.handle(
+        new Request("http://localhost/api/auth/login", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body,
+        }),
+      )
+    ).status;
+
+  test("a body that is not JSON stays 400 (PARSE)", async () => {
+    expect(await login("{ not json at all")).toBe(400);
+  });
+
+  test("a body the schema refuses stays 422 (VALIDATION)", async () => {
+    expect(await login(JSON.stringify({ nope: 1 }))).toBe(422);
+  });
+});
+
+// What the ACCESS LOG says happened, which is a different question from what the client got.
+// `onAfterResponse` logs `set.status`; a raw `Response` alone does not move it. Elysia seeds it from
+// the thrown value's own `status`, so an error carrying `status: 401` is answered 500 and recorded
+// as 401 — the response is right and the log is wrong, which is the worse of the two failures
+// because nothing on the wire shows it.
+describe("the access log records the status actually answered", () => {
+  // `onAfterResponse` runs after `handle` has already resolved, so the line is not there yet when
+  // the await returns. Poll for it and THROW when it never arrives: a bare timeout would let a
+  // missing access log read as `undefined` and turn a real regression into a wording mismatch.
+  const loggedStatusFor = async (path: string): Promise<string> => {
+    const spy = spyOn(logger, "info");
+    try {
+      await (await app.handle(new Request(`http://localhost${path}`))).text();
+      for (let i = 0; i < 100; i++) {
+        const call = spy.mock.calls.findLast((c) => c[0] === "%s %s [%s]");
+        if (call) return String(call[3]);
+        await Bun.sleep(5);
+      }
+      throw new Error(`no access log line for ${path} after 500ms`);
+    } finally {
+      spy.mockRestore();
+    }
+  };
+
+  const wireStatusFor = async (path: string): Promise<number> =>
+    (await app.handle(new Request(`http://localhost${path}`))).status;
+
+  test("an error carrying status: 401 is answered 500 and logged 500", async () => {
+    expect(await wireStatusFor("/__logged/carries-status")).toBe(500);
+    expect(await loggedStatusFor("/__logged/carries-status")).toBe("500");
+  });
+
+  test("the 404 arm logs 404 even when the error carries another status", async () => {
+    expect(await wireStatusFor("/__real/notfound-status")).toBe(404);
+    expect(await loggedStatusFor("/__real/notfound-status")).toBe("404");
+  });
+
+  test("the BigInt guard's raw 400 is logged as 400, not 500", async () => {
+    expect(await wireStatusFor("/__logged/bigint")).toBe(400);
+    expect(await loggedStatusFor("/__logged/bigint")).toBe("400");
   });
 });
