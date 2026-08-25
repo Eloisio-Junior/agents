@@ -6,6 +6,7 @@ import apiEn from "@/api/locales/en.json";
 import apiPt from "@/api/locales/pt-BR.json";
 import clientEn from "@/client/locales/en.json";
 import clientPt from "@/client/locales/pt-BR.json";
+import { expectWaiverLedger } from "@/tests/utils/ledger";
 
 // The guard for what `ErrorTranslationKey` (src/lib/errors.ts) cannot see.
 //
@@ -435,6 +436,15 @@ describe("the error catalog cannot be bypassed", () => {
     const dotted = [...API].filter((k) => k.split(".").length > 2);
     expect(dotted).toEqual([]);
   });
+
+  // The other direction of every waiver rule in this file, and the one none of them had: a ledger is
+  // subtracted from a set DERIVED from the tree, so appending to it both silences a new offender and
+  // satisfies the stale-waiver test. The size is the only fact the tree cannot supply.
+  // tests/utils/ledger.ts carries the measurement (issue #293).
+  test("the cast and legacy-token ledgers may only shrink", () => {
+    expectWaiverLedger("ALLOWED_CASTS", ALLOWED_CASTS, 0);
+    expectWaiverLedger("STORED_LEGACY_TOKENS", STORED_LEGACY_TOKENS, 3);
+  });
 });
 
 describe("both languages answer, and answer differently", () => {
@@ -735,6 +745,38 @@ describe("both languages answer, and answer differently", () => {
       (k) => pt[k] === en[k] && !ALLOWED_UNTRANSLATED.includes(`errors.${k}`),
     );
     expect(untranslated).toEqual([]);
+  });
+
+  // Same rule, same reason as the cast and legacy-token pin above.
+  test("the untranslated, keyless and say-less ledgers may only shrink", () => {
+    expectWaiverLedger("ALLOWED_UNTRANSLATED", ALLOWED_UNTRANSLATED, 0);
+    expectWaiverLedger("KEYLESS_BY_DESIGN", KEYLESS_BY_DESIGN, 1);
+    // NOTE: PER EDITION, and the question is asked of the CATALOG. Both ledgers hold entries
+    // inside `@full-only` blocks, waiving keys the Free extractor prunes, so waiver and key leave
+    // that tree together: two entries from one ledger, one from the other.
+    //
+    // Three cheaper signals were written first and every one of them is wrong somewhere, measured:
+    // `IS_FREE` reads "full" in a derived Free tree, because the env var that flips
+    // `config.edition` is set by the Dockerfile and not by the test runner; reading this file's own
+    // `@full-only` markers reads nothing in PRO, because the derivation strips the marker lines from
+    // both derived trees while keeping the Pro content; and a hand-kept list of the excluded names is
+    // a second waiver ledger, where appending to it and to the ledger balances the count in every
+    // tree. The catalog is not another proxy: these ledgers differ BECAUSE those keys do.
+    //
+    // The key it reads is one of the waived ones on purpose. Renamed or dropped, this reads "free"
+    // in the full tree and the pin goes red there, where someone can see it.
+    const hasProOnlyKeys =
+      "faviconTitle" in (clientEn.branding as Record<string, unknown>);
+    expectWaiverLedger(
+      "CLIENT_IDENTICAL_BY_DESIGN",
+      CLIENT_IDENTICAL_BY_DESIGN,
+      hasProOnlyKeys ? 102 : 100,
+    );
+    expectWaiverLedger(
+      "SAY_LESS_GRANDFATHERED",
+      SAY_LESS_GRANDFATHERED,
+      hasProOnlyKeys ? 26 : 25,
+    );
   });
 });
 
