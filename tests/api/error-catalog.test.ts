@@ -254,11 +254,12 @@ function keysThatSayLess(
 // messages thrown with it. Literal messages only: a message built from a variable cannot be compared
 // to a catalog entry, and the rule is about what the two SAY.
 //
-// THREE SPELLINGS, because a refusal is written three ways here and the rule is about the refusal,
+// FIVE SPELLINGS, because a refusal is written five ways here and the rule is about the refusal,
 // not about the syntax. The class alternation is DERIVED from src/lib/errors.ts rather than spelled
 // out. A hard-coded list goes stale the day someone adds a subclass, and it did: `ConflictError`
 // was missing, so every refusal thrown through it (`chatwootDifferentDeployment` among them) was
-// invisible. The other two spellings were found the same way, one blind spot later:
+// invisible. Every spelling since was found the same way, one blind spot at a time, and each was
+// MEASURED before being added, because a widened reader is only worth what it newly sees:
 //
 //   1. `new AppError("…", 400, "errors.x")`, the direct throw;
 //   2. `super("…", 400, "errors.x")`, a subclass that hard-codes its own refusal. Sees three keys
@@ -268,16 +269,30 @@ function keysThatSayLess(
 //      shape `src/modules/documents/templates.ts` uses so a dry run and an apply can reach the same
 //      answer. This one was hiding a live offender: `invalidDocumentSlug` interpolates the rule the
 //      identifier broke (`slug: ${problem}.`) into a catalog entry that says only "This identifier
-//      is not valid", and issue #291 was written from a list that could not see it.
+//      is not valid", and issue #291 was written from a list that could not see it;
+//   4. `translate("errors.x", "…")` and 5. `translateWithLocale(locale, "errors.x", "…")`, which are
+//      not throws at all: the auth, admin and origin surfaces answer `set.status` plus a body, and
+//      the schema boundary renders its own. Twenty-one keys, and the whole of `features/auth` and
+//      `features/admin`, had never been read by this rule (issue #299).
+//
+// THE KEY COMES FIRST in 4 and 5 and second in 1 to 3, which is why the groups are NAMED. Written
+// positionally, the two orders are one transposition apart, and the transposed version still runs:
+// it reads a message as a key and reports offenders that do not exist.
+//
+// The `translate(` forms are anchored to the CALL and not to adjacency, and that is the whole
+// difference between this reader and a wrong one. Measured while writing it: a bare
+// `"errors.x"\s*,\s*"…"` also matches a key sitting next to its neighbour in an ARRAY of keys
+// (`src/graph/tools/documents.ts` holds one), and it reported `documentNotStored` and
+// `documentRevoked` as offenders whose "message" was the next key in the list.
 async function throwSiteRes(): Promise<RegExp[]> {
   const src = await readFile("src/lib/errors.ts", "utf8");
   const classes = [...src.matchAll(/export class (\w+)/g)].map(
     (m) => m[1] as string,
   );
   expect(classes.length).toBeGreaterThan(5);
-  const MESSAGE = '(`[^`]*`|"(?:[^"\\\\]|\\\\.)*")';
+  const MESSAGE = '(?<msg>`[^`]*`|"(?:[^"\\\\]|\\\\.)*")';
   const STATUS = "(?:\\d+\\s*,\\s*)?";
-  const KEY = '"errors\\.([A-Za-z0-9_]+)"';
+  const KEY = '"errors\\.(?<key>[A-Za-z0-9_]+)"';
   return [
     new RegExp(
       `new (?:${classes.join("|")})\\(\\s*${MESSAGE}\\s*,\\s*${STATUS}${KEY}`,
@@ -285,7 +300,56 @@ async function throwSiteRes(): Promise<RegExp[]> {
     ),
     new RegExp(`super\\(\\s*${MESSAGE}\\s*,\\s*${STATUS}${KEY}`, "gs"),
     new RegExp(`message:\\s*${MESSAGE}\\s*,\\s*key:\\s*${KEY}`, "gs"),
+    new RegExp(`\\btranslate\\(\\s*${KEY}\\s*,\\s*${MESSAGE}`, "gs"),
+    new RegExp(
+      `\\btranslateWithLocale\\(\\s*\\w+\\s*,\\s*${KEY}\\s*,\\s*${MESSAGE}`,
+      "gs",
+    ),
   ];
+}
+
+// THE SIXTH PRODUCER, and the only one that cannot be a regex over the tree: a subclass that
+// hard-codes BOTH its sentence and its key, so neither is written at any call site.
+// `throw new ProEditionError()` names nothing for a sweep to find.
+//
+// The pair is split across two lines of the class — a `message = "…"` default in the constructor
+// signature, the key in the `super(...)` call — so the file is read class by class rather than by
+// one expression, which is also what keeps a default from pairing with the NEXT class's key. That
+// happened while writing this: a single greedy regex reported `ForbiddenError`'s "Forbidden" as the
+// sentence of `errors.proEdition`.
+//
+// Found by review on #304, and by the right question: the `tenantTargetRequired` fix in this same PR
+// moved two refusals ONTO one of these classes, which silenced the rule instead of satisfying it.
+// A producer the reader cannot see is not a producer that agrees.
+async function subclassDefaults(into: Map<string, Set<string>>): Promise<void> {
+  const src = await readFile("src/lib/errors.ts", "utf8");
+  const bodies = src.split(/\nexport class /).slice(1);
+  expect(bodies.length).toBeGreaterThan(5);
+  for (const body of bodies) {
+    const message = body.match(
+      /constructor\([^)]*?message\s*=\s*("(?:[^"\\]|\\.)*")/,
+    )?.[1];
+    const key = body
+      .match(/super\(([^;]*?)\)\s*;/s)?.[1]
+      ?.match(/"errors\.([A-Za-z0-9_]+)"/)?.[1];
+    if (!message || !key) continue;
+    const set = into.get(key) ?? new Set<string>();
+    set.add(message.slice(1, -1));
+    into.set(key, set);
+  }
+}
+
+// Every producer in the tree, in one place: the three tests below asked the same question with the
+// same loop, and a spelling added to one of them and not the others is the shape of blind spot this
+// whole file exists to close.
+async function allSites(): Promise<Map<string, Set<string>>> {
+  const res = await throwSiteRes();
+  const sites = new Map<string, Set<string>>();
+  for (const f of await sourceFiles("src")) {
+    throwSites(await readFile(f, "utf8"), sites, res);
+  }
+  await subclassDefaults(sites);
+  return sites;
 }
 
 function throwSites(
@@ -295,10 +359,11 @@ function throwSites(
 ): void {
   for (const re of res) {
     for (const m of body.matchAll(re)) {
-      const key = m[2] as string;
-      const msg = (m[1] as string).slice(1, -1);
+      // Every reader above names both groups, so a match that is missing one is a broken reader and
+      // not a shape in the tree: let it throw here rather than skip the site quietly.
+      const { key, msg } = m.groups as { key: string; msg: string };
       const set = into.get(key) ?? new Set<string>();
-      set.add(msg);
+      set.add(msg.slice(1, -1));
       into.set(key, set);
     }
   }
@@ -319,6 +384,13 @@ const SAY_LESS_GRANDFATHERED: readonly string[] = [
   "googleOAuthNotConnected",
   "googleOAuthTokenExchangeFailed",
   "imageTooLarge",
+  // The one entry here that did NOT predate the rule: it predated the READER. Widening it to the
+  // `translate(key, "…")` producers (issue #299) put the admin surface's re-auth refusal beside the
+  // four `AppError` ones, and the two spell the same fact differently: "password verification
+  // failed" is the log line, "Incorrect password" is the sentence, and the catalog already answers
+  // both with the second. Two phrasings of one fact is what #292 exists to judge; rewording either
+  // side to satisfy the count would be pretending the rule caught something.
+  "invalidPassword",
   "invalidVaultValue",
   "mcpOAuthDiscoveryFailed",
   "mcpOAuthNotConnected",
@@ -618,16 +690,32 @@ describe("both languages answer, and answer differently", () => {
         'throw new NotFoundError("no status arg", "errors.c");',
         'throw new AppError("second message", 400, "errors.a");',
         'throw new AppError(someVariable, 400, "errors.d");',
-        // The two spellings the reader was blind to. Both are POSITIVE controls: a reader that
-        // stopped matching them would go green here and quietly stop covering a whole family, which
-        // is what it did to `invalidDocumentSlug` for four releases.
+        // The spellings the reader was blind to, each of which cost a release. All POSITIVE
+        // controls: a reader that stopped matching one would go green here and quietly stop
+        // covering a whole family, which is what it did to `invalidDocumentSlug` for four releases.
         'super("from a subclass", 400, "errors.e");',
         'return { message: "built, thrown elsewhere", key: "errors.f", params: {} };',
+        // KEY FIRST in these two, and the message second. The auth and admin surfaces answer with a
+        // body instead of throwing, and the schema boundary renders its own.
+        'return { error: translate("errors.g", "answered, not thrown") };',
+        'error: translateWithLocale(locale, "errors.h", "rendered at the boundary"),',
+        // NEGATIVE, and it is the false positive this reader was measured against: a key sitting
+        // beside its neighbour in an ARRAY of keys is not a key beside its message. Read by
+        // adjacency instead of by call, this line reports `i` as a refusal whose sentence is `j`.
+        'const DOCUMENT_KEYS = ["errors.i", "errors.j"];',
       ].join("\n"),
       into,
       await throwSiteRes(),
     );
-    expect([...into.keys()].sort()).toEqual(["a", "b", "c", "e", "f"]);
+    expect([...into.keys()].sort()).toEqual([
+      "a",
+      "b",
+      "c",
+      "e",
+      "f",
+      "g",
+      "h",
+    ]);
     // The captured MESSAGE, not just the key: what feeds the rule above is whether the message
     // interpolates, so a reader that stripped the `${…}` on the way out would silence it.
     //
@@ -639,6 +727,23 @@ describe("both languages answer, and answer differently", () => {
     expect(into.get("a")?.size).toBe(2);
     // A message built from a variable has nothing to compare, so it is not a site.
     expect(into.has("d")).toBe(false);
+  });
+
+  test("a subclass that hard-codes its own refusal is read from the class", async () => {
+    const into = new Map<string, Set<string>>();
+    await subclassDefaults(into);
+    // The live pairs, which is what makes this a positive control rather than a shape test: a reader
+    // that stopped pairing the default with the key would answer with an empty map and pass any
+    // assertion written about "no bad pairs".
+    expect(into.get("proEdition")).toEqual(
+      new Set(["This feature requires the Pro edition"]),
+    );
+    expect(into.get("tenantTargetRequired")).toEqual(
+      new Set(["A target tenant is required"]),
+    );
+    // A class whose key is a PARAMETER pairs its default with nothing: `new NotFoundError("…")` can
+    // carry any key, so its "Not found" is not the sentence of any one of them.
+    expect(into.has("tenantNotFound")).toBe(false);
   });
 
   // The regression this derivation exists for: a subclass the alternation forgot is a whole family of
@@ -660,26 +765,87 @@ describe("both languages answer, and answer differently", () => {
   });
 
   test("no key answers with less than its call sites already said", async () => {
-    const sites = new Map<string, Set<string>>();
-    const res = await throwSiteRes();
-    for (const f of await sourceFiles("src")) {
-      throwSites(await readFile(f, "utf8"), sites, res);
-    }
     expect(
       keysThatSayLess(
-        sites,
+        await allSites(),
         apiEn.errors as Record<string, string>,
         SAY_LESS_GRANDFATHERED,
       ),
     ).toEqual([]);
   });
 
-  test("the grandfathered list only names keys that still offend", async () => {
-    const sites = new Map<string, Set<string>>();
-    const res = await throwSiteRes();
+  // WHAT THE READER STILL CANNOT SEE, and why each one is allowed to stay invisible.
+  //
+  // A rule that never RUNS on a key is worse than one that runs and waives it: the waiver is a
+  // decision someone wrote down, and the blind spot is a number nobody knows. Issue #291 was drafted
+  // from a list this reader produced while blind to one of its own spellings, so the list was short
+  // by a key and wrong about another. This is the ledger that makes the blind spot a decision.
+  //
+  // NOT subtracted from the sweep, COMPARED to it, which is the difference that keeps it honest and
+  // is why it needs no size pin (issue #293): appending a key that the reader CAN see fails this
+  // test just as loudly as forgetting one it cannot. There is no direction to cheat in.
+  const UNSEEN_BY_THE_READER: readonly string[] = [
+    // NO MESSAGE AT ALL. A map from a reason enum to a key (src/lib/embedding-block.ts). The
+    // sentence is chosen by whoever renders it, so there is nothing here for any reader to compare.
+    "embeddingEmpty",
+    "embeddingNotConfigured",
+    "embeddingPending",
+    // A MESSAGE BUILT FROM A VARIABLE. The reader takes literals only, because a computed string
+    // cannot be compared to a catalog entry. That is right about the comparison and it is NOT a
+    // clean bill of health: a message that varies is exactly what an entry with no placeholder
+    // cannot carry, and four of these drop or contradict the reason that fired. Issue #302 holds
+    // the measurement and the fix; five of the nine already interpolate, which is the same answer
+    // arrived at one key at a time.
+    "invalidBusinessHoursDate",
+    "invalidCompanyField",
+    "invalidDocumentNumberPrefix",
+    "invalidDocumentTemplateDescription",
+    "invalidDocumentTemplateName",
+    "invalidDocumentTemplateReason",
+    "invalidDocumentValues",
+    "invalidIdempotencyKey",
+    "unstorableText",
+    // A third group stood here until review asked the obvious question: a subclass that hard-codes
+    // its own refusal names nothing at the call site, and `errors.proEdition` was waived for it.
+    // "Nothing to read at the call site" is not "nothing to read": the sentence is in the class, and
+    // `subclassDefaults` now reads it there. The group is empty, so it is gone.
+  ];
+
+  test("every key the reader cannot see is named, with the reason it may stay invisible", async () => {
+    const named = new Set<string>();
+    const seen = await allSites();
     for (const f of await sourceFiles("src")) {
-      throwSites(await readFile(f, "utf8"), sites, res);
+      const body = await readFile(f, "utf8");
+      // A ledger comment declares a key, it does not produce one, and it is spelled in single
+      // quotes. Skipping comment lines keeps this honest even if that ever changes.
+      for (const line of body.split("\n")) {
+        if (line.trimStart().startsWith("//")) continue;
+        for (const m of line.matchAll(/"errors\.([A-Za-z0-9_]+)"/g))
+          named.add(m[1] as string);
+      }
     }
+    // Takes anything that can answer "do you have this key": the sweep hands back a Map of
+    // key -> messages, and the blinded control below is an empty Set.
+    const unseenGiven = (visible: { has: (k: string) => boolean }): string[] =>
+      [...named].filter((k) => !visible.has(k)).sort();
+    // NO FLOOR ON EITHER COUNT, and that is the whole lesson of this assertion. The first version
+    // pinned both above 150, which is true on THIS tree and false on the one the public CI runs:
+    // both totals shrink with the edition (166 named / 153 seen here, 161 / 148 in the Free
+    // projection, measured), while the ledger below is the same thirteen in every tree. A sentinel
+    // calibrated against a tree that the derivation reshapes is a red build in the derived repo and
+    // a green one here, which is the shape this file has been bitten by before.
+    //
+    // The comparison guards itself, so it needs no sentinel: a blinded reader reports every named
+    // key as unseen, and that is not this ledger. Proven rather than claimed, because "it would have
+    // failed" is exactly the kind of statement that turns out to be false.
+    expect(unseenGiven(new Set())).not.toEqual(
+      [...UNSEEN_BY_THE_READER].sort(),
+    );
+    expect(unseenGiven(seen)).toEqual([...UNSEEN_BY_THE_READER].sort());
+  });
+
+  test("the grandfathered list only names keys that still offend", async () => {
+    const sites = await allSites();
     const stillOffends = new Set(
       keysThatSayLess(sites, apiEn.errors as Record<string, string>, []),
     );
@@ -789,7 +955,10 @@ describe("both languages answer, and answer differently", () => {
     expectWaiverLedger(
       "SAY_LESS_GRANDFATHERED",
       SAY_LESS_GRANDFATHERED,
-      hasProOnlyKeys ? 14 : 13,
+      // GREW by one, which a ledger pinned to shrink has to explain out loud: a reader that sees
+      // more finds more, and the entry it found is named above with why it is a waiver and not a
+      // fix. This is the only direction of growth that is not an append papering over a defect.
+      hasProOnlyKeys ? 15 : 14,
     );
   });
 });
