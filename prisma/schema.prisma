@@ -493,6 +493,29 @@ model Conversation {
   // proactive (follow-up/nudge) free-form send is only allowed within the window; outside it, an
   // approved template (HSM) is required. NULL = no inbound seen yet.
   lastInboundAt          DateTime? @map("last_inbound_at")
+  // Chatwoot's own first-response SLA, mirrored rather than derived. Chatwoot computes both from
+  // the messages table and ships them on every conversation payload, so the pair answers "how long
+  // did the team take to answer" on an inbox the agent never touched — the one question the
+  // dashboard could not ask, because every other KPI here is derived from LlmUsage.
+  //
+  // Mirrored and not computed, deliberately. A first-response watermark maintained on this side
+  // would be a state machine fed by webhooks, and would have to be right about every ordering they
+  // can arrive in (a retry delivering the reply before the question, a conversation the mirror
+  // first meets mid-dialogue, a /reset). Chatwoot has the messages table and answers from it. Both
+  // values are immutable at the source once set, so a late delivery carries the same numbers as the
+  // one it duplicates and the write is idempotent whatever order it lands in.
+  //
+  // chatwootCreatedAt is the conversation's creation at the SOURCE (never our row's createdAt,
+  // which dates the first webhook we happened to see). chatwootFirstReplyAt is
+  // `first_reply_created_at`: the first message passing Chatwoot's `Message#valid_first_reply?`,
+  // which excludes an AgentBot's reply — so our own answers stay out of a HUMAN response time and
+  // go on being counted through LlmUsage.
+  //
+  // NULL = the payload never carried it: a conversation with no qualifying reply yet, or one no
+  // event has been seen for since these columns existed. The KPI needs both, and reports the size
+  // of its sample beside the median so a partial backfill can be seen instead of assumed away.
+  chatwootCreatedAt      DateTime? @map("chatwoot_created_at")
+  chatwootFirstReplyAt   DateTime? @map("chatwoot_first_reply_at")
   // Watermark for follow-up single-shot semantics: set after each follow-up (sent or silenced).
   // Another follow-up can only fire once the client speaks again (lastInboundAt > lastFollowUpAt).
   // NULL = no follow-up has ever been attempted for this conversation.

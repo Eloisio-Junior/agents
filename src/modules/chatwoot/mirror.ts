@@ -112,6 +112,21 @@ export async function mirrorChatwootEvent(
       ? (newLastEventAt ?? now)
       : null;
 
+  // Chatwoot's first-response SLA, taken from the payload as it stands. Not ordered against what is
+  // stored and not guarded by the staleness decision below: both values are computed at the source
+  // from the messages table and never revised, so every delivery mentioning a conversation carries
+  // the same two readings, and the latest to arrive writes what the first one would have. Absent
+  // (`null`) means the payload said nothing — a conversation with no qualifying reply yet, or a
+  // message event with no `conversation` — and must never wipe a stored reading.
+  const slaWrites: {
+    chatwootCreatedAt?: Date;
+    chatwootFirstReplyAt?: Date;
+  } = {};
+  if (n.conversationCreatedAt != null)
+    slaWrites.chatwootCreatedAt = n.conversationCreatedAt;
+  if (n.firstReplyCreatedAt != null)
+    slaWrites.chatwootFirstReplyAt = n.firstReplyCreatedAt;
+
   return runScopedOn(base, sysCtx(tenantId), async (db) => {
     const contactId = await upsertContact(
       db,
@@ -143,6 +158,10 @@ export async function mirrorChatwootEvent(
           status: true,
           resolvedBy: true,
           resolvedByAt: true,
+          // Read so the stale branch can tell a reading it already has from one it does not, and
+          // skip the UPDATE in the common case rather than rewriting the same two values.
+          chatwootCreatedAt: true,
+          chatwootFirstReplyAt: true,
         },
       });
       const prevAssigneeId = existing?.assigneeId ?? null;
@@ -185,10 +204,34 @@ export async function mirrorChatwootEvent(
         // `resolvedBy != null` is a write-avoidance guard, not part of the rule: this branch is
         // taken by every out-of-order delivery, and clearing a column that is already null would
         // add an UPDATE to each one.
-        if (dropsResolutionOrigin && existing.resolvedBy != null) {
+        // NOTE: And a second exception, for the same reason stated the other way round: the ORDER
+        // this event lost is about the conversation's STATE. The SLA pair it carries is not state
+        // this side maintains — it is two immutable readings Chatwoot computed from its own
+        // messages table — so losing the ordering says nothing about them, and a row that has never
+        // seen them yet is exactly the row a late delivery can still teach. Compared rather than
+        // written blind so the common stale delivery, which repeats what is stored, adds no UPDATE.
+        const staleSla: typeof slaWrites = {};
+        if (
+          slaWrites.chatwootCreatedAt != null &&
+          slaWrites.chatwootCreatedAt.getTime() !==
+            existing.chatwootCreatedAt?.getTime()
+        )
+          staleSla.chatwootCreatedAt = slaWrites.chatwootCreatedAt;
+        if (
+          slaWrites.chatwootFirstReplyAt != null &&
+          slaWrites.chatwootFirstReplyAt.getTime() !==
+            existing.chatwootFirstReplyAt?.getTime()
+        )
+          staleSla.chatwootFirstReplyAt = slaWrites.chatwootFirstReplyAt;
+        const clearsOrigin =
+          dropsResolutionOrigin && existing.resolvedBy != null;
+        if (clearsOrigin || Object.keys(staleSla).length > 0) {
           await db.conversation.update({
             where: { id: existing.id },
-            data: { resolvedBy: null, resolvedByAt: null },
+            data: {
+              ...(clearsOrigin ? { resolvedBy: null, resolvedByAt: null } : {}),
+              ...staleSla,
+            },
           });
         }
         return {
@@ -225,6 +268,10 @@ export async function mirrorChatwootEvent(
             chatwootStatusAt: decision.statusAt,
             chatwootAssigneeAt: decision.assigneeAt,
             lastInboundAt: inboundAt,
+            // A row created mid-dialogue needs no special case here: what it stores is what
+            // Chatwoot measured over the whole conversation, not what we happened to witness.
+            ...slaWrites,
+
             ...(n.customAttributes
               ? {
                   customAttributes: n.customAttributes as Prisma.InputJsonValue,
@@ -299,6 +346,7 @@ export async function mirrorChatwootEvent(
             ? { chatwootAssigneeAt: decision.assigneeAt }
             : {}),
           ...(inboundAt != null ? { lastInboundAt: inboundAt } : {}),
+          ...slaWrites,
           // NOTE: The bags are ASSIGNED (the payload always ships the whole jsonb), but only when the
           // event carried one: a payload without them must not wipe the stored snapshot.
           ...(decision.unversioned && n.customAttributes
