@@ -102,64 +102,80 @@ function sysCtx(tenantId: bigint): TenantContext {
 // Fire-and-forget: schedules the row write (and, for warn/error on real traffic, alert dispatch)
 // without awaiting. Returns immediately; failures are swallowed (logged at warn).
 export function emitFlowEvent(ctx: FlowContext, ev: FlowEvent): void {
+  void writeFlowEvent(ctx, ev);
+}
+
+// THE SAME WRITE, AWAITED, and it exists for a caller whose line is the only record there will be.
+//
+// Every turn-time caller wants the fire-and-forget form: the line describes work that already
+// happened, and making a customer wait on a log write would be the wrong trade. The stranded-delivery
+// sweep is the opposite case — it retires the ledger row that is the line's only other trace, so a
+// swallowed failure loses the report permanently and no later pass can find the row again. Awaiting
+// lets that caller write the line FIRST and retire the row only if it landed.
+//
+// Failures are still swallowed here, for the same reason they are swallowed above: a caller asking
+// for the line is not asking to fail if it cannot be written. What awaiting buys is ORDERING, not an
+// exception — the caller learns the outcome from `delivered`.
+export async function writeFlowEvent(
+  ctx: FlowContext,
+  ev: FlowEvent,
+): Promise<{ delivered: boolean }> {
   const base = ctx.base ?? basePrisma;
   const level: FlowLevel = ev.level ?? "info";
-  void (async () => {
+  let delivered = true;
+  try {
+    await runScopedOn(base, sysCtx(ctx.tenantId), (db) =>
+      db.executionLog.create({
+        data: {
+          tenantId: ctx.tenantId,
+          turnId: ctx.turnId,
+          conversationId: ctx.conversationId ?? undefined,
+          agentId: ctx.agentId ?? undefined,
+          inboxId: ctx.inboxId ?? undefined,
+          threadId: ctx.threadId ?? undefined,
+          stage: ev.stage,
+          level,
+          status: ev.status ?? undefined,
+          provider: ev.provider ?? undefined,
+          model: ev.model ?? undefined,
+          durationMs: ev.durationMs ?? undefined,
+          source: ctx.source,
+          detail: ev.detail
+            ? (redactSecretsDeep(
+                ev.detail,
+                0,
+                ctx.fullDetail ? DEBUG_MAX_STRING : MAX_STRING,
+                // The raised ceiling comes with an aggregate budget, because a per-string cap
+                // bounds no ROW: `detail` is a tree and nothing here bounds an object's key
+                // count, so fifty leaves at 300k each would be a 15 MB row. The default path
+                // passes none and keeps the per-string behaviour every existing line has.
+                ctx.fullDetail ? { left: DEBUG_MAX_STRING } : undefined,
+              ) as Prisma.InputJsonValue)
+            : Prisma.DbNull,
+          // NOTE: `errorMessage` keeps its own 500-char cut, debug mode or not. That cut is not
+          // the size policy `detail` is under — it is standing in for a scrub that does not
+          // exist: a provider's error text is not allowlisted the way `detail` is, and it can
+          // echo the customer's own message back (a content-filter refusal quoting the input).
+          // Lifting it would widen PII exposure to buy nothing this issue asked for.
+          errorMessage: ev.errorMessage
+            ? sanitizeErrorMessage(ev.errorMessage)
+            : undefined,
+        },
+      }),
+    );
+  } catch (err) {
+    delivered = false;
+    logger.warn({ err, turnId: ctx.turnId }, "flowlog emit failed");
+  }
+  // Alerting: only warn/error, and only real (inbox) traffic — a playground error must not page.
+  if ((level === "warn" || level === "error") && ctx.source === "inbox") {
     try {
-      await runScopedOn(base, sysCtx(ctx.tenantId), (db) =>
-        db.executionLog.create({
-          data: {
-            tenantId: ctx.tenantId,
-            turnId: ctx.turnId,
-            conversationId: ctx.conversationId ?? undefined,
-            agentId: ctx.agentId ?? undefined,
-            inboxId: ctx.inboxId ?? undefined,
-            threadId: ctx.threadId ?? undefined,
-            stage: ev.stage,
-            level,
-            status: ev.status ?? undefined,
-            provider: ev.provider ?? undefined,
-            model: ev.model ?? undefined,
-            durationMs: ev.durationMs ?? undefined,
-            source: ctx.source,
-            detail: ev.detail
-              ? (redactSecretsDeep(
-                  ev.detail,
-                  0,
-                  ctx.fullDetail ? DEBUG_MAX_STRING : MAX_STRING,
-                  // The raised ceiling comes with an aggregate budget, because a per-string cap
-                  // bounds no ROW: `detail` is a tree and nothing here bounds an object's key
-                  // count, so fifty leaves at 300k each would be a 15 MB row. The default path
-                  // passes none and keeps the per-string behaviour every existing line has.
-                  ctx.fullDetail ? { left: DEBUG_MAX_STRING } : undefined,
-                ) as Prisma.InputJsonValue)
-              : Prisma.DbNull,
-            // NOTE: `errorMessage` keeps its own 500-char cut, debug mode or not. That cut is not
-            // the size policy `detail` is under — it is standing in for a scrub that does not
-            // exist: a provider's error text is not allowlisted the way `detail` is, and it can
-            // echo the customer's own message back (a content-filter refusal quoting the input).
-            // Lifting it would widen PII exposure to buy nothing this issue asked for.
-            errorMessage: ev.errorMessage
-              ? sanitizeErrorMessage(ev.errorMessage)
-              : undefined,
-          },
-        }),
-      );
+      await dispatchAlertsForEvent(ctx, { ...ev, level }, base);
     } catch (err) {
-      logger.warn({ err, turnId: ctx.turnId }, "flowlog emit failed");
+      logger.warn({ err, turnId: ctx.turnId }, "flowlog alert dispatch failed");
     }
-    // Alerting: only warn/error, and only real (inbox) traffic — a playground error must not page.
-    if ((level === "warn" || level === "error") && ctx.source === "inbox") {
-      try {
-        await dispatchAlertsForEvent(ctx, { ...ev, level }, base);
-      } catch (err) {
-        logger.warn(
-          { err, turnId: ctx.turnId },
-          "flowlog alert dispatch failed",
-        );
-      }
-    }
-  })();
+  }
+  return { delivered };
 }
 
 // Span helper: measures `fn`, emits an `ok` line on success and an `error` line on throw (then

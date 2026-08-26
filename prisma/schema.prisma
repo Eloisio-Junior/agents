@@ -66,6 +66,7 @@ enum SchedulerJobKind {
   REDIRECT_FOLLOWUP
   MEMORY_COMPACT
   INGEST_MESSAGE
+  DELIVERY_SWEEP
 }
 
 enum SchedulerJobStatus {
@@ -334,12 +335,40 @@ model ChatwootWebhookDelivery {
   attempts           Int                   @default(0)
   receivedAt         DateTime              @default(now()) @map("received_at")
   processedAt        DateTime?             @map("processed_at")
+  // When the CURRENT attempt claimed this row (the tx1 CAS `PENDING -> PROCESSING`). The staleness
+  // clock for a row being worked, and it has to be separate from `receivedAt`: a redelivery is
+  // deliberately allowed to claim a row stranded on PENDING (see `recordAndProcessChatwootDelivery`),
+  // and measuring that live attempt from the ORIGINAL receipt makes it look abandoned the moment it
+  // starts. NULL = never claimed, so the row is still measured from receipt.
+  claimedAt          DateTime?             @map("claimed_at")
+  // The Chatwoot display id this delivery was about. What the stranded-delivery sweep files its
+  // report against, and deliberately the only thing stored: an id, never the event body, so nothing
+  // here can hold what the customer wrote. Null on an event that names no conversation, and on every
+  // row written before this column existed.
+  conversationId     Int?                  @map("conversation_id")
+  // The INBOUND message this delivery carried, when it carried one. Null on every event that is not
+  // a customer message — a conversation update, the bot's own reply coming back around — which is
+  // what lets the sweep tell a row where nothing was lost from one where a customer went unanswered.
+  // Matched by id when a turn retires the rows it covered, never read for content: an id, like the
+  // column above, and nothing here can hold what the customer wrote.
+  inboundMessageId   Int?                  @map("inbound_message_id")
 
   tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   instance ChatwootInstance @relation(fields: [chatwootInstanceId], references: [id], onDelete: Cascade)
 
   @@unique([chatwootInstanceId, deliveryId])
   @@index([tenantId])
+  // Serves the other half of the same contract: a turn retiring the rows of the messages it just ran
+  // over. ACCOUNT FIRST, because that is how the write is keyed — display ids and message ids are
+  // numbered per Chatwoot account, so a conversation id alone matches rows on every account a tenant
+  // has connected.
+  // Named: the implicit name for these three columns is 87 bytes, and Postgres keeps the FIRST 63
+  // while Prisma truncates so `_idx` survives. Left implicit, the created index and this line
+  // disagree, and every later `migrate dev` reports drift against a database that is correct.
+  @@index([chatwootInstanceId, conversationId, inboundMessageId], map: "chatwoot_webhook_deliveries_retire_idx")
+  // NOTE: the sweep's own index is PARTIAL and lives in raw SQL, which Prisma cannot express:
+  // `(tenant_id, received_at) WHERE status IN ('PENDING','PROCESSING')`. See the migration for why
+  // a full index over this table is the wrong shape.
   @@map("chatwoot_webhook_deliveries")
 }
 

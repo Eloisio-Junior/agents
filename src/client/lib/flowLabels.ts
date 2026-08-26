@@ -16,6 +16,8 @@ export function flowStageLabel(stage: string, t: TFunction): string {
       return t("logs.stage.vision", "Image reading");
     case "embed":
       return t("logs.stage.embed", "Embedding");
+    case "delivery":
+      return t("logs.stage.delivery", "Interrupted delivery");
     case "debounce":
       return t("logs.stage.debounce", "Message grouping");
     case "contact_auth":

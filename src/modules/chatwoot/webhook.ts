@@ -49,6 +49,7 @@ import {
   isRedirectEntryInbox,
   readChannelRedirectConfig,
 } from "@/modules/channel-redirect/service";
+import { retireCoveredDeliveries } from "@/modules/chatwoot/delivery-sweep";
 import {
   describeClosedGate,
   type GateCloseDetail,
@@ -119,6 +120,7 @@ import {
   firstAudioAttachment,
   firstLocationAttachment,
   firstVisualAttachment,
+  heldByAnotherParty,
   isIncomingMessage,
   isNewHumanAgentMessage,
   isNewIncomingMessage,
@@ -509,6 +511,15 @@ export async function recordAndProcessChatwootDelivery(
     { tenantId: params.tenantId, instanceId: params.instanceId },
     params.deliveryId,
     params.normalized.event,
+    params.normalized.conversationId,
+    // Only a NEW INBOUND message, which is the exact set that drives a turn: the sweep uses this to
+    // tell a delivery that lost a customer's message from one that lost nothing (issue #228). The
+    // bot's own reply comes back as a `message_created` too, and an incoming `message_updated` is
+    // usually our own media write-back coming around — neither is a customer waiting for an answer,
+    // so neither may put a row in the loss list.
+    isNewIncomingMessage(params.normalized)
+      ? (params.normalized.message?.id ?? null)
+      : null,
   );
   return processChatwootDelivery({
     tenantId: params.tenantId,
@@ -538,11 +549,20 @@ async function claimDelivery(
   scope: { tenantId: bigint; instanceId: bigint },
   deliveryId: string,
   event: string,
+  conversationId: number | null,
+  inboundMessageId: number | null,
 ): Promise<{ rowId: bigint; duplicate: boolean }> {
   let lastErr: unknown;
   for (let attempt = 1; attempt <= LEDGER_CLAIM_ATTEMPTS; attempt++) {
     try {
-      return await recordDelivery(base, scope, deliveryId, event);
+      return await recordDelivery(
+        base,
+        scope,
+        deliveryId,
+        event,
+        conversationId,
+        inboundMessageId,
+      );
     } catch (err) {
       lastErr = err;
       logger.warn(
@@ -569,6 +589,8 @@ async function recordDelivery(
   scope: { tenantId: bigint; instanceId: bigint },
   deliveryId: string,
   event: string,
+  conversationId: number | null,
+  inboundMessageId: number | null,
 ): Promise<{ rowId: bigint; duplicate: boolean }> {
   try {
     const row = await runScopedOn(base, sysCtx(scope.tenantId), (db) =>
@@ -579,6 +601,12 @@ async function recordDelivery(
           deliveryId,
           event,
           status: "PENDING",
+          // What a recovery sweep needs if this delivery is stranded on PROCESSING by a process
+          // death (issue #228): which conversation to flush, and which message that flush was
+          // supposed to answer. Two ids, and nothing else about the event — the flush re-reads the
+          // messages from Chatwoot, so no column here can hold what the customer wrote.
+          conversationId,
+          inboundMessageId,
         },
         select: { id: true },
       }),
@@ -593,6 +621,29 @@ async function recordDelivery(
       }),
     );
     if (!existing) throw err;
+    // Fill what the row is missing before handing it back. A row inserted by a build that predates
+    // these columns carries neither id, and the CAS that follows stamps `claimed_at` on it — which
+    // is precisely the signature the sweep reads as "this build wrote it, so its nulls mean what
+    // they say". Left empty, a redelivery of a legacy row turns a lost customer message into a row
+    // the sweep closes as carrying none (issue #228).
+    //
+    // Only ever fills, never overwrites: a row this build already wrote has the right values, and a
+    // redelivery of it must not be able to change them.
+    if (conversationId !== null || inboundMessageId !== null) {
+      await runScopedOn(base, sysCtx(scope.tenantId), (db) =>
+        db.chatwootWebhookDelivery.updateMany({
+          where: {
+            id: existing.id,
+            ...(conversationId !== null ? { conversationId: null } : {}),
+            ...(inboundMessageId !== null ? { inboundMessageId: null } : {}),
+          },
+          data: {
+            ...(conversationId !== null ? { conversationId } : {}),
+            ...(inboundMessageId !== null ? { inboundMessageId } : {}),
+          },
+        }),
+      );
+    }
     return { rowId: existing.id, duplicate: true };
   }
 }
@@ -2619,10 +2670,17 @@ export async function processChatwootDelivery(
 
   // tx1: CAS PENDING→PROCESSING. A re-entry (duplicate POST that found a stranded PENDING) sees
   // 0 rows and skips.
+  //
+  // The claim is STAMPED, because the winner of this CAS is not always the first attempt: a
+  // redelivery is deliberately allowed through to here on a row stranded on PENDING, and that claim
+  // can land long after the row was received. `claimed_at` is the clock the stranded-delivery sweep
+  // measures a PROCESSING row by; without it the sweep dates this live attempt to the original
+  // receipt, calls it abandoned the instant it starts, and reports a lost message while the process
+  // answering it is still running (issue #228).
   const claimed = await runScopedOn(base, sysCtx(params.tenantId), (db) =>
     db.chatwootWebhookDelivery.updateMany({
       where: { id: params.deliveryRowId, status: "PENDING" },
-      data: { status: "PROCESSING" },
+      data: { status: "PROCESSING", claimedAt: new Date() },
     }),
   );
   if (claimed.count === 0) return "skipped";
@@ -2815,6 +2873,25 @@ export async function processChatwootDelivery(
     },
     { ourAgentBotId: params.agentBotId },
   );
+  // Who is holding it, when somebody else is. A HUMAN taking a conversation is a statement about the
+  // message: they will answer it, whichever bot route carried it here. ANOTHER BOT is not — its own
+  // delivery of this same message may be running right now, and Chatwoot fans a message to two
+  // routes whenever a conversation's assignee bot differs from the inbox's (`agent_bots_for`). The
+  // settlement at the gate tail is scoped by this, and by nothing else about the gate.
+  //
+  // Asked of `heldByAnotherParty`, the same predicate the gate itself uses, rather than of `act`.
+  // `act` is false for a second reason — a status that is not `pending` — so `assigneeType is
+  // AgentBot && !act` calls OUR OWN bot another bot on every open or resolved conversation, and then
+  // scopes away the sibling settlement on the most ordinary gate exit there is.
+  const heldByAnotherBot =
+    effectiveAssigneeType === "AgentBot" &&
+    heldByAnotherParty(
+      {
+        assigneeType: effectiveAssigneeType,
+        assigneeId: assigneeKnown ? (n.assigneeId ?? null) : mirror.assigneeId,
+      },
+      { ourAgentBotId: params.agentBotId },
+    );
   const convLabel = n.conversationId === null ? "?" : String(n.conversationId);
 
   // ── A conversation this agent manages just transitioned TO resolved (by anyone: the agent's own
@@ -3101,6 +3178,62 @@ export async function processChatwootDelivery(
 
   // Hoisted so the ingestion pass below can tell an out-of-hours-silenced incoming (consumed) from an
   // answered one. Stays false on every path that never runs the gate.
+  // Say on the LEDGER that this delivery settled the message it carries — something ran over it, or
+  // a gate decided deliberately that nothing would — AT THE MOMENT it is decided, never later.
+  //
+  // Later is the whole point. tx2 is the natural place and it is much too late: the error clearing,
+  // the follow-up arming, the redirect re-arm, the ingestion pass and the watermark tail all sit in
+  // between, each taking its own time, and a process that dies anywhere in that stretch leaves the
+  // row PROCESSING for a message whose fate was already sealed. The stranded-delivery sweep would
+  // then report it as a customer nobody answered and page somebody about it (issue #228).
+  //
+  // One body, called from each branch that decides, rather than one call reading a flag set by
+  // them: the decision and the record have to be adjacent, and a flag is exactly the thing that
+  // lets them drift apart again.
+  //
+  // "Settled" is not "answered", which is why the caller says which. What the ledger has to hold is
+  // whether a message was lost to a PROCESS DEATH, and one a gate consumed or a turn answered with
+  // silence was not lost. A delivery that armed a flush settles NOTHING here: the flush is what
+  // will, and it retires the rows itself when it runs.
+  // `scope` is which rows this settlement speaks for, and it is not always the conversation's.
+  //
+  //   "conversation"  every row for this message, whichever bot route received it. What a TURN can
+  //                   say: it ran over the message and answered or deliberately did not, and that is
+  //                   true of the message rather than of one delivery of it. It is also what rescues
+  //                   a row an earlier attempt stranded.
+  //   "this-delivery" only the row this process is working. What a gate taken because ANOTHER PARTY
+  //                   holds the conversation can say. Chatwoot fans a message to up to two bot
+  //                   routes (`agent_bots_for`: the assignee bot and the inbox bot, each with its
+  //                   own delivery id), so the other party may be a bot whose own delivery is in
+  //                   flight right now. Retiring its row would take a live loss out of the list.
+  const settleDelivery = async (
+    messageId: number,
+    settlement: "answered" | "consumed",
+    scope: "conversation" | "this-delivery" = "conversation",
+  ): Promise<void> => {
+    // Narrows for the call below, which takes a number. Every caller is already inside a branch that
+    // needs a conversation, so nothing reaches here without one and removing this kills no test.
+    if (n.conversationId === null) return;
+    try {
+      await retireCoveredDeliveries({
+        tenantId: params.tenantId,
+        instanceId: params.instanceId,
+        conversationId: n.conversationId,
+        conversationRowId: mirror.conversationRowId,
+        settlement,
+        ...(scope === "this-delivery"
+          ? { deliveryRowId: params.deliveryRowId }
+          : { messageIds: [messageId] }),
+        base,
+      });
+    } catch (e) {
+      logger.warn(
+        "chatwoot: could not settle the delivery (conv=%s): %s",
+        convLabel,
+        errMsg(e),
+      );
+    }
+  };
   let consumed = false;
   // What the contact-authorization gate below learned about this contact, for the direct turn's
   // prompt. Null when the gate is off, or when the delivery never reaches a turn.
@@ -3221,6 +3354,42 @@ export async function processChatwootDelivery(
             outcome,
             mirror.applied ? "applied" : "skipped",
           );
+          // The turn RAN over this message, so nothing is owed on it — EVERY outcome, where the
+          // flush keeps two of them open. The rule belongs to the call site, because the same two
+          // words mean different things on each side:
+          //
+          //   superseded  On the flush it means the burst is handed to a re-armed flush that will
+          //               answer it and retire these same rows, so retiring them now would close a
+          //               message before the run that covers it exists. Nothing is re-armed here:
+          //               the graph already ran over this message (the thread state, reply included,
+          //               is written before `shouldPost` is consulted), and it is the NEWER
+          //               message's own delivery that carries the reply. Left open, the row is
+          //               reported as a lost customer message every time the process dies in the
+          //               tail after a deliberate supersede — which is the one thing separating this
+          //               outcome from every other one on this path, since all of them close here.
+          //   stale       Not reachable at all: `runAgentTurn` passes `stillWanted: null`, because
+          //               nothing queued this turn and there is no job for /reset to retire. It is
+          //               NOT written into the condition, because a branch no input can take is a
+          //               branch no test can hold: it would read as a rule and be a comment. The
+          //               premise it rests on is asserted instead, in
+          //               tests/modules/delivery-sweep.test.ts, so the day something hands this path
+          //               a `stillWanted` the failure points here rather than passing silently.
+          //
+          // NOTE: no `isNewIncoming` here, because the whole block is already inside it — an
+          // incoming `message_updated` (our own media write-back coming around) never reaches this
+          // line, which matters: it carries the same message id as the `message_created` whose row
+          // may be stranded, and nothing about it answered anybody. Asserted from the outside in
+          // tests/modules/delivery-sweep.test.ts, since a guard that is absorbed cannot be mutated.
+          //
+          // The null check below is absorbed by that same enclosing guard: an event that is a new
+          // incoming message HAS an id. It answers the compiler, not the runtime, which is why
+          // removing it kills no test — a survivor that is a narrowing rather than a rule.
+          if (n.message?.id != null) {
+            await settleDelivery(
+              n.message.id,
+              outcome === "posted" ? "answered" : "consumed",
+            );
+          }
           // NOTE: The turn had nowhere to go: no agent is bound to this inbox (issue #318). One line
           // per customer message that nothing will answer — `runAgentTurn` only reaches this outcome
           // for a new incoming message with text — which is the same unit as the gate's line below.
@@ -3384,6 +3553,27 @@ export async function processChatwootDelivery(
     n.message?.id != null &&
     mirror.conversationRowId !== null
   ) {
+    // The same fact the watermark records here, on the ledger: a human owns the conversation, or a
+    // command or a gate consumed the message. Nothing further is coming for it, deliberately, so it
+    // is not a message a crash lost — and a gate is silence by construction, never an answer.
+    //
+    // SCOPED to this delivery in exactly one case: another BOT holds the conversation. Then the
+    // silence is about US, and the row this message also has on that bot's route belongs to a
+    // delivery that may be working right now — retiring it takes a live loss out of the list. A
+    // human holding the conversation is the opposite: they answer the message, whichever route
+    // carried it, and so is a command or a test-mode gate consuming it. Both keep the wider scope,
+    // which is also what rescues a strand an earlier attempt left behind.
+    // THE WATERMARK FIRST, and the order is chosen by which way the pair fails.
+    //
+    // They are two writes and not a transaction, so a process dying between them leaves one of two
+    // states. Settle first and the row is terminal while the watermark still sits below this
+    // message: the sweep can no longer see it, and a flush after the conversation comes back to the
+    // bot re-coalesces from that watermark and ANSWERS the message a gate deliberately suppressed —
+    // a reply the product decided not to send, with nothing anywhere reporting it. Watermark first
+    // and the row is left in the worklist for a message something did handle: a line in the loss
+    // list that is wrong and VISIBLE, and correctable by the next turn that runs over it.
+    //
+    // Wrong and visible over quiet and wrong is the rule this whole change is built on.
     try {
       await advanceHandledWatermark({
         tenantId: params.tenantId,
@@ -3398,6 +3588,11 @@ export async function processChatwootDelivery(
         errMsg(err),
       );
     }
+    await settleDelivery(
+      n.message.id,
+      "consumed",
+      heldByAnotherBot ? "this-delivery" : "conversation",
+    );
   }
 
   // Continuous ingestion (production + enabled only): fold the messages no turn handled into the
@@ -3416,8 +3611,19 @@ export async function processChatwootDelivery(
     });
   }
 
-  // tx2: mark processed. NOTE: a crash between tx1 and tx2 strands the row in PROCESSING; a
-  // reaper (stale PROCESSING→PENDING) lands with the durable payload store.
+  // tx2: mark processed. NOTE: a crash between tx1 and tx2 still strands the row in PROCESSING —
+  // nothing here can close that window, because the process is gone. What closes it is the
+  // stranded-delivery sweep (./delivery-sweep.ts): it does not replay the event, it REPORTS the row,
+  // so the payload never had to be stored. Answering the customer is issue #295, and the reason it
+  // is not done from a sweep is written down there and at the head of that file.
+  //
+  // NOTE: By ID and with no CAS, which matters for one race and is the right side of it. A turn that
+  // outlives the sweep's staleness threshold (nothing bounds a model call or a tool here) has its
+  // row judged abandoned and marked DEAD while this process is still working, and then reaches this
+  // line. Winning here is what leaves the row TRUE — the delivery did complete, late — so the
+  // correction outlives the sweep's verdict. What cannot be taken back is the alert the sweep
+  // already dispatched, which is why the threshold is generous; the residue is one false alert on a
+  // pathological turn, against a row that ends up saying the right thing.
   await runScopedOn(base, sysCtx(params.tenantId), (db) =>
     db.chatwootWebhookDelivery.update({
       where: { id: params.deliveryRowId },

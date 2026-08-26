@@ -1576,6 +1576,7 @@
       "command": "Control command",
       "contact_auth": "Contact authorization",
       "debounce": "Message grouping",
+      "delivery": "Interrupted delivery",
       "embed": "Embedding",
       "generate": "Generation",
       "guardrail": "Guardrail check",

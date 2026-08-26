@@ -51,6 +51,11 @@ export const JOB_LANE: Record<SchedulerJobKind, SchedulerLane> = {
   // a kind parked in that lane would then never drain at all, silently, on an install that simply
   // does not use debounce.
   INGEST_MESSAGE: "shared",
+  // Shared: it is a sweep, and neither reason applies. Its cadence is minutes by design (a delivery
+  // is not stranded until nothing has moved it for ten), and the work it does is one indexed query
+  // per tenant — the arming it may do costs nothing, and the flush that follows is a DEBOUNCE job
+  // that gets claimed on its own lane with its own budget.
+  DELIVERY_SWEEP: "shared",
 };
 
 // Whether ONE job of this kind spends capacity at an external provider that the rest of the product
@@ -84,6 +89,11 @@ export const JOB_SPENDS_PROVIDER: Record<SchedulerJobKind, boolean> = {
   MEMORY_COMPACT: false,
   // No model, no embedding: it appends to a checkpointer channel and writes one row.
   INGEST_MESSAGE: false,
+  // It reads and writes rows and emits log lines. Answering the stranded message would make this
+  // true, and that is exactly why answering is not done here (issue #295): the delivery path's own
+  // gates do not survive the process that died, so a turn run from a sweep is not the turn the
+  // delivery would have run.
+  DELIVERY_SWEEP: false,
 };
 
 // How many provider-spending jobs the shared lane may run at once, out of the model budget. NEVER
@@ -116,6 +126,7 @@ export const JOB_DELETE_ON_DONE: Record<SchedulerJobKind, boolean> = {
   DEBOUNCE: false,
   MEMORY_COMPACT: false,
   INGEST_MESSAGE: true,
+  DELIVERY_SWEEP: false,
 };
 
 // Whether the NUMBER of rows of this kind follows inbound traffic, rather than a population the
@@ -146,6 +157,8 @@ export const JOB_TRAFFIC_PROPORTIONAL: Record<SchedulerJobKind, boolean> = {
   REDIRECT_FOLLOWUP: false,
   MEMORY_COMPACT: false,
   INGEST_MESSAGE: true,
+  // One row per tenant, re-armed forever. Bounded by the install's tenant count, not by traffic.
+  DELIVERY_SWEEP: false,
 };
 
 export function kindsInLane(
