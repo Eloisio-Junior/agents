@@ -1162,6 +1162,8 @@ async function maybeConsumeCommandOrGate(params: {
         redirectSentAt: true,
         redirectCount: true,
         redirectLinkedAt: true,
+        redirectOriginDisplayId: true,
+        chatwootRedirectOriginAt: true,
         inboxId: true,
       },
     });
@@ -1574,6 +1576,8 @@ async function maybeConsumeCommandOrGate(params: {
           displayId: conversationId,
           testActivatedAt: ctx.conv.testActivatedAt,
           contactId: ctx.conv.contactId,
+          redirectOriginDisplayId: ctx.conv.redirectOriginDisplayId,
+          chatwootRedirectOriginAt: ctx.conv.chatwootRedirectOriginAt,
         },
         base,
       });
@@ -1763,11 +1767,17 @@ async function maybeConsumeCommandOrGate(params: {
     // other side's anchors and ladder standing, and the funnel can be re-run but not re-closed. The
     // operator resets the other side to finish the job.
     //
-    // Reaching across needs to know WHICH widget chat opened from this entry, and that is not
-    // derivable here: the merge happens inside Chatwoot's token resolve and what comes back names
-    // the CONTACT, not the conversation the token was minted on. Every predicate over the mirrored
-    // rows is a guess, and this command cancels appointment reminders — issue #222 carries the fork
-    // change that would make the pair a fact.
+    // Reaching across needs to know WHICH widget chat opened from this entry, and that used to be
+    // underivable: the merge happens inside Chatwoot's token resolve and what comes back names the
+    // CONTACT, not the conversation the token was minted on, so every predicate over the mirrored
+    // rows was a guess — on a command that cancels appointment reminders. Issue #222 removed that:
+    // the widget row now records the entry conversation it opened from, so this direction is a
+    // lookup rather than an inference.
+    //
+    // The scoping stands anyway, and deliberately. Widening what a /reset erases is a change to what
+    // the operator asked for, on the command whose whole ordering above exists to bound what it
+    // touches; it is the operator's call, not a side effect of the pairing becoming available. What
+    // changed is that the reach is now implementable, not that it is wanted here.
 
     // FIRST among the mutations, and the ordering is the whole fence. Two races pull in opposite
     // directions and only this position settles both.
@@ -2764,7 +2774,23 @@ export async function processChatwootDelivery(
     params.instanceId,
     n,
     base,
-    { suppressInboundWatermark: commandActive },
+    {
+      suppressInboundWatermark: commandActive,
+      // Which ladder goes with the episode, if this event turns out to move the pairing. Computed
+      // here because the key is this module's to spell, retired in there because it has to be
+      // atomic with the write that moves it.
+      ...(n.conversationId !== null
+        ? {
+            redirectLadderDedupeKey: followUpDedupeKey(
+              chatwootThreadId(
+                params.tenantId,
+                params.instanceId,
+                n.conversationId,
+              ),
+            ),
+          }
+        : {}),
+    },
   );
 
   // NOTE: A command that will not run is otherwise indistinguishable from ordinary customer text, in the
@@ -3484,6 +3510,11 @@ export async function processChatwootDelivery(
               ),
               agentId: rt.agentId,
               entryInboxId: redirectCfg.entryInboxId,
+              // From the EVENT, not from the mirrored row: a mirror write whose ladder retirement
+              // was rejected holds the pairing back, and this same delivery still arms. Reading the
+              // row there would stamp the episode being left behind, and the payload that finally
+              // applies the pairing would retire the ladder it had just armed.
+              originDisplayId: n.redirectOriginDisplayId,
               cfg: redirectCfg,
               base,
             });

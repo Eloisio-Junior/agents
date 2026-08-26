@@ -25,7 +25,7 @@ import {
   proactiveSendMode,
   readServiceWindowConfig,
 } from "@/modules/service-window/service";
-import { episodeTestActivatedAt } from "./episode";
+import { episodeOriginQuery, episodeTestActivatedAt } from "./episode";
 import { interpolateLink, resolveRedirectLink } from "./gate";
 import {
   type ChannelRedirectConfig,
@@ -129,6 +129,13 @@ export interface RedirectFollowUpPayload {
   // Agent.id, serialized as a string — scheduler job payloads are plain JSON.
   agentId: string;
   entryInboxId: number | null;
+  // The redirect episode this ladder was armed for, as the pairing stood in the EVENT that armed it
+  // — not as the row read, which can still be holding the previous pairing back (see the savepoint
+  // in chatwoot/mirror.ts). The dedupe key names the conversation and every episode it ever has
+  // shares it, so this is the only thing that tells the retirement which ladder is the one it means.
+  // Absent ⇒ armed before this field existed, or by a Chatwoot that does not speak about pairings;
+  // `null` ⇒ the event stated there is no pairing.
+  originDisplayId?: number | null;
 }
 
 // Parse (and validate) a claimed job's raw payload. Pure — no I/O — so "is this payload usable" is
@@ -150,7 +157,20 @@ export function parseRedirectFollowUpPayload(
   const entryInboxId =
     typeof payload.entryInboxId === "number" ? payload.entryInboxId : null;
   if (!stage || !widgetThreadId || !agentId) return null;
-  return { stage, widgetThreadId, agentId, entryInboxId };
+  // Read as three states, and put back the same way: a stage advance rebuilds the payload field by
+  // field, so anything this drops is gone from the job for good.
+  const origin = payload.originDisplayId;
+  return {
+    stage,
+    widgetThreadId,
+    agentId,
+    entryInboxId,
+    ...(typeof origin === "number"
+      ? { originDisplayId: origin }
+      : origin === null
+        ? { originDisplayId: null }
+        : {}),
+  };
 }
 
 // Pure: the nudge content for each stage, kept separate from I/O so "what do we say" is trivially
@@ -176,6 +196,9 @@ export interface ArmRedirectChatFollowUpParams {
   widgetThreadId: string;
   agentId: bigint;
   entryInboxId: number | null;
+  // The episode this message belongs to, taken from the EVENT. Omitted when the payload said
+  // nothing about a pairing, which is every Chatwoot without fazer-ai/chatwoot#418.
+  originDisplayId?: number | null;
   cfg: {
     chatFollowupEnabled: boolean;
     chatFollowupDelayValue: number;
@@ -237,6 +260,9 @@ export async function armRedirectChatFollowUp(
       widgetThreadId: p.widgetThreadId,
       agentId: p.agentId.toString(),
       entryInboxId: p.entryInboxId,
+      ...(p.originDisplayId !== undefined
+        ? { originDisplayId: p.originDisplayId }
+        : {}),
     },
     base: p.base,
   });
@@ -255,37 +281,67 @@ interface WhatsAppSibling {
   provider: string | null;
 }
 
-// Resolve the WhatsApp sibling conversation of a widget conversation's contact: the OTHER conversation
-// on the SAME contact whose inbox is the agent's configured entry (official WhatsApp) inbox, most-
-// recently-active. Returns everything the proactive WhatsApp touches need — the sibling's conversation id
-// (to post on), the contact's Chatwoot id (the token identity), plus the 24h-window inputs (lastInboundAt
-// + inbox channel/provider). Powers stage 2 (re-send the link) AND the closing. null when the contact has
-// no such conversation (never messaged that inbox, or the merge never linked it).
+// Resolve the WhatsApp entry half of a widget conversation's redirect episode. Returns everything the
+// proactive WhatsApp touches need — the sibling's conversation id (to post on), the contact's Chatwoot
+// id (the token identity), plus the 24h-window inputs (lastInboundAt + inbox channel/provider). Powers
+// stage 2 (re-send the link) AND the closing, which RESOLVES the conversation it names.
+//
+// WHICH row that is comes from episodeOriginQuery: the pairing the fork stored at resolve time, or —
+// only when there is none — the most-recently-active predicate this function used to apply on its own.
+// #222 is why: the closing acts destructively on the answer, and the old predicate is an inference
+// about an event this side never observes.
+//
+// null when there is no such conversation (never messaged that inbox, or the merge never linked it).
 async function resolveWhatsAppSibling(
   tenantId: bigint,
   instanceId: bigint,
   widgetConversationId: number,
   entryInboxId: number,
   base: PrismaClient,
+  // The episode to resolve FOR, when the caller is holding one. A closing that has already posted on
+  // the chat is committed to an episode: re-reading the pairing at that point lets a re-entry landing
+  // during those round trips redirect the WhatsApp half — a clear leaves the original thread open, a
+  // move sends the goodbye to (and RESOLVES) the conversation the new episode just paired with. The
+  // ladder's own stage-2 send has no such commitment and keeps reading fresh, which is what lets a
+  // /reset stand it down.
+  pinned?: {
+    contactId: bigint | null;
+    redirectOriginDisplayId: number | null;
+    chatwootRedirectOriginAt: number | null;
+  },
 ): Promise<WhatsAppSibling | null> {
   return runScopedOn(base, sysCtx(tenantId), async (db) => {
-    const widgetConv = await db.conversation.findUnique({
-      where: {
-        tenantId_chatwootInstanceId_chatwootConversationId: {
-          tenantId,
-          chatwootInstanceId: instanceId,
-          chatwootConversationId: widgetConversationId,
+    const widgetConv =
+      pinned ??
+      (await db.conversation.findUnique({
+        where: {
+          tenantId_chatwootInstanceId_chatwootConversationId: {
+            tenantId,
+            chatwootInstanceId: instanceId,
+            chatwootConversationId: widgetConversationId,
+          },
         },
-      },
-      select: { contactId: true },
-    });
-    if (!widgetConv?.contactId) return null;
-    const sibling = await db.conversation.findFirst({
-      where: {
+        select: {
+          contactId: true,
+          redirectOriginDisplayId: true,
+          chatwootRedirectOriginAt: true,
+        },
+      }));
+    if (!widgetConv) return null;
+    const originQuery = episodeOriginQuery({
+      tenantId,
+      instanceId,
+      entryInboxId,
+      widget: {
+        redirectOriginDisplayId: widgetConv.redirectOriginDisplayId,
+        chatwootRedirectOriginAt: widgetConv.chatwootRedirectOriginAt,
         contactId: widgetConv.contactId,
-        chatwootInstanceId: instanceId,
-        inbox: { chatwootInboxId: entryInboxId },
       },
+    });
+    if (!originQuery) return null;
+    const sibling = await db.conversation.findFirst({
+      where: originQuery.where,
+      ...(originQuery.orderBy ? { orderBy: originQuery.orderBy } : {}),
       select: {
         chatwootConversationId: true,
         status: true,
@@ -294,7 +350,6 @@ async function resolveWhatsAppSibling(
         contact: { select: { chatwootContactId: true } },
         inbox: { select: { channelType: true, provider: true } },
       },
-      orderBy: { lastEventAt: "desc" },
     });
     if (!sibling?.contact?.chatwootContactId) return null;
     return {
@@ -367,6 +422,8 @@ export async function sendWhatsAppFollowUp(
     instanceId: p.instanceId,
     chatwootContactId: sibling.chatwootContactId,
     widgetInboxId: p.cfg.widgetInboxId,
+    // The link is re-sent ON the sibling, so the sibling IS this redirect's origin.
+    originDisplayId: sibling.chatwootConversationId,
     openWidget: p.cfg.openWidget,
     ttlSeconds: REDIRECT_LINK_TTL_SECONDS,
     base: p.base,
@@ -648,6 +705,9 @@ export async function redirectFollowUpHandler(
             widgetThreadId: payload.widgetThreadId,
             agentId: payload.agentId,
             entryInboxId,
+            ...(payload.originDisplayId !== undefined
+              ? { originDisplayId: payload.originDisplayId }
+              : {}),
           },
         };
 
@@ -701,6 +761,9 @@ export async function redirectFollowUpHandler(
                   agentId: payload.agentId,
                   entryInboxId,
                   nudgeRetries: retry.attempt,
+                  ...(payload.originDisplayId !== undefined
+                    ? { originDisplayId: payload.originDisplayId }
+                    : {}),
                 },
               };
         }
@@ -897,6 +960,9 @@ export async function deliverRedirectClosing(
         status: true,
         chatwootStatusAt: true,
         lastInboundAt: true,
+        contactId: true,
+        redirectOriginDisplayId: true,
+        chatwootRedirectOriginAt: true,
         inbox: { select: { agentId: true, channelType: true, provider: true } },
       },
     });
@@ -966,6 +1032,30 @@ export async function deliverRedirectClosing(
   }
 
   // Claim the closing: set the watermark only if still unset AND the episode is the one this run read.
+  //
+  // `redirectOriginDisplayId` is the third condition, and the one this path has nothing else to put
+  // in its place. The closing RESOLVES the WhatsApp conversation the pairing names; the resolve
+  // trigger reaches here straight from a webhook, with no job to ask about, so every fence the ladder
+  // gets from `stillWanted` is one this caller skips. Between the read at the top and this write sit
+  // an agent read, a bot load and a client build — a re-entry accepted in that window re-points the
+  // episode, and a goodbye sent afterwards resolves a thread this conversation is no longer paired
+  // with. Losing the claim leaves the anchor free, so the episode that IS current still gets its own.
+  //
+  // Null is a value here, not a wildcard: a widget conversation with no stored pairing (every one of
+  // them, until fazer-ai/chatwoot#418 is deployed) matches only while it still has none, so the
+  // arrival of a first pairing stands this run down rather than letting it act on the recency
+  // fallback it read.
+  //
+  // And the mark comes in ONLY where the origin cannot answer, which is when the origin is null.
+  // `(null, null)` is nobody ever told us and licenses the recency fallback this run may have used;
+  // `(null, set)` is the fork saying this episode has no WhatsApp half. A clear landing between the
+  // read and this write turns the first into the second without changing the origin.
+  //
+  // Its NULLNESS, never its value. The mark is a version: it advances on every payload that states
+  // the pairing, the ones that state the SAME pairing included. Compared for equality it turns any
+  // ordinary webhook arriving mid-run into "the episode moved", and on this path that is permanent —
+  // the ladder is cancelled by the time the resolve trigger runs, so this is the only closing the
+  // episode will ever get. The identity is the origin; the mark only tells two nulls apart.
   const won = await runScopedOn(base, sysCtx(p.tenantId), async (db) => {
     const res = await db.conversation.updateMany({
       where: {
@@ -974,6 +1064,15 @@ export async function deliverRedirectClosing(
         chatwootConversationId: p.widgetConversationId,
         redirectClosedAt: null,
         lastInboundAt: cx.widget.lastInboundAt,
+        redirectOriginDisplayId: cx.widget.redirectOriginDisplayId,
+        ...(cx.widget.redirectOriginDisplayId === null
+          ? {
+              chatwootRedirectOriginAt:
+                cx.widget.chatwootRedirectOriginAt === null
+                  ? null
+                  : { not: null },
+            }
+          : {}),
       },
       data: { redirectClosedAt: now },
     });
@@ -1107,6 +1206,14 @@ export async function deliverRedirectClosing(
     p.widgetConversationId,
     p.entryInboxId,
     base,
+    // The episode this run CLAIMED, not whatever the row says now. By here the chat half may already
+    // have had its goodbye and its resolve, so this run is committed to an episode; a re-entry
+    // landing during those round trips must not move the conversation the WhatsApp half closes.
+    {
+      contactId: cx.widget.contactId,
+      redirectOriginDisplayId: cx.widget.redirectOriginDisplayId,
+      chatwootRedirectOriginAt: cx.widget.chatwootRedirectOriginAt,
+    },
   );
   // NOTE: ONE watermark read and ONE fence, in that order, and nothing between the fence and the
   // send. Asking the watermark again after the fence — which is what a second `stillDelivering()`
