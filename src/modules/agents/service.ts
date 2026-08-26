@@ -4,6 +4,7 @@ import { broadcastAgentConfigEvent } from "@/api/features/realtime/realtime.serv
 import basePrisma from "@/api/lib/prisma";
 import config from "@/config";
 import { DEFAULT_MODEL_CONFIG, modelConfigSchema } from "@/graph/model-config";
+import { modelOptionalFor } from "@/graph/model-defaults";
 import { NATIVE_TOOL_NAMES, RAG_TOOL_NAMES } from "@/graph/tools/catalog";
 import { parseDbId } from "@/lib/db-id";
 import {
@@ -316,6 +317,115 @@ export class DebugWindowTooLongError extends AppError {
   }
 }
 
+// A FALLBACK IS A PROVIDER AND A MODEL, OR IT IS NOTHING — and the write is the only place that can
+// say so, because every reader downstream agrees a half-named block is no fallback and none of them
+// has anywhere to say it.
+//
+// Measured on the stored bag: naming a provider and saving without a model persists
+// `{provider: "openai", model: null}`, `hasModelFallback` answers false, and the form reader maps it
+// straight back to "No fallback". So the operator's provider is gone on the next load, with no error
+// and nothing in the row to explain it, and the same bag reaches the MCP patch as a diff showing
+// `provider: openai` for a fallback that does not exist. That is the ONE difference from the two
+// other `*Required` fields this editor renders — theirs survive the round trip and come back with
+// their error still on screen.
+//
+// Refused rather than repaired for the reason the whole block exists: repairing means choosing which
+// half to drop, and both choices throw away something the operator typed. Whoever receives this can
+// fix it — the operator picks a model, the MCP caller sends one — which is the test for whether a
+// refusal belongs at a write boundary at all.
+//
+// Same shape as the two rules beside it: only a pair this write INTRODUCES or CHANGES is refused, so
+// a bag that already holds a half-named block does not freeze every later save. Per field, because
+// `mergeBehaviorSettings` merges a block one level deep: a patch naming only the model is a complete
+// statement when the stored block already names a provider.
+export class HalfConfiguredFallbackError extends AppError {
+  constructor(missing: "provider" | "model") {
+    // Names WHICH half, and does not promise both: the model is not required for every provider (see
+    // `modelOptionalFor`), so "needs a provider and a model" would send an operator on
+    // `openai-compatible` looking for a field they do not need. ONE literal with one placeholder,
+    // matching the catalog entry and sitting directly after `super(` — the error-catalog reader
+    // pairs the sentence with the key by regex, and it can span neither a ternary of two literals
+    // nor a comment between the paren and the string.
+    super(
+      `settings.modelFallback is only half configured: ${missing} is missing`,
+      400,
+      "errors.halfConfiguredFallback",
+      { missing },
+      `settings.modelFallback.${missing}`,
+    );
+  }
+}
+
+// The two fields, plus whether the bag MENTIONED each of them. A key that is absent is a key this
+// write says nothing about, which only matters on the path that merges.
+function fallbackPair(settings: unknown): {
+  provider: unknown;
+  model: unknown;
+  sets: { provider: boolean; model: boolean };
+} | null {
+  const bag =
+    settings && typeof settings === "object"
+      ? (settings as Record<string, unknown>).modelFallback
+      : undefined;
+  if (!bag || typeof bag !== "object" || Array.isArray(bag)) return null;
+  const o = bag as Record<string, unknown>;
+  return {
+    provider: o.provider,
+    model: o.model,
+    sets: { provider: "provider" in o, model: "model" in o },
+  };
+}
+
+// One spelling for "not named", so a blank string, a null and an absent key compare equal — the
+// editor trims before it stores and the readers treat all three as no fallback.
+const namedOrNull = (v: unknown): string | null =>
+  typeof v === "string" && v.trim() ? v.trim() : null;
+
+// WHAT THE WRITE WILL ACTUALLY STORE, which is not the same question on the two transports and was
+// the defect in the first version of this: REST REPLACES the settings column with the bag it was
+// handed (`updateData = { ...rest }`), while the MCP patch runs `mergeBehaviorSettings` first and
+// merges a block one level deep. Asking the merge question on the replace path lets
+// `settings: { modelFallback: { model: "new" } }` borrow the stored provider to pass the check and
+// then store a bag that has none — the exact half-named row this rule exists to refuse.
+export type SettingsWriteMode = "replace" | "merge";
+
+export function assertSettingsModelFallback(
+  settings: unknown,
+  stored: unknown,
+  mode: SettingsWriteMode,
+): void {
+  const next = fallbackPair(settings);
+  if (!next) return;
+  const prev = fallbackPair(stored);
+  const inherit = mode === "merge";
+  const provider = namedOrNull(
+    inherit && !next.sets.provider ? prev?.provider : next.provider,
+  );
+  const model = namedOrNull(
+    inherit && !next.sets.model ? prev?.model : next.model,
+  );
+  // The model is required for every provider that needs one, which is not all of them: an
+  // `openai-compatible` endpoint that serves a single model discards the name it is sent, and the
+  // repo has said so since the primary's own schema. `modelOptionalFor` is that one predicate.
+  if (provider !== null && (model !== null || modelOptionalFor(provider)))
+    return;
+  if (provider === null && model === null) return;
+  // ONLY WHAT THE WRITE CHANGES. A bag that already holds a half-named pair is re-sent untouched by
+  // every save that edits some other section, and refusing those would freeze the agent on a field
+  // nobody is editing. By VALUE, not by which half is filled: swapping the provider of a broken
+  // pair for another provider edits it and leaves it just as broken, so "same shape" would wave
+  // through a write that is not the one this exemption is for.
+  if (
+    provider === namedOrNull(prev?.provider) &&
+    model === namedOrNull(prev?.model)
+  ) {
+    return;
+  }
+  throw new HalfConfiguredFallbackError(
+    provider !== null ? "model" : "provider",
+  );
+}
+
 export function assertSettingsDebugWindow(
   settings: unknown,
   stored: unknown,
@@ -494,6 +604,7 @@ export async function updateAgent(
     // would compare against a value another writer could have changed in between.
     assertSettingsTextSizes(rest.settings, before?.settings);
     assertSettingsDebugWindow(rest.settings, before?.settings);
+    assertSettingsModelFallback(rest.settings, before?.settings, "replace");
     // NOTE: Inside the lock and against the same row, for the reason above: "did this write change
     // the ref" has to be asked of the value this write replaces. It also rewrites `rest` in place,
     // so the normalization below copies the canonical bag rather than the submitted one.
@@ -628,6 +739,7 @@ export async function createAgent(
   assertPromptSize(input.systemPrompt);
   assertSettingsTextSizes(input.settings, undefined);
   assertSettingsDebugWindow(input.settings, undefined);
+  assertSettingsModelFallback(input.settings, undefined, "replace");
   const data = parseInput(agentCreateSchema, input);
   validateModelConfigForWrite(data.modelConfig);
   const bhId =

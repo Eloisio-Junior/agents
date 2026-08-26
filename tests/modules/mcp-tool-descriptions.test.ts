@@ -134,7 +134,16 @@ const SETTINGS_DESC_CEILING = 2_000;
 // is the instant the mode ENDS rather than a duration or a switch, and that the mode stores log
 // detail whole instead of cutting it at 2,000. Headroom over 11,690 stays tighter than a block, as
 // before.
-const SETTINGS_SCHEMA_CEILING = 12_050;
+//
+// RAISED from 12,050 for issue #143, and the trim was measured BEFORE the raise rather than after.
+// The `modelFallback` block declares the same quartet the two other model overrides carry and costs
+// 657 characters; dropping BOTH its `describe` notes buys 130 and still does not fit. So the raise
+// is not avoidable by trimming, and trimming would only delete the half a caller cannot get by
+// trying: a fallback needs a provider AND a model, and naming one of the two stores a block that
+// reads as configured and can never run — the same silent-failure shape every raise above paid for.
+// The remaining 527 is the shape (four fields, the provider enum, the nullable wrappers) and does
+// not compress. Headroom over 12,347 stays tighter than a block, as before.
+const SETTINGS_SCHEMA_CEILING = 12_400;
 
 describe("MCP tool descriptions", () => {
   test("agent_settings_set stays under its ceiling", async () => {
@@ -235,6 +244,17 @@ describe("MCP tool descriptions", () => {
   // a dead-letter view, and the enum is derived from the module's vocabulary rather than hand-typed
   // (see the note at its registration) so shrinking it here would mean advertising fewer statuses
   // than the surface accepts.
+  // Issue #143 moves the SCHEMA figure and not the description one: `agent_settings_set` is the only
+  // tool the `modelFallback` block reaches, and a block publishes fields, not prose. Re-measured
+  // rather than trimmed, for the reason the paragraph above gives — the alternative is cutting an
+  // unrelated document description to pay for it.
+  //
+  // The two arrived together on the way to the merge, so these figures are a FRESH measurement of
+  // the combined tree rather than either branch's number: adding the two deltas would assume nothing
+  // else moved between them, and it does not survive the measurement. Measured here: 26,764 of
+  // description and 41,852 of schema. The DESCRIPTION ceiling therefore does NOT move for #143 —
+  // this block publishes a schema and no new tool, so #305's number still has room and raising it
+  // would have been a number nobody had measured. The schema ceiling does, to 41,950.
   test("the whole tools/list payload stays under its ceiling", async () => {
     const all = await listed();
     let desc = 0;
@@ -244,7 +264,7 @@ describe("MCP tool descriptions", () => {
       schema += t.schema.length;
     }
     expect(desc).toBeLessThanOrEqual(27_250);
-    expect(schema).toBeLessThanOrEqual(41_650);
+    expect(schema).toBeLessThanOrEqual(41_950);
   });
 
   // Why the document write tools declare `blocks`/`fields` as loose arrays and put the vocabulary in

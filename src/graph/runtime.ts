@@ -547,14 +547,64 @@ export async function runLoadedTurn(
     // A turn recovered from an empty provider response must not read like a clean one: without this
     // line the fault is invisible and its rate (issue #63 measured 1 in 184 on one install) can
     // never be told apart from a turn that simply worked.
-    onModelRetry: ({ attempt }) =>
+    onModelRetry: ({ attempt, provider, model }) =>
       emitFlowEvent(flow, {
         stage: "generate",
         level: "warn",
         status: "ok",
-        provider: loaded.mc.provider,
-        model: loaded.mc.model,
+        // NOTE: the retry can happen on either model, and the row names the one that made it. The
+        // labels ride on the event rather than being defaulted here, so there is no default to get
+        // wrong — which is what two of the four emitters did while they were optional.
+        provider,
+        model,
         detail: { retriedEmptyResponse: attempt },
+      }),
+    // A fallback that ANSWERS produces a successful turn, so nothing else on it would ever say the
+    // primary was down: the reply went out, the customer was served, and the only trace would be a
+    // usage row under another model's name. Warn rather than info — this is the operator's one
+    // signal that a provider they are paying for is not taking their traffic.
+    onModelFallback: ({ provider, model, reason }) =>
+      emitFlowEvent(flow, {
+        stage: "generate",
+        level: "warn",
+        status: "ok",
+        provider,
+        model,
+        detail: { fallbackFrom: loaded.mc.provider, fallbackReason: reason },
+      }),
+    // The turn's real ending when there was a second provider and it failed too. `error` rather
+    // than `warn`: the customer got nothing. The stage line that wraps the call is labelled with the
+    // primary by construction, so without this the last thing an operator reads is an error against
+    // the model that never made the second call.
+    // ATTRIBUTION, NOT A SECOND ALARM, which is why this one line is `info` while the failure it
+    // describes is an error. The `generate` stage this call sits inside emits its OWN error when the
+    // turn throws, and alert coalescing keys on (channel, stage, level): two `generate`/`error` events
+    // for one failed turn bump one delivery to "×2" — or, losing the race on the coalesce window, send
+    // two — so the operator is paged twice for one outage and the Logs show two errors for one failure.
+    // The stage owns the alarm; this line exists only to say WHICH model died, because the stage is
+    // labelled with the primary by construction and would otherwise blame the model that never made
+    // the second call. `status` stays "error": the call did fail.
+    onModelFallbackFailed: ({ provider, model, reason }) =>
+      emitFlowEvent(flow, {
+        stage: "generate",
+        level: "info",
+        status: "error",
+        provider,
+        model,
+        detail: { fallbackFailed: reason },
+      }),
+    // The mirror image, and it fires BEFORE any failure: a fallback the operator configured and that
+    // cannot be built leaves the turn with nothing behind it, which is indistinguishable from having
+    // configured none. Reported once per turn build rather than on the failure, because by then it
+    // is too late to be the warning it needs to be.
+    onModelFallbackUnavailable: ({ provider, model, reason }) =>
+      emitFlowEvent(flow, {
+        stage: "generate",
+        level: "warn",
+        status: "ok",
+        provider,
+        model,
+        detail: { fallbackUnavailable: reason },
       }),
     // The history ceiling dropped older attendances from this turn. INFO, not warn: emitFlowEvent
     // fans warn/error out to the alert channels, and a correctly configured ceiling trims on nearly

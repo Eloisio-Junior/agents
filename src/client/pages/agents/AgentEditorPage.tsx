@@ -61,6 +61,8 @@ import { IntegrationEditModal } from "@/client/pages/resources/IntegrationEditMo
 import { McpEditModal } from "@/client/pages/resources/McpEditModal";
 import { ToolEditModal } from "@/client/pages/resources/ToolEditModal";
 import { useKnowledgeManager } from "@/client/pages/resources/useKnowledgeManager";
+import { readModelFallbackConfig } from "@/graph/fallback-settings";
+import { modelOptionalFor } from "@/graph/model-defaults";
 import { collectOversizedTextChanges } from "@/modules/agents/text-caps";
 import type { Schedule } from "@/modules/business-hours/hours";
 import {
@@ -79,6 +81,7 @@ import {
   BehaviorTab,
   type ContactAuthState,
   type MemoryState,
+  type ModelFallbackState,
   type SendImageState,
 } from "./BehaviorTab";
 import {
@@ -92,6 +95,10 @@ import { GuardrailsTab } from "./GuardrailsTab";
 import { readGuardrailsFormState } from "./guardrailsFormState";
 import { KnowledgeTab } from "./KnowledgeTab";
 import { memoryToForm, memoryToStored } from "./memoryFormState";
+import {
+  modelFallbackToForm,
+  modelFallbackToStored,
+} from "./modelFallbackFormState";
 import {
   observabilityToForm,
   observabilityToStored,
@@ -428,6 +435,7 @@ function readBehaviorState(a: Agent) {
     // defaults to ON and a hand-rolled `=== true` would show the switch off on every agent whose bag
     // predates the feature, then persist that lie on the next save.
     memory: memoryToForm(s),
+    modelFallback: modelFallbackToForm(s),
   };
 }
 
@@ -714,6 +722,9 @@ function AgentEditor() {
   // the round-trip pair produces, so a field added to `compaction` cannot default differently here
   // than it does everywhere else.
   const [memory, setMemory] = useState<MemoryState>(() => memoryToForm({}));
+  const [modelFallback, setModelFallback] = useState<ModelFallbackState>(() =>
+    modelFallbackToForm({}),
+  );
   // NOTE: Hosts the send_image tool may fetch from. Mirrors agent.settings.sendImage
   // (modules/images/settings), edited as one host per line.
   const [sendImage, setSendImage] = useState<SendImageState>({
@@ -785,6 +796,7 @@ function AgentEditor() {
   const sttCredBaseUrl = vaultBaseUrl(stt.credentialRef);
   const visionCredBaseUrl = vaultBaseUrl(vision.credentialRef);
   const memoryCredBaseUrl = vaultBaseUrl(memory.credentialRef);
+  const modelFallbackCredBaseUrl = vaultBaseUrl(modelFallback.credentialRef);
   const ttsNormalizeCredBaseUrl = vaultBaseUrl(tts.normalizeCredentialRef);
 
   // Tool selection
@@ -914,6 +926,7 @@ function AgentEditor() {
     setObservability(b.observability);
     setSavedObservability(b.observability);
     setMemory(b.memory);
+    setModelFallback(b.modelFallback);
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
     setChannelRedirect(readChannelRedirectState(a));
@@ -952,6 +965,7 @@ function AgentEditor() {
     setObservability(b.observability);
     setSavedObservability(b.observability);
     setMemory(b.memory);
+    setModelFallback(b.modelFallback);
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
   }, []);
@@ -1118,7 +1132,7 @@ function AgentEditor() {
   function guardModelBeforeSave(): boolean {
     if (
       model.provider &&
-      model.provider !== "openai-compatible" &&
+      !modelOptionalFor(model.provider) &&
       !model.model.trim()
     ) {
       showToast(
@@ -1253,6 +1267,7 @@ function AgentEditor() {
       // field the form dropped would be deleted on the next save — which is exactly how
       // `tts.baseURL` was lost once, and the round-trip test over ./memoryFormState is the guard.
       memory: memoryToStored(memory),
+      modelFallback: modelFallbackToStored(modelFallback),
       attributeContext: {
         conversation: attributeContext.conversation,
         contact: attributeContext.contact,
@@ -1300,6 +1315,7 @@ function AgentEditor() {
       sendImage,
       observability,
       memory,
+      modelFallback,
     }),
     // The WhatsApp→website-chat redirect (own Save button). widgetInboxId is excluded (server-owned,
     // persisted on provision), so provisioning the widget never lights up this tab's unsaved-changes dot.
@@ -1470,7 +1486,9 @@ function AgentEditor() {
   // t('editor.configIssue.ttsNormalize', 'The speech rewrite is on but its model configuration cannot run, so replies will be spoken without it. Check its provider, model, key and endpoint.')
   // t('editor.configIssuePending.ttsNormalize', 'The speech-rewrite credential is referenced but not filled in yet.')
   // t('editor.configIssue.memoryModel', 'A separate model is set for attendance summaries but its configuration cannot run, so attendances that end will not be summarized and the contact keeps no memory of them. Check its provider, model, key and endpoint.')
+  // t('editor.configIssue.modelFallback', 'A fallback provider is set but its configuration cannot run, so a turn the primary provider drops is still lost. Check its provider, model, key and endpoint.')
   // t('editor.configIssuePending.memoryModel', 'The summary-model credential is referenced but not filled in yet, so attendances that end are not summarized.')
+  // t('editor.configIssuePending.modelFallback', 'The fallback-provider credential is referenced but not filled in yet, so the fallback cannot take a turn.')
   // t('editor.configIssue.vision', 'Image/document reading is on but has no API key set.')
   // t('editor.configIssue.guardrails', 'Guardrails are on but have no API key set, so messages go out unscreened.')
   // t('editor.configIssuePending.guardrails', 'The guardrails credential is referenced but not filled in yet, so messages go out unscreened.')
@@ -1494,6 +1512,7 @@ function AgentEditor() {
   // t('editor.configIssueUnresolved.tts', 'The audio-reply credential no longer exists, so replies are sent as text.')
   // t('editor.configIssueUnresolved.ttsNormalize', 'The speech-rewrite credential no longer exists, so replies are spoken without the rewrite.')
   // t('editor.configIssueUnresolved.memoryModel', 'The summary-model credential no longer exists, so attendances that end are not summarized.')
+  // t('editor.configIssueUnresolved.modelFallback', 'The fallback-provider credential no longer exists, so the fallback cannot take a turn.')
   // t('editor.configIssueUnresolved.vision', 'The image-reading credential no longer exists, so images and documents are not read.')
   // t('editor.configIssueUnresolved.embedding', 'A knowledge base needs indexing, but the embedding credential no longer exists.')
   // Knowledge bases this agent uses (its RAG grant) that still have documents awaiting indexing —
@@ -1522,6 +1541,12 @@ function AgentEditor() {
     readMemoryConfig(syncedAgentRef.current?.settings).compaction
       .credentialRef ?? "",
   );
+  // Same rule, same reason: the fallback is judged on the STORED bag, so its endpoint has to come
+  // from the credential the row names rather than from the one the form is holding.
+  const savedModelFallbackCredBaseUrl = vaultBaseUrl(
+    readModelFallbackConfig(syncedAgentRef.current?.settings).credentialRef ??
+      "",
+  );
   const configIssues = computeConfigIssues({
     settings: syncedAgentRef.current?.settings,
     // Saved, like the settings above. Absent only before the first load lands, and nothing that
@@ -1537,6 +1562,7 @@ function AgentEditor() {
     savedModelBaseURL: savedModelBaseUrl,
     savedModelCredentialRef: savedModel.credentialRef,
     savedMemoryCredentialBaseURL: savedMemoryCredBaseUrl,
+    savedModelFallbackCredentialBaseURL: savedModelFallbackCredBaseUrl,
     ttsNormalize: tts.normalize,
     ttsNormalizeProvider: tts.normalizeProvider,
     ttsNormalizeModel: tts.normalizeModel,
@@ -2091,6 +2117,7 @@ function AgentEditor() {
     setObservability(b.observability);
     setSavedObservability(b.observability);
     setMemory(b.memory);
+    setModelFallback(b.modelFallback);
     setSendImage(b.sendImage);
     setAttributeContext(b.attributeContext);
   };
@@ -3015,10 +3042,13 @@ function AgentEditor() {
                 setVision={setVision}
                 visionCredBaseUrl={visionCredBaseUrl}
                 memoryCredBaseUrl={memoryCredBaseUrl}
+                modelFallbackCredBaseUrl={modelFallbackCredBaseUrl}
                 limits={limits}
                 setLimits={setLimits}
                 memory={memory}
                 setMemory={setMemory}
+                modelFallback={modelFallback}
+                setModelFallback={setModelFallback}
                 observability={observability}
                 setObservability={setObservability}
                 sendImage={sendImage}

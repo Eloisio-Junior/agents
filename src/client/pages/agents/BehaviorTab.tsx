@@ -7,6 +7,7 @@ import {
   Image,
   ImagePlus,
   Layers,
+  LifeBuoy,
   ListChecks,
   Megaphone,
   Mic,
@@ -63,6 +64,10 @@ import {
 import { FOLLOW_UP_MAX_STEPS } from "@/modules/followups/settings";
 import { visionAcceptsDocuments } from "@/modules/vision/document-support";
 import { DEFAULT_EXTRACTION_PROMPT } from "@/modules/vision/prompt-default";
+import {
+  fallbackIsConfigured,
+  fallbackModelIsMissing,
+} from "./modelFallbackFormState";
 import {
   overrideBaseUrlInvalid,
   overrideBaseUrlUnsupported,
@@ -192,6 +197,16 @@ export interface MemoryState {
   baseURL: string;
 }
 
+// The second provider behind the agent's own. No `enabled` flag of its own, deliberately: a
+// fallback exists exactly when a provider AND a model are named, so the switch would be a third way
+// to say the same thing and a way for the two to disagree.
+export interface ModelFallbackState {
+  provider: string;
+  model: string;
+  credentialRef: string;
+  baseURL: string;
+}
+
 export interface SendImageState {
   allowedHosts: string;
 }
@@ -263,6 +278,9 @@ interface BehaviorTabProps {
   limits: LimitsState;
   memory: MemoryState;
   setMemory: React.Dispatch<React.SetStateAction<MemoryState>>;
+  modelFallback: ModelFallbackState;
+  setModelFallback: React.Dispatch<React.SetStateAction<ModelFallbackState>>;
+  modelFallbackCredBaseUrl: string | null;
   // The base URL stored on the summarizer's OWN credential, when it has one. Outranks the typed
   // field, exactly as it does for the speech rewrite.
   memoryCredBaseUrl: string | null;
@@ -962,6 +980,9 @@ export function BehaviorTab({
   limits,
   memory,
   setMemory,
+  modelFallback,
+  setModelFallback,
+  modelFallbackCredBaseUrl,
   memoryCredBaseUrl,
   observability,
   savedObservability,
@@ -1140,6 +1161,50 @@ export function BehaviorTab({
     memoryCredBaseUrl,
     memory.compactionEnabled,
   );
+  const fallbackOverride = {
+    provider: modelFallback.provider,
+    model: modelFallback.model,
+    credentialRef: modelFallback.credentialRef,
+    baseURL: modelFallback.baseURL,
+  };
+  // A fallback is CONFIGURED once a destination is named, and that is the flag every check below
+  // reads — including the endpoint ones, which is why it has to agree with the backend rather than
+  // approximate it. Written as "both halves are named", it answered NO for a model-less
+  // `openai-compatible` fallback, which the backend calls configured: the base-URL checks switched
+  // themselves off, Save went through on a missing or malformed endpoint, the server stored it, and
+  // the runtime could not build it. Same rule, same predicate, one place.
+  const fallbackConfigured = fallbackIsConfigured(modelFallback);
+  // Named, and on the save gate, because the round trip does not survive it: `modelFallbackToStored`
+  // persists `{provider: "openai", model: null}`, `hasModelFallback` answers false, and the form
+  // reader maps that straight back to "No fallback" — so the provider the operator picked is gone on
+  // the next load with nothing on screen to say why. The write boundary refuses it too
+  // (`assertSettingsModelFallback`, which is what covers the MCP patch); this is what keeps the
+  // operator from meeting that refusal as a 400 on a button they were never stopped from pressing.
+  const fallbackModelMissing = fallbackModelIsMissing(modelFallback);
+  const fallbackSource = overridePickerSource(
+    fallbackOverride,
+    agentModel,
+    modelFallbackCredBaseUrl,
+  );
+  const fallbackEffectiveProvider =
+    modelFallback.provider || agentModelProvider;
+  const fallbackNeedsOwnCredential = overrideNeedsOwnCredential(
+    fallbackOverride,
+    agentModel,
+    modelFallbackCredBaseUrl,
+  );
+  const fallbackBaseUrlInvalid = overrideBaseUrlInvalid(
+    fallbackOverride,
+    agentModel,
+    modelFallbackCredBaseUrl,
+    fallbackConfigured,
+  );
+  const fallbackBaseUrlUnsupported = overrideBaseUrlUnsupported(
+    fallbackOverride,
+    agentModel,
+    modelFallbackCredBaseUrl,
+    fallbackConfigured,
+  );
   const normalizeBaseUrlInvalid = ttsNormalizerBaseUrlInvalid(
     tts,
     agentModel,
@@ -1227,6 +1292,11 @@ export function BehaviorTab({
       id: "memory",
       icon: Brain,
       label: t("editor.memory", "Memory"),
+    },
+    {
+      id: "modelFallback",
+      icon: LifeBuoy,
+      label: t("editor.modelFallback", "Fallback provider"),
     },
     {
       id: "observability",
@@ -2613,6 +2683,172 @@ export function BehaviorTab({
           </Section>
 
           <Section
+            id="modelFallback"
+            icon={LifeBuoy}
+            title={t("editor.modelFallback", "Fallback provider")}
+            description={t(
+              "editor.modelFallbackHint",
+              "Where a turn goes when the agent's own provider cannot take it: rate-limited, overloaded, or not answering. Only those. A key the provider rejected, a model id it does not know, or a request it refused are NOT failed over, because the second provider would answer them fine and you would never find out the first one is broken \u2014 you would just be billed by both. Leave it empty and nothing changes: a turn that fails today keeps failing the same way.",
+            )}
+          >
+            <FormField
+              label={t("editor.provider", "Provider")}
+              description={t(
+                "editor.modelFallbackProviderHint",
+                "Pick a different vendor than the agent's whenever you can. The same vendor rate-limits your account as a whole, so a second model there is usually down for the same reason at the same moment.",
+              )}
+            >
+              <Select
+                value={modelFallback.provider}
+                onChange={(e) =>
+                  setModelFallback((prev) => ({
+                    ...prev,
+                    ...overrideProviderChanged(
+                      {
+                        provider: prev.provider,
+                        model: prev.model,
+                        credentialRef: prev.credentialRef,
+                        baseURL: prev.baseURL,
+                      },
+                      e.target.value,
+                    ),
+                  }))
+                }
+              >
+                <option value="">
+                  {t("editor.modelFallbackNone", "No fallback")}
+                </option>
+                {MODEL_PROVIDERS.map((p) => (
+                  <option key={p} value={p}>
+                    {providerLabel(p, t)}
+                  </option>
+                ))}
+              </Select>
+            </FormField>
+            {!!modelFallback.provider && (
+              <div className="flex flex-col gap-3">
+                <FormField
+                  label={t("editor.credential", "API key")}
+                  description={t(
+                    "editor.modelFallbackCredentialHint",
+                    "Required when the provider differs from the agent's: the agent's key is never sent to another vendor, so without a key of its own there is nothing behind the provider and the turn fails as it would with no fallback at all.",
+                  )}
+                  group
+                >
+                  <CredentialPicker
+                    value={modelFallback.credentialRef}
+                    onChange={(v) =>
+                      setModelFallback((prev) => ({
+                        ...prev,
+                        ...overridePicked(
+                          {
+                            provider: prev.provider,
+                            model: prev.model,
+                            credentialRef: prev.credentialRef,
+                            baseURL: prev.baseURL,
+                          },
+                          "credentialRef",
+                          v,
+                          agentModelProvider,
+                        ),
+                      }))
+                    }
+                    required={fallbackNeedsOwnCredential}
+                    compatibleTypes={credentialCompat.model(
+                      fallbackEffectiveProvider,
+                    )}
+                    defaultCreateType={
+                      credentialCompat.model(fallbackEffectiveProvider)[0]
+                    }
+                    ariaLabel={t("editor.credential", "API key")}
+                  />
+                </FormField>
+                <FormField
+                  label={t("editor.model", "Model")}
+                  // The same predicate the save gate reads, so the red field and the disabled button
+                  // cannot drift apart: a provider with no model stores cleanly, comes back as "No
+                  // fallback", and builds nothing.
+                  error={
+                    fallbackModelMissing
+                      ? t(
+                          "editor.modelFallbackModelRequired",
+                          "Pick a model, or the fallback is saved and never runs.",
+                        )
+                      : null
+                  }
+                  group
+                >
+                  <ModelPicker
+                    value={modelFallback.model}
+                    onChange={(v) =>
+                      setModelFallback((prev) => ({
+                        ...prev,
+                        ...overridePicked(
+                          {
+                            provider: prev.provider,
+                            model: prev.model,
+                            credentialRef: prev.credentialRef,
+                            baseURL: prev.baseURL,
+                          },
+                          "model",
+                          v,
+                          agentModelProvider,
+                        ),
+                      }))
+                    }
+                    provider={fallbackEffectiveProvider}
+                    credentialRef={fallbackSource.credentialRef || undefined}
+                    baseURL={fallbackSource.baseURL || undefined}
+                  />
+                </FormField>
+                {(fallbackEffectiveProvider === "openai-compatible" ||
+                  !!modelFallbackCredBaseUrl ||
+                  !!modelFallback.baseURL.trim()) && (
+                  <FormField
+                    label={t("editor.baseURL", "Base URL")}
+                    description={
+                      modelFallbackCredBaseUrl
+                        ? t(
+                            "editor.baseURLFromCredential",
+                            "Defined by the selected credential.",
+                          )
+                        : t(
+                            "editor.modelFallbackBaseURLHint",
+                            "Required for OpenAI-compatible endpoints, unless the credential already carries one.",
+                          )
+                    }
+                    error={
+                      fallbackBaseUrlUnsupported
+                        ? t(
+                            "editor.baseURLNotSentByProvider",
+                            "This provider does not send a base URL: the request would go to its own endpoint instead. Pick a credential without one, or use an OpenAI-compatible provider.",
+                          )
+                        : fallbackBaseUrlInvalid && modelFallback.baseURL.trim()
+                          ? t(
+                              "common.invalidUrl",
+                              "Must be a valid http(s) URL.",
+                            )
+                          : null
+                    }
+                  >
+                    <Input
+                      value={modelFallbackCredBaseUrl ?? modelFallback.baseURL}
+                      onChange={(e) =>
+                        setModelFallback((prev) => ({
+                          ...prev,
+                          baseURL: e.target.value,
+                        }))
+                      }
+                      disabled={!!modelFallbackCredBaseUrl}
+                      placeholder="https://..."
+                    />
+                  </FormField>
+                )}
+              </div>
+            )}
+          </Section>
+
+          <Section
             id="observability"
             icon={ScrollText}
             title={t("editor.observability", "Logs")}
@@ -2930,7 +3166,10 @@ export function BehaviorTab({
           normalizeBaseUrlInvalid ||
           normalizeBaseUrlUnsupported ||
           memoryBaseUrlInvalid ||
-          memoryBaseUrlUnsupported
+          memoryBaseUrlUnsupported ||
+          fallbackBaseUrlInvalid ||
+          fallbackBaseUrlUnsupported ||
+          fallbackModelMissing
         }
         onOpenPlayground={onOpenPlayground}
       />

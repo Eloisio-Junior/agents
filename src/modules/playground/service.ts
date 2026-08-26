@@ -6,6 +6,7 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { lastAssistantText } from "@/graph/graph";
+import type { ModelRetryInfo } from "@/graph/model-limit";
 import type { ResolvedModelConfig } from "@/graph/models";
 import {
   type AgentNudge,
@@ -297,7 +298,25 @@ async function buildPlaygroundGraph(params: {
   turnId?: string;
   // Same warn line the reactive turn leaves when a model call had to be retried. The caller passes
   // it because the FlowContext is the caller's.
-  onModelRetry?: (info: { attempt: number; error: unknown }) => void;
+  onModelRetry?: (info: ModelRetryInfo) => void;
+  // The same two lines the two production entrypoints leave. The playground is where an operator
+  // finds out what their agent does, so a fallback that silently answers here is a fallback they
+  // conclude the wrong things from.
+  onModelFallback?: (info: {
+    provider: string;
+    model: string;
+    reason: string;
+  }) => void;
+  onModelFallbackFailed?: (info: {
+    provider: string;
+    model: string;
+    reason: string;
+  }) => void;
+  onModelFallbackUnavailable?: (info: {
+    provider: string;
+    model: string;
+    reason: string;
+  }) => void;
   onHistoryTrim?: (info: {
     kept: number;
     dropped: number;
@@ -338,6 +357,9 @@ async function buildPlaygroundGraph(params: {
     makeModel: params.deps?.makeModel,
     checkpointer: params.deps?.checkpointer,
     onModelRetry: params.onModelRetry,
+    onModelFallback: params.onModelFallback,
+    onModelFallbackFailed: params.onModelFallbackFailed,
+    onModelFallbackUnavailable: params.onModelFallbackUnavailable,
     onHistoryTrim: params.onHistoryTrim,
   });
   // Tag usage as playground so it never pollutes the real dashboard figures (the dashboard
@@ -483,12 +505,49 @@ export async function runPlaygroundTurn(
       deps: params.deps,
       overrides: params.overrides,
       turnId,
-      onModelRetry: ({ attempt }) =>
+      onModelRetry: ({ attempt, provider, model }) =>
         emitFlowEvent(flow, {
           stage: "generate",
           level: "warn",
           status: "ok",
+          provider,
+          model,
           detail: { retriedEmptyResponse: attempt },
+        }),
+      onModelFallback: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "warn",
+          status: "ok",
+          provider,
+          model,
+          detail: { fallbackReason: reason },
+        }),
+      // ATTRIBUTION, NOT A SECOND ALARM, which is why this one line is `info` while the failure it
+      // describes is an error. The `generate` stage this call sits inside emits its OWN error when the
+      // turn throws, and alert coalescing keys on (channel, stage, level): two `generate`/`error` events
+      // for one failed turn bump one delivery to "×2" — or, losing the race on the coalesce window, send
+      // two — so the operator is paged twice for one outage and the Logs show two errors for one failure.
+      // The stage owns the alarm; this line exists only to say WHICH model died, because the stage is
+      // labelled with the primary by construction and would otherwise blame the model that never made
+      // the second call. `status` stays "error": the call did fail.
+      onModelFallbackFailed: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "info",
+          status: "error",
+          provider,
+          model,
+          detail: { fallbackFailed: reason },
+        }),
+      onModelFallbackUnavailable: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "warn",
+          status: "ok",
+          provider,
+          model,
+          detail: { fallbackUnavailable: reason },
         }),
       onHistoryTrim: ({ kept, dropped, tokens }) =>
         emitFlowEvent(flow, {
@@ -812,12 +871,49 @@ export async function runPlaygroundFollowup(
       deps: params.deps,
       overrides: params.overrides,
       turnId,
-      onModelRetry: ({ attempt }) =>
+      onModelRetry: ({ attempt, provider, model }) =>
         emitFlowEvent(flow, {
           stage: "generate",
           level: "warn",
           status: "ok",
+          provider,
+          model,
           detail: { retriedEmptyResponse: attempt },
+        }),
+      onModelFallback: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "warn",
+          status: "ok",
+          provider,
+          model,
+          detail: { fallbackReason: reason },
+        }),
+      // ATTRIBUTION, NOT A SECOND ALARM, which is why this one line is `info` while the failure it
+      // describes is an error. The `generate` stage this call sits inside emits its OWN error when the
+      // turn throws, and alert coalescing keys on (channel, stage, level): two `generate`/`error` events
+      // for one failed turn bump one delivery to "×2" — or, losing the race on the coalesce window, send
+      // two — so the operator is paged twice for one outage and the Logs show two errors for one failure.
+      // The stage owns the alarm; this line exists only to say WHICH model died, because the stage is
+      // labelled with the primary by construction and would otherwise blame the model that never made
+      // the second call. `status` stays "error": the call did fail.
+      onModelFallbackFailed: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "info",
+          status: "error",
+          provider,
+          model,
+          detail: { fallbackFailed: reason },
+        }),
+      onModelFallbackUnavailable: ({ provider, model, reason }) =>
+        emitFlowEvent(flow, {
+          stage: "generate",
+          level: "warn",
+          status: "ok",
+          provider,
+          model,
+          detail: { fallbackUnavailable: reason },
         }),
       onHistoryTrim: ({ kept, dropped, tokens }) =>
         emitFlowEvent(flow, {
