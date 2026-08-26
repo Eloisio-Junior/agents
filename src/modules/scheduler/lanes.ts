@@ -1,3 +1,4 @@
+import type { FlowLevel } from "@/modules/flowlog/stages";
 import type { SchedulerJobKind } from "@/modules/scheduler/service";
 
 // Which drain each job kind belongs to, and the rule for when a new drain is warranted.
@@ -159,6 +160,65 @@ export const JOB_TRAFFIC_PROPORTIONAL: Record<SchedulerJobKind, boolean> = {
   INGEST_MESSAGE: true,
   // One row per tenant, re-armed forever. Bounded by the install's tenant count, not by traffic.
   DELIVERY_SWEEP: false,
+};
+
+// WHAT ONE KIND'S DEATH MEANS TO THE OPERATOR, at the only moment the scheduler can state it
+// (issue #356). Read by the generic dead-letter announcement in ./worker.ts.
+//
+// A Record over SchedulerJobKind, like its three neighbours above, and for the sharper reason here:
+// the thing this issue is about is a kind reaching DEAD with nobody having decided what that means.
+// A default would cover today's twelve and hand the thirteenth the same silence in a new shape —
+// this does not compile until the new kind has been asked the question.
+//
+// The rule the answers follow: `error` where the system accepted work and lost it, `warn` where the
+// operator has their own way back to it. Nothing is `info`, because `AlertChannel.minLevel` does not
+// accept `info` and a line nobody can subscribe to is not an announcement.
+//
+// Every answer here is currently `error`, and that is a result rather than a default — one entry was
+// `warn` until a review round showed the reasoning behind it was about the wrong failure (see
+// RAG_INGEST). A table where the answers agree is not a table that could be replaced by a default:
+// the default would hand the thirteenth kind an answer nobody chose, and the RAG_INGEST entry is the
+// evidence that the answer is not obvious even for the twelve that exist.
+export const JOB_DEATH_LEVEL: Record<SchedulerJobKind, FlowLevel> = {
+  // A lead that will never be followed up, and nothing on the conversation says so.
+  FOLLOWUP: "error",
+  // The sweep that ARMS the follow-ups. Its death stops every future one, for every contact.
+  FOLLOWUP_SWEEP: "error",
+  // The retry drain for outbound deliveries; without it a subscriber's events stop arriving.
+  WEBHOOK_RETRY: "error",
+  // Registers its own hook (../debounce/handler.ts), which announces where a burst's loss is
+  // actually felt: a private note on the customer's own conversation, by #71's decision, and not a
+  // trail line at all. This is the level of the GENERIC line that stands in when nothing registered
+  // one — a real state, since `registerDebounceHandler` runs only under DEBOUNCE_WORKER_ENABLED
+  // while the scheduler's reaper can still reap a stale DEBOUNCE claim. A burst that is never
+  // answered is a customer waiting on nobody, so it is not an advisory.
+  DEBOUNCE: "error",
+  // NOT the recoverable case, which is the one this entry was written for and got wrong. A document
+  // whose INDEXING failed is stamped FAILED by ../rag/documents.ts, which announces it itself at
+  // `warn` — the knowledge-base page shows it with a re-index in reach. What reaches THIS line is
+  // the other half: a throw before that catch is entered (the scoped load, `resolveEmbeddingStatus`)
+  // propagates out of the handler, so after five of them the job is DEAD while the document is still
+  // PENDING — and `retryDocument` refuses anything that is not FAILED or UNINDEXED with a 409. The
+  // operator has no way back to it at all.
+  RAG_INGEST: "error",
+  // Self-rescheduling: one death ends the loop, and outbound heartbeats stop for good.
+  HEARTBEAT: "error",
+  // Self-rescheduling, and the hardest of them to notice from outside: retention silently stops.
+  FLOWLOG_SWEEP: "error",
+  // A customer who is not reminded of an appointment, and nobody learns.
+  APPOINTMENT_REMINDER: "error",
+  REDIRECT_FOLLOWUP: "error",
+  // Registers its own hook (../memory/compact.ts); same standing-in reason as DEBOUNCE, since that
+  // registration runs under the scheduler OR the compaction worker. `error` because the hook itself
+  // decided `error` with the reason written above it: a corrected configuration heals the NEXT
+  // attendance, and the one this job was carrying is gone. The stand-in must not undercut the line
+  // it stands in for.
+  MEMORY_COMPACT: "error",
+  // A message the turn will never see. The customer wrote and is waiting.
+  INGEST_MESSAGE: "error",
+  // Self-rescheduling: its death is stranded deliveries going unreported from then on, which is the
+  // silence #282 had just finished closing.
+  DELIVERY_SWEEP: "error",
 };
 
 export function kindsInLane(
