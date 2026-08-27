@@ -147,18 +147,43 @@ process.env.JWT_SECRET = "test-secret-key-for-testing-only";
 // `/auth/google` regardless of the developer's local `.env` and so tests can
 // exercise the enabled-mode code path.
 process.env.GOOGLE_CLIENT_ID = "test-google-client.apps.googleusercontent.com";
-// NOTE: Force the shipped rate-limit budgets, for the same reason as the line
-// above and with one consequence worth spelling out. Two test files read a real
-// response from the real app: one identifies WHICH limiter answered by the
-// ceiling it advertises (`RateLimit-Limit: 20` is the credential bucket, 600 the
-// global one), the other measures what a rejected request costs by watching the
+// NOTE: Force the rate-limit budgets, for the same reason as the line above and
+// with one consequence worth spelling out. Two test files read a real response
+// from the real app: one identifies WHICH limiter answered by the ceiling it
+// advertises (`RateLimit-Limit: 20` is the credential bucket, 1000000 the global
+// one), the other measures what a rejected request costs by watching the
 // remaining budget move. All four of these are environment variables, so a
 // developer who tunes one in their `.env` would watch a correct app fail, and
-// fail with `Expected: "20", Received: "600"`, which is exactly the signature of
-// the limiter-collision regression those tests exist to catch. Pinning here, at
-// preload and before any module reads config, is what keeps that signal
+// fail with `Expected: "20", Received: "1000000"`, which is exactly the signature
+// of the limiter-collision regression those tests exist to catch. Pinning here,
+// at preload and before any module reads config, is what keeps that signal
 // unambiguous.
-process.env.RATE_LIMIT_USER_PER_MIN = "600";
+//
+// THE GLOBAL BUDGET IS PINNED HIGH RATHER THAN SHIPPED-ACCURATE, and that is the
+// one number here that is not the production default. `server.handle` has no
+// socket, so `server.requestIP` answers nothing and `resolveClientIp` falls back
+// to the constant "unknown": every request every file sends through the app
+// shares ONE bucket, for the whole process, over a 60s window. Measured in a
+// fresh process, the 601st `server.handle` call came back 429. The limiter is not
+// wrong — in production each client carries its own peer — but the ambient
+// ceiling is a resource 520 files compete for, and whoever is running when it
+// runs out fails on a status it never asked about. It cost two branding tests on
+// master CI (429 where they expected 200 and 401) while the same suite passed
+// locally: what differs between the two machines is how the requests fall across
+// the minute, not what any of them assert.
+//
+// The other three stay shipped-accurate, because nothing can exhaust them
+// through that shared key: the MCP transport bucket is reached from two call
+// sites in the whole suite, and the credential bucket (20 per 5 minutes, and the
+// suite runs in under 5) from none — every test that drives /auth/login either
+// runs a real server, where the peer is 127.0.0.1 and the key is its own, or
+// calls the service directly.
+//
+// The limiter is still exercised at a reachable budget, which is the coverage
+// this line would otherwise cost: rateLimit.test.ts and rateLimitMetering.test.ts
+// build the REAL middleware with an explicit `max`, which is what that parameter
+// exists for.
+process.env.RATE_LIMIT_USER_PER_MIN = "1000000";
 process.env.RATE_LIMIT_MCP_PER_MIN = "1200";
 process.env.RATE_LIMIT_CREDENTIAL_MAX = "20";
 process.env.RATE_LIMIT_CREDENTIAL_WINDOW_MINUTES = "5";
