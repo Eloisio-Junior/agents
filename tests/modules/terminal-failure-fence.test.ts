@@ -101,6 +101,15 @@ const CENSUS: Record<string, string> = {
     "a document that will never be indexed; the second line is the same fact broadcast live (#356)",
   "src/modules/chatwoot/delivery-sweep.ts:record":
     "a delivery stranded by a process death (#282)",
+  // The one entry here that is not a death. It RESTORES the verdict `record` already reached and
+  // already announced: a recovery that claimed the row out of `DEAD` and then could not answer —
+  // the delivery path threw, the turn threw, or the turn withheld its reply — puts it back, so the
+  // next attempt finds a row it can claim instead of one that reads as somebody else's. Announcing
+  // the RESTORE would page a second time about a message the loss line already reported, which is
+  // how an alert channel stops being read (#295). The FAILURE to restore is a different event and
+  // does page, from inside this same helper: from `PROCESSED` nothing revisits the row.
+  "src/modules/chatwoot/recover-delivery.ts:putRowBack":
+    "ALREADY ANNOUNCED: ./delivery-sweep.ts record, when this row was first declared DEAD",
   // The two that announce ELSEWHERE, and the only exemptions here. Both are CAS writes in the
   // scheduler's service layer, and neither can announce from where it sits: what a dead job means is
   // decided per kind by a registry only the worker holds, and both roads converge on the worker's
@@ -114,6 +123,9 @@ const CENSUS: Record<string, string> = {
 const ANNOUNCES_ELSEWHERE = new Set([
   "src/modules/scheduler/service.ts:failJob",
   "src/modules/scheduler/service.ts:reapStaleJobs",
+  // Not "announces elsewhere" but "was announced ALREADY", which lands in the same set because the
+  // question this asks is whether the write reaches an operator, and this one's already did.
+  "src/modules/chatwoot/recover-delivery.ts:putRowBack",
 ]);
 
 async function sweepSrc(): Promise<{ key: string; announces: boolean }[]> {
