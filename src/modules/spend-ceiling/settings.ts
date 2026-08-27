@@ -64,12 +64,23 @@ export interface SpendCeilingConfig {
 // Off by default, and every other field carries the value an operator who switches it on would
 // otherwise have to think about. The default MESSAGE is the field that matters most here: it is
 // what a tenant that never opens this screen shows its customers.
+//
+// It is written against the `handoffEnabled: true` two lines below, and the verb is picked to match
+// what the handoff actually DOES — it opens the conversation for humans, it pages nobody. So
+// "encaminhei" is true and the "já avisei a equipe, e alguém continua por aqui" it replaces was
+// not: it claimed an active notice and a present human, and the handoff delivers neither. The pair
+// is only true together, though, and the two fields are independent on the screen: an operator who
+// turns the handoff off and leaves this text ships a promise nothing keeps, and nothing warns them.
+//
+// What it deliberately does not do: name a deadline (the ceiling holds until the month turns or the
+// operator raises it) and invite a retry (retrying cannot help, and the customer spends their
+// patience learning that).
 export const SPEND_CEILING_DEFAULTS: SpendCeilingConfig = {
   enabled: false,
   monthlyInboxTokens: 0,
   monthlyPlaygroundTokens: 0,
   overCeilingMessage:
-    "Não consigo responder agora. Já avisei a equipe, e alguém continua por aqui.",
+    "Não consigo responder agora. Encaminhei sua mensagem para a equipe.",
   handoffEnabled: true,
   noticeCooldownSeconds: 300,
   warnAtPercent: 80,
