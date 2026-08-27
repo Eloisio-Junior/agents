@@ -14,12 +14,18 @@ import {
 } from "@/lib/errors";
 import { parseInput } from "@/lib/parse-input";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import {
+  agentUpdateAudit,
+  auditSafe,
+  grantSetChanged,
+} from "@/modules/agents/audit-projection";
 import { collectCredentialRefWrites } from "@/modules/agents/credential-paths";
 import { collectOversizedTextChanges } from "@/modules/agents/text-caps";
 import {
   invalidToolPreconditions,
   parseToolPrecondition,
 } from "@/modules/agents/tool-preconditions";
+import { auditMutation } from "@/modules/audit/service";
 import { isOutOfHoursNow, parseSchedule } from "@/modules/business-hours/hours";
 import { renameAgentBots } from "@/modules/chatwoot/provisioning";
 import { invalidateRouteTokenCache } from "@/modules/chatwoot/route-token-cache";
@@ -696,6 +702,17 @@ export async function updateAgent(
       }>
     >`SELECT enabled, mode, settings, model_config, updated_at FROM agents WHERE id = ${id} FOR UPDATE`;
     const before = beforeRows[0];
+    // NOTE: read AFTER the lock, and that order is the whole point. The raw lock above reads the
+    // four columns the follow-up fence needs; the trail answers for every column an operator can
+    // write, and which of the three actions this call IS comes from comparing them
+    // (audit-projection.ts). Taken BEFORE the lock, this read can observe state A, wait on the lock
+    // while another save commits B, and then have its own write applied against B while the row
+    // says A — and a write that restores A would compare equal and go unrecorded entirely, which is
+    // the one outcome an audit trail cannot have.
+    const beforeRow = await db.agent.findUnique({
+      where: { id },
+      select: AGENT_SELECT,
+    });
     // NOTE: The optimistic-concurrency check comes FIRST, on the locked row. A stale editor resends
     // the settings it loaded, so if the other writer edited a capped field our copy of it is an edit
     // too — validating first would answer 400 "text too long" to what is really a 409, and the
@@ -778,7 +795,22 @@ export async function updateAgent(
       where: { id },
       select: AGENT_SELECT,
     });
-    return toDto(row);
+    const applied = toDto(row);
+    if (beforeRow) {
+      const audit = agentUpdateAudit(
+        toDto(beforeRow) as unknown as Record<string, unknown>,
+        applied as unknown as Record<string, unknown>,
+      );
+      if (audit) {
+        await auditMutation(db, ctx, {
+          action: audit.action,
+          target: `agent:${id}`,
+          before: audit.before,
+          after: audit.after,
+        });
+      }
+    }
+    return applied;
   });
   // Arm the sweep if settings were updated and follow-up is now enabled (idempotent).
   if (rest.settings !== undefined && ctx.tenantId !== null) {
@@ -921,7 +953,17 @@ export async function createAgent(
       },
       select: AGENT_SELECT,
     });
-    return toDto(row);
+    const created = toDto(row);
+    await auditMutation(db, ctx, {
+      action: "agent.create",
+      target: `agent:${created.id}`,
+      after: auditSafe({
+        id: created.id,
+        name: created.name,
+        enabled: created.enabled,
+      }),
+    });
+    return created;
   });
   // Arm the sweep if follow-up is enabled on the new agent (idempotent).
   const followUpCfg = readFollowUpConfig(dto.settings);
@@ -935,6 +977,13 @@ export async function deleteAgent(
   base: PrismaClient = basePrisma,
 ): Promise<void> {
   await runScopedOn(base, ctx, async (db) => {
+    // Read inside the transaction that deletes AND under its lock: the row is what the record is
+    // OF, and after the statement there is nothing left to name it with. Unlocked, a rename that
+    // commits between this read and the delete leaves an `agent.update` saying A→B followed by an
+    // `agent.delete` claiming A was what went.
+    const doomedRows = await db.$queryRaw<Array<{ name: string }>>`
+      SELECT name FROM agents WHERE id = ${id} FOR UPDATE`;
+    const doomed = doomedRows[0];
     // Inbox.agentId and Experiment.agentId are plain references (no FK cascade) — null them so a
     // deleted agent leaves no dangling binding. AgentToolSelection cascades via its FK.
     await db.inbox.updateMany({
@@ -949,6 +998,12 @@ export async function deleteAgent(
     if (res.count === 0) {
       throw new NotFoundError("agent not found", "errors.agentNotFound");
     }
+    await auditMutation(db, ctx, {
+      action: "agent.delete",
+      target: `agent:${id}`,
+      before: auditSafe({ id: String(id), name: doomed?.name }),
+      after: null,
+    });
   });
   // NOTE: ChatwootAgentBot cascades off the agent (schema.prisma: `onDelete: Cascade`), so deleting a
   // persona retires its route token without this module ever naming one. The receiver caches
@@ -1023,7 +1078,17 @@ export async function cloneAgent(
         })),
       });
     }
-    return toDto(created);
+    const clone = toDto(created);
+    await auditMutation(db, ctx, {
+      action: "agent.clone",
+      target: `agent:${clone.id}`,
+      after: auditSafe({
+        id: clone.id,
+        name: clone.name,
+        clonedFrom: String(id),
+      }),
+    });
+    return clone;
   });
 }
 
@@ -1366,6 +1431,30 @@ function toGrantDto(g: {
   };
 }
 
+// Just the granted set, for the audit snapshot. `buildToolSelectionView` answers a different
+// question — it also loads every tool definition, MCP connection, integration, knowledge base and
+// document template, plus a tenant-wide groupBy for unindexed documents — and the snapshot is taken
+// while holding the agent's row lock, where that catalog would be paid twice and held open.
+async function readGrantSet(
+  db: ScopedDb,
+  agentId: bigint,
+): Promise<ToolGrantDto[]> {
+  const grants = await db.agentToolSelection.findMany({
+    where: { agentId },
+    select: {
+      source: true,
+      toolDefinitionId: true,
+      mcpServerConnectionId: true,
+      integrationInstanceId: true,
+      documentTemplateId: true,
+      knowledgeBaseIds: true,
+      enabledTools: true,
+    },
+    orderBy: { id: "asc" },
+  });
+  return grants.map(toGrantDto);
+}
+
 async function buildToolSelectionView(
   db: ScopedDb,
   agentId: bigint,
@@ -1512,10 +1601,15 @@ export async function replaceAgentToolSelections(
   const tenantId = requireTenant(ctx);
   const grants = normalizeGrants(input);
   const view = await runScopedOn(base, ctx, async (db) => {
-    const agent = await db.agent.findUnique({
-      where: { id: agentId },
-      select: { id: true, updatedAt: true },
-    });
+    // NOTE: the agent row is LOCKED before its version is read, and the grant snapshot below is
+    // taken under that lock. The set lives in another table with no version of its own, so this row
+    // is what serializes two replacements against each other: unlocked, one call can read set A,
+    // wait while another commits B, and then write A back while its audit row claims A→A. The
+    // agent is also what `expectedUpdatedAt` is checked against, so the precondition and the
+    // snapshot now answer for the same instant. RLS still applies to the raw read.
+    const locked = await db.$queryRaw<Array<{ updated_at: Date }>>`
+      SELECT updated_at FROM agents WHERE id = ${agentId} FOR UPDATE`;
+    const agent = locked[0] ? { updatedAt: locked[0].updated_at } : null;
     if (!agent) {
       throw new NotFoundError("agent not found", "errors.agentNotFound");
     }
@@ -1636,6 +1730,9 @@ export async function replaceAgentToolSelections(
       }
     }
 
+    // The set as it stands, read before the delete-and-recreate replaces it. Same shape the view
+    // returns, so the row's two halves are comparable.
+    const grantsBefore = await readGrantSet(db, agentId);
     await db.agentToolSelection.deleteMany({ where: { agentId } });
     if (grants.length > 0) {
       await db.agentToolSelection.createMany({
@@ -1659,7 +1756,18 @@ export async function replaceAgentToolSelections(
       where: { id: agentId },
       data: { updatedAt: new Date() },
     });
-    return buildToolSelectionView(db, agentId);
+    const next = await buildToolSelectionView(db, agentId);
+    // Same rule the update path follows: the trail records changes, and the editor resubmits the
+    // whole set on every save of the Tools tab.
+    if (grantSetChanged(grantsBefore, next.grants)) {
+      await auditMutation(db, ctx, {
+        action: "agent.tools_set",
+        target: `agent:${agentId}`,
+        before: auditSafe({ grants: grantsBefore }),
+        after: auditSafe({ grants: next.grants }),
+      });
+    }
+    return next;
   });
   // Heads-up for any open editor (other tab / another operator) — best-effort, metadata-only.
   if (ctx.tenantId !== null && view.agentUpdatedAt) {

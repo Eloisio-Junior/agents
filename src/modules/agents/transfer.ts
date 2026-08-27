@@ -26,6 +26,7 @@ import {
   stdioCommandLauncher,
 } from "@/lib/mcp-launchers";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import { auditSafe } from "@/modules/agents/audit-projection";
 import {
   type CredentialFieldTab,
   credRefSlot,
@@ -33,6 +34,7 @@ import {
   SETTINGS_CREDENTIAL_PATHS,
 } from "@/modules/agents/credential-paths";
 import { clampOversizedTextInPlace } from "@/modules/agents/text-caps";
+import { auditMutation } from "@/modules/audit/service";
 import {
   MAX_SCHEDULE_EXCEPTIONS,
   MAX_SCHEDULE_WINDOWS,
@@ -1128,9 +1130,20 @@ export async function importAgent(
       await db.agentToolSelection.createMany({ data: grantRows });
     }
 
+    const agent = toDto(created);
+    await auditMutation(db, ctx, {
+      action: "agent.import",
+      target: `agent:${agent.id}`,
+      after: auditSafe({
+        id: agent.id,
+        name: agent.name,
+        enabled: agent.enabled,
+        mode: agent.mode,
+      }),
+    });
     // De-dupe: the same credential/component referenced in several places should warn once, and the
     // toast count ("{{n}} warnings") must match the rendered list.
-    return { agent: toDto(created), warnings: dedupeWarnings(warnings) };
+    return { agent, warnings: dedupeWarnings(warnings) };
   });
 }
 
