@@ -9,6 +9,7 @@ fazer.ai agents is multi-tenant. Isolation is **hybrid and defense-in-depth**: a
 3. **No network/LLM `await` inside a scoped transaction.** It pins a pooled connection; long I/O exhausts the pool. Do network I/O outside; keep the tx to DB work.
 4. **Never read the tenant from AsyncLocalStorage at query time.** The `$extends` is *closure-bound* to a fixed `tenantId` (reading ALS inside the extension callback is unreliable on `create`). ALS is plumbing for carrying context to nodes/workers, not the source of truth for a query's tenant.
 5. **A module takes the caller's `TenantContext`, never its `tenantId`.** `runScopedOn` verifies that an unknown tenant exists only when `ctx.role` is `SUPER_ADMIN`, because the role is the whole predicate: an id that reached this process from OUTSIDE it arrives with `SUPER_ADMIN` (the `X-Tenant-Id` selector the console persists, an MCP `tenant` argument), while every context the process builds for itself carries an id it just read from a row, and `TENANT_ADMIN`. A module that takes `tenantId: bigint` and rebuilds a context around it (`{ tenantId, userId: null, role: "TENANT_ADMIN" }`) tells that check the id was internal whatever its real provenance, and a dead selection then reads as an empty tenant instead of a refusal. The rebuild is correct where the id genuinely came from a row — the graph, the scheduler, the ingest job, the webhook receiver — and that is exactly the case the role lets through for free. `tests/modules/tenant-selector-entry-points.test.ts` holds the REST controllers to it.
+6. **An FK does not validate ownership.** When a tenant-scoped row points at another entity, `tenant_isolation` checks only the new row's own `tenant_id`; the `agent_id`/`inbox_id` that came from the request is validated by nobody, because Postgres documents that referential-integrity checks (FK, unique, PK) always bypass row security to preserve consistency. So an `INSERT` carrying another tenant's FK returns `INSERT 0 1` under `FORCE ROW LEVEL SECURITY`, even when RLS hides that row from the writer. Measured on the public PR #132: tenant A wrote `playground_share_links(tenant_id=1, agent_id=<tenant B's agent>)` without being able to see the agent. Inert on its own; it became a leak because the read that followed ran `asSuperAdminOn` and joined `agent.name` into a public, `BIGSERIAL`-enumerable route. **Isolation comes from the scoped READ, never from the constraint**: read the referenced entity with `runScopedOn` first and let RLS refuse (the pattern `src/modules/agents/transfer.ts` already uses), and in any `asSuperAdminOn` read that joins across entities, compare the two `tenantId`s explicitly — RLS will not save you there.
 
 ## API
 
@@ -90,6 +91,19 @@ by explicit `tenant_id` filtering + the `authorize()` gate (see
 ## Roles & first-run
 
 `UserRole` is `SUPER_ADMIN | TENANT_ADMIN | AGENT`. A CHECK constraint enforces "`SUPER_ADMIN` ⟺ `tenant_id IS NULL`". The first account is created via `/setup` as `SUPER_ADMIN` (tenant_id NULL) together with an initial `Tenant`, inside one `asSuperAdmin` transaction with an advisory lock + count re-check. `bun set-admin` promotes to `TENANT_ADMIN` of the first tenant (or `SUPER_ADMIN` when no tenant exists yet).
+
+### Role attributes are not inherited, and the boot guard asks the neighbouring question
+
+`SUPERUSER` and `BYPASSRLS` are **role attributes**, and attributes are not inherited through membership — only object privileges are. Against an RLS table, a role that inherits a `BYPASSRLS` role still sees 1 row; it sees 2 only after `SET ROLE` to it. So `assertRuntimeRoleIsNotSuperuser` (`src/lib/db-guard.ts`) asks `pg_has_role(…, 'USAGE')`, which is inheritance, while the real escalation depends on `set_option`, and it is wrong in both directions:
+
+| membership | escalates? | guard |
+| --- | --- | --- |
+| INHERIT TRUE, SET TRUE | yes | refuses ✓ |
+| INHERIT FALSE, SET TRUE | yes | accepts ✗ |
+| INHERIT FALSE, SET FALSE | no | accepts ✓ |
+| INHERIT TRUE, SET FALSE | no | refuses ✗ |
+
+Under Postgres defaults the two questions coincide (an `INHERIT` role plus a plain `GRANT` is `INHERIT TRUE, SET TRUE`), which is why the guard works. They diverge on a `NOINHERIT` runtime role, where a plain `GRANT` already yields `inherit_option false, set_option true` and escalates unseen, with no deliberate syntax involved. **Deliberately not fixed** (#197): `set_option` is PG16-only, the real predicate is transitive, and hardening would refuse installs that boot today. `MEMBER` is not a substitute — it is true on all four rows, including the two that do not escalate. The limit is recorded in #197's public body under "Not validated", and the measurement in `tests/scripts/db-bootstrap.test.ts`.
 
 ## LangGraph checkpointer
 

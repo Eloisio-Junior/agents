@@ -97,3 +97,10 @@ The onboarding's Tier B adapter drives Portainer over its API and bundles **Cadd
 ### EasyPanel / plain compose
 
 Same model, bring-your-own-proxy. Use [`docker-compose.prod.yml`](../docker-compose.prod.yml) (publishes the app's HTTP port; terminate TLS in front), provide a `pgvector/pgvector:pg17` Postgres, set the two URL pairs (superuser vs app role), and keep the image's bootstrap→migrate→serve command. On EasyPanel set the env vars in the service UI; for a plain VM, `gen-onboarding-env.ts` writes the `.env` and `docker compose -f docker-compose.prod.yml up -d` brings up the stack.
+
+### Coolify freezes a compose default at creation time
+
+Measured live on Coolify v4.1.2 with a throwaway service: when a compose uses `${VAR:-default}`, Coolify **materializes `VAR` on the service at creation and freezes the resolved value**. Changing the default in the raw compose and saving does NOT change the effective value of a service that already exists — the deployable compose is regenerated (a composed string like `postgres://…/${VAR:-x}` shows the new default) while the materialized variable keeps the old one, and inside the container both forms converge on the OLD value, because the generated `.env` carries the frozen one. The API reports `value=null`/`real_value=null` for the materialized key, so it is not visible there either.
+
+Practical consequence: changing a default in `docker-compose.coolify.yml` is **safe** for existing installs (they stay on the old value) and only new installs get the new one. It also means a rename cannot reach an existing install at all, which is why `DOCUMENTS_STORAGE_DIR` keeps a `QUOTES_STORAGE_DIR` fallback. Not tested: an operator who destroys and recreates the service while reusing the old Postgres volume — that service is born with the new name and does not find the database.
+
