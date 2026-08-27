@@ -26,13 +26,13 @@ import { replaceAgentToolSelections } from "@/modules/agents/service";
 // Ordering the read by `id` would NOT fix it — the recreated rows are assigned ids in the order the
 // client sent, so `ORDER BY id` reproduces the click history exactly. The anchor has to be the
 // SOURCE's identity (the connection / instance / definition row), which a grant re-save never
-// touches.
+// touches, and specifically its NAME, which an export/import preserves where its id is reassigned.
 //
-// SCOPE: this fixes the order, which is the half that moves under a re-save inside one tenant. It
-// does NOT make the exposed name stable across an export/import into another tenant, where the
-// connection rows themselves are recreated with new ids — a connection whose display name yields no
-// ASCII at all falls back to `mcp_<connId>` and comes back named after a different id. That half is
-// named in #389 and stays open.
+// SCOPE: this file is the re-save half, inside one tenant. The transfer half — the same question
+// asked across two tenants, where the import reassigns every id — is
+// tests/modules/agent-transfer-tool-names.test.ts (#412), and it is why the anchor below is the
+// source's NAME rather than its row id: the name is what the export carries, and it is unique per
+// tenant for both sources.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -215,6 +215,56 @@ describe.skipIf(!dbUp)("the order a turn reads an agent's grants in", () => {
       loadToolSelections(db, agentId),
     );
     expect(sel.mcpSelections.map((s) => s.connId)).toEqual([connA, connB]);
+  });
+
+  test("and the order does not follow the database's collation", async () => {
+    // NOTE: The comparison is done in code, by UTF-16 code unit, and not as `ORDER BY name` — SQL
+    // would compare under the database's collation, and a bundle exported from one deployment is
+    // imported into another. Measured on exactly these two names: `en_US.utf8` (this test database)
+    // orders "…connection a" before "…connection B", and `C` orders them the other way round. Under
+    // `ORDER BY name` this case therefore fails here and passes on a `C` install, which is the shape
+    // of a rule that holds until the two ends of a transfer disagree.
+    const lower = await suDb.mcpServerConnection.create({
+      data: {
+        tenantId,
+        name: "Acme CRM production connection a",
+        transport: "streamableHttp",
+        url: "https://l.example.com/mcp",
+      },
+    });
+    const upper = await suDb.mcpServerConnection.create({
+      data: {
+        tenantId,
+        name: "Acme CRM production connection B",
+        transport: "streamableHttp",
+        url: "https://u.example.com/mcp",
+      },
+    });
+    await replaceAgentToolSelections(
+      ctx(),
+      agentId,
+      [lower.id, upper.id].map((id) => ({
+        source: "MCP" as const,
+        mcpServerConnectionId: String(id),
+        enabledTools: ["search"],
+      })),
+      appDb,
+    );
+    const sel = await runScopedOn(appDb, ctx(), (db) =>
+      loadToolSelections(db, agentId),
+    );
+    // NOTE: "B" (0x42) before "a" (0x61): code unit, not locale.
+    expect(sel.mcpSelections.map((x) => x.connId)).toEqual([
+      upper.id,
+      lower.id,
+    ]);
+    // NOTE: and the two really do contest one name, so the order decides who gets the plain one.
+    const byServer = await exposedNameByServer();
+    expect(byServer["Acme CRM production connection B"]).toBe(
+      "mcp__acme_crm_production_connecti__search",
+    );
+    await suDb.mcpServerConnection.delete({ where: { id: lower.id } });
+    await suDb.mcpServerConnection.delete({ where: { id: upper.id } });
   });
 
   test("and where no name is contested, the order is invisible either way", async () => {
