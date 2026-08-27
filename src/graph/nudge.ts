@@ -2,6 +2,7 @@ import type { BaseMessage } from "@langchain/core/messages";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
+import { NUDGE_RETRY_BACKOFF_MS, NUDGE_RETRY_LIMIT } from "@/graph/nudge-retry";
 import { parseDbId } from "@/lib/db-id";
 import { withKeyedQueue } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
@@ -35,6 +36,10 @@ import {
   buildTemplatePayload,
   proactiveSendMode,
 } from "@/modules/service-window/service";
+import {
+  announceSpendCeiling,
+  spendCeilingVerdict,
+} from "@/modules/spend-ceiling/service";
 import {
   attendanceHasStarted,
   claimAttendanceBoundary,
@@ -97,6 +102,53 @@ export interface AgentNudge {
   // For a follow-up sequence: the 1-based step that fired. Surfaced on the conversation timeline
   // ("Follow-up N enviado") and in the flow log. Undefined for non-sequenced nudges (inbound events).
   step?: number;
+  // NOTE: The caller's own name for THIS occasion, read by `nudgeOccasionKey` and by nothing else —
+  // never rendered, so it does not reach the model the way `refs` does. Set it when the descriptor's
+  // own fields cannot tell two independent occasions apart: an inbound delivery carries no `step`
+  // and no `refs`, so two separate events on one conversation describe themselves identically and
+  // would share a window. The inbound dispatcher passes the delivery row's id, which is exactly one
+  // occasion — a redelivery of that same row is the same occasion, and gets the same key on purpose.
+  occasionId?: string;
+}
+
+// WHICH SCHEDULED OCCASION A REFUSAL BELONGS TO. The `over` line is one per occasion, and the retry
+// ladder is only half of what "one occasion" has to mean: the conversation alone collapses genuinely
+// independent jobs, so an appointment reminder refused an hour after an inactivity follow-up lost its
+// row and its alert. Derived from the nudge DESCRIPTOR rather than threaded in from the caller,
+// because a parameter three callers must remember to pass is the one the fourth forgets — and each
+// caller already describes its own occasion here: `source` and `kind` tell the three apart, `step`
+// separates the rungs of a follow-up sequence, `refs` separates two reminders for two different
+// appointments on one conversation, and `occasionId` is what a caller whose descriptor says none of
+// those uses to name the occasion outright.
+//
+// What it deliberately does NOT separate is the first and the final reminder of the SAME appointment
+// inside one window: they differ only in their instructions, and the second alert would say what the
+// first already said.
+export function nudgeOccasionKey(
+  // THE ACCOUNT THE CONVERSATION ID BELONGS TO. Chatwoot conversation ids are account-local, so a
+  // tenant connected to two Chatwoot instances has two different conversations numbered the same;
+  // without this, an identical follow-up step on each would share one two-hour window and the second
+  // refusal would lose its row and its alert. Every caller already parsed it out of the thread id.
+  instanceId: bigint,
+  conversationId: number,
+  nudge: AgentNudge,
+): string {
+  // JSON, not `k=v` joined by commas, because refs are OPAQUE strings from a calendar or a payment
+  // provider and that encoding is not injective: `{a: "x,b=y"}` and `{a: "x", b: "y"}` produce the
+  // same suffix, which would hand two independent occasions one window. Sorted first, explicitly and
+  // by code unit rather than with `localeCompare`, because this key has to be the same string on
+  // every machine that builds it.
+  const refs = JSON.stringify(
+    Object.entries(nudge.refs ?? {})
+      .filter(([, v]) => v != null)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+  );
+  return `nudge:${instanceId}:${conversationId}:${JSON.stringify([
+    nudge.source,
+    nudge.kind ?? null,
+    nudge.step ?? null,
+    nudge.occasionId ?? null,
+  ])}:${refs}`;
 }
 
 export type RunAgentNudgeOutcome =
@@ -120,6 +172,11 @@ export type RunAgentNudgeOutcome =
   // that own an occasion (a follow-up step, a reminder offset, a ladder stage) must not spend it
   // here; see isRepairableNudgeRefusal.
   | "agent-unavailable"
+  // NOTE: The tenant is past its token ceiling for the month (issue #146). Nothing was posted and no
+  // model was reached, and like `agent-unavailable` this is a refusal an operator REPAIRS (raise the
+  // ceiling, or wait for the month to turn), so a caller that owns an occasion must not spend it
+  // here; see isRepairableNudgeRefusal.
+  | "over-ceiling"
   | "no-conversation"
   | "no-agent";
 
@@ -560,6 +617,39 @@ export async function runAgentNudge(
   // thread, so a retired job asked only at the send boundary would still leave memory of a message
   // nobody received.
   if (!(await stillWanted())) return "stale";
+
+  // THE TENANT'S OWN CEILING, asked here for the reason the line above states: before any model
+  // spend. A proactive nudge has nobody waiting on the other end, so there is no copy and no handoff
+  // to arrange — it simply does not go out, and the caller reschedules it rather than burning the
+  // occasion, because a month that turns over repairs this by itself.
+  const ceiling = await spendCeilingVerdict({
+    tenantId,
+    source: "inbox",
+    base,
+  });
+  // ASKED AGAIN, because the verdict above is two database reads deep and a `/reset` landing inside
+  // them retires this nudge. Everything below is a report about work that will not happen: the flow
+  // line is `error` severity for `over`, so it pages the alert channels, and the announcement CLAIMS
+  // the occasion window as it decides — a line written about a retired job would also swallow the
+  // window the next attempt's real refusal needs. Nothing was refused, so nothing is reported.
+  if (!(await stillWanted())) return "stale";
+  // ONE LINE PER OCCASION, not per attempt. A refused nudge is repairable, so the caller reschedules
+  // it every fifteen minutes for two hours (`nudge-retry.ts`) — and the ceiling it walks into is one
+  // unchanging fact, not eight refusals. Windowed to the ladder it has to outlast, and keyed by the
+  // occasion itself rather than by the conversation, which two independent jobs share.
+  announceSpendCeiling(flow, ceiling, "inbox", tenantId, {
+    key: nudgeOccasionKey(instanceId, conversationId, params.nudge),
+    windowMs: NUDGE_RETRY_BACKOFF_MS * NUDGE_RETRY_LIMIT,
+  });
+  if (ceiling.state === "over") {
+    logger.info(
+      "nudge: spend ceiling reached (conv=%s used=%s ceiling=%s) — nothing was sent",
+      String(conversationId),
+      String(ceiling.usedTokens),
+      String(ceiling.ceilingTokens),
+    );
+    return "over-ceiling";
+  }
 
   // Pre-invoke gate: may we message the customer (bot owns it), or only note (human owns it)?
   // When the live gate ran, it already proved bot ownership with FRESH data (and reconciled the

@@ -386,10 +386,17 @@ export interface ProcessParams {
 function buildNudge(
   payload: Record<string, unknown>,
   source: string,
+  // WHICH OCCASION THIS IS, and the delivery row is the answer: one row is one event, a redelivery
+  // of that row is the same event, and two events on one conversation are two rows. Nothing else in
+  // this descriptor separates them — an inbound nudge carries no `step` and no `refs`, so two
+  // distinct deliveries would otherwise describe themselves identically and the second, refused by
+  // the spend ceiling inside the first's window, would lose its flow line and its alert.
+  deliveryId: bigint,
 ): AgentNudge {
   return {
     source,
     kind: "agent_nudge",
+    occasionId: `delivery:${deliveryId}`,
     status: asString(payload.status) ?? null,
     value: typeof payload.value === "number" ? payload.value : null,
     currency: asString(payload.currency) ?? null,
@@ -531,7 +538,7 @@ export async function processInboundDelivery(
           return {
             kind: "nudge",
             threadId: corr.threadId,
-            nudge: buildNudge(payload, source),
+            nudge: buildNudge(payload, source, params.deliveryId),
           };
         }
         await markProcessed();
@@ -563,7 +570,7 @@ export async function processInboundDelivery(
         return {
           kind: "nudge",
           threadId: ref.threadId,
-          nudge: buildNudge(payload, source),
+          nudge: buildNudge(payload, source, params.deliveryId),
         };
       }
 
@@ -607,6 +614,20 @@ export async function processInboundDelivery(
   if (plan.kind === "done") return "processed";
 
   // Phase B: agent_nudge network turn outside the tx (best-effort), then mark PROCESSED.
+  //
+  // BEST-EFFORT MEANS THE OUTCOME IS NOT CONSULTED, and that is the contract rather than an
+  // oversight: the durable barrier is the ConversionEvent recorded in Phase A, and everything past
+  // it is one attempt at telling the customer. A Chatwoot outage, a model failure and a spend
+  // ceiling all end the same way — the notification does not go out, the row is PROCESSED, and the
+  // catch above says so in the log. The ceiling additionally writes an `error` flow line, which
+  // pages the alert channels, so a refusal here is the most visible of the three.
+  //
+  // Making a refused nudge RECOVERABLE is a real gap and a separate change: this module has no
+  // driver that re-runs a delivery (`processInboundDelivery` is called only by the inbound route,
+  // detached, and we ack 200 before Phase B, so no provider redelivers), and the conversion barrier
+  // means a redelivery that did arrive would take the `done` path instead of re-running the nudge.
+  // It needs a scheduler kind of its own — which would fix the throw case too, and that is the
+  // larger half of the same hole.
   const runNudge = params.deps?.runNudge ?? runAgentNudge;
   try {
     await runNudge({

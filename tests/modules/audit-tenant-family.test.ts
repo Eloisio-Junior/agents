@@ -12,6 +12,7 @@ import {
   updateCompanySettings,
   updateEmbeddingSettings,
   updateLangfuse,
+  updateSpendCeiling,
 } from "@/modules/tenant-settings/service";
 import { countingBase } from "../utils/counting-base";
 
@@ -140,6 +141,57 @@ describe.skipIf(!dbUp)("the tenant family records from its services", () => {
     // operator's own tax id, address and phone, and a row outlives the profile that held them.
     expect(all[2]?.before).toBeNull();
     expect(all[2]?.after).toEqual({ changed: ["name"] });
+  });
+
+  // THE NUMBER THAT DECIDES WHETHER A CUSTOMER IS ANSWERED, so the trail owes both sides of it: a
+  // month that went silent is investigated by asking who moved the ceiling and from what. The
+  // operator's own sentence is the one field reported as moved rather than quoted — it is free text
+  // the console reads back in full, and a row keeps whatever it copies forever.
+  test("the spend ceiling records its numbers, and the copy only as set or cleared", async () => {
+    await clearAudit();
+    await updateSpendCeiling(
+      ctx(),
+      {
+        enabled: true,
+        monthlyInboxTokens: 250_000,
+        overCeilingMessage:
+          "Voltamos amanhã, e alguém da equipe continua por aqui.",
+      },
+      appDb,
+    );
+    const all = await rows({ tenantId });
+    expect(all.map((r) => r.action)).toEqual([
+      "tenant_settings.spend_ceiling_set",
+    ]);
+    expect(all[0]?.before).toMatchObject({
+      enabled: false,
+      monthlyInboxTokens: 0,
+    });
+    expect(all[0]?.after).toMatchObject({
+      enabled: true,
+      monthlyInboxTokens: 250_000,
+    });
+    // The sentence itself is not in the row, on either side.
+    expect(projectionText(all)).not.toContain("Voltamos amanhã");
+    // ...and what IS there answers "did it move": null before, a digest after.
+    const first = all[0]?.after as { overCeilingMessage?: string | null };
+    expect(first.overCeilingMessage).toBeTruthy();
+
+    // ONE SENTENCE REPLACED BY ANOTHER IS A CHANGE, and a bare "set" on both sides could not say so.
+    // This is the edit an operator actually makes — the message exists and its wording is being
+    // corrected — so it is the one the trail must not read as a no-op.
+    await clearAudit();
+    await updateSpendCeiling(
+      ctx(),
+      { overCeilingMessage: "Estamos fora do ar; alguém retorna em breve." },
+      appDb,
+    );
+    const second = await rows({ tenantId });
+    const before = second[0]?.before as { overCeilingMessage?: string | null };
+    const after = second[0]?.after as { overCeilingMessage?: string | null };
+    expect(before.overCeilingMessage).toBe(first.overCeilingMessage);
+    expect(after.overCeilingMessage).not.toBe(before.overCeilingMessage);
+    expect(projectionText(second)).not.toContain("Estamos fora do ar");
   });
 
   test("the logo's two acts are recorded under their own names", async () => {

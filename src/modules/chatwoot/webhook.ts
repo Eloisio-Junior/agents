@@ -16,6 +16,7 @@ import {
 import { isTurnInFlight } from "@/graph/inflight";
 import type { IngestRole } from "@/graph/ingest";
 import { armIngest } from "@/graph/ingest-job";
+import { loadAgentConfig } from "@/graph/prepare";
 import { type RuntimeDeps, runAgentTurn } from "@/graph/runtime";
 import { threadBusyForResetOn, turnOwnsThread } from "@/graph/thread-claim";
 import { AppError, UnauthorizedError } from "@/lib/errors";
@@ -85,7 +86,10 @@ import {
   debounceDedupeKey,
   resolveDebounceConfig,
 } from "@/modules/debounce/service";
-import { advanceHandledWatermark } from "@/modules/debounce/watermark";
+import {
+  advanceHandledWatermark,
+  readHandledWatermark,
+} from "@/modules/debounce/watermark";
 import { emitCommandDropped } from "@/modules/flowlog/command";
 import { emitFlowEvent } from "@/modules/flowlog/service";
 import { emitUnroutedMessage } from "@/modules/flowlog/unrouted";
@@ -97,6 +101,12 @@ import {
   retireJobsByDedupeKey,
   revokeJobsByKeyPrefixOn,
 } from "@/modules/scheduler/service";
+import { announceSpendCeilingOnConversation } from "@/modules/spend-ceiling/notice";
+import {
+  announceSpendCeiling,
+  SPEND_CEILING_MESSAGE_WINDOW_MS,
+  spendCeilingVerdict,
+} from "@/modules/spend-ceiling/service";
 import {
   resolveSttConfig,
   transcribeInboundAudio,
@@ -122,6 +132,7 @@ import {
   firstLocationAttachment,
   firstVisualAttachment,
   heldByAnotherParty,
+  incomingRenderable,
   isIncomingMessage,
   isNewHumanAgentMessage,
   isNewIncomingMessage,
@@ -1551,6 +1562,57 @@ async function maybeConsumeCommandOrGate(params: {
     }
   };
 
+  // OPENING A CONVERSATION FOR THE HUMAN QUEUE, for every gate that refuses a turn before it runs.
+  //
+  // Status `open` is what ends the bot's attribution, so this IS the handoff; the optional team
+  // assignment only routes it, and a routing miss must never undo the open. Shared rather than
+  // written per gate (issue #146): the fence below is the part that is easy to leave out, and a
+  // second copy of it would be the copy that forgets.
+  //
+  // The fence: a gate can take time to decide (contact-auth waits on somebody else's endpoint), and
+  // a human can claim the conversation while it does. Without the re-check the copy was correctly
+  // withheld and the conversation was reopened and re-routed anyway, pulling a human's conversation
+  // back out of their hands by a gate that had already decided to stay quiet.
+  const openConversationForHumans = async (
+    gate: string,
+    teamId: number | null,
+    teamUsable?: (id: number) => Promise<boolean>,
+  ): Promise<boolean> => {
+    try {
+      if (!(await stillOurs())) {
+        logger.info(
+          "chatwoot: %s handoff skipped (conv=%s) — the conversation is no longer the bot's",
+          gate,
+          String(conversationId),
+        );
+        return false;
+      }
+      const client = await personaClient();
+      await client.toggleStatus(conversationId, "open");
+      if (teamId !== null && (await (teamUsable?.(teamId) ?? true))) {
+        try {
+          await client.assignTeam(conversationId, teamId);
+        } catch (err) {
+          logger.warn(
+            "chatwoot: %s team assignment failed (conv=%s): %s",
+            gate,
+            String(conversationId),
+            errMsg(err),
+          );
+        }
+      }
+      return true;
+    } catch (err) {
+      logger.warn(
+        "chatwoot: %s handoff failed (conv=%s): %s",
+        gate,
+        String(conversationId),
+        errMsg(err),
+      );
+      return false;
+    }
+  };
+
   // ── Redirect cross-link: on the widget conversation's first inbound after the merge, link it to its
   //    WhatsApp sibling — propagate that side's /teste activation + post cross-link private notes, once.
   //    Runs BEFORE the test-mode gate so a propagated activation is honored on this same turn. ──
@@ -2477,6 +2539,178 @@ async function maybeConsumeCommandOrGate(params: {
     return true;
   }
 
+  // ── Spend ceiling: the tenant's own token budget for the calendar month (issue #146). BEFORE the
+  //    authorization gate below, and that ordering is the point: past this line the turn is not going
+  //    to run, so asking somebody else's endpoint whether the contact may be served would be spending
+  //    a stranger's network call on a question whose answer changes nothing. It is also the cheapest
+  //    gate here, one indexed local read (measured: 1.3ms median over a 1M-row ledger spread across
+  //    200 tenants, see `tokensUsedSince`).
+  //
+  //    Over the ceiling ⇒ the operator's configured sentence to the customer, then a handoff so a
+  //    human can pick the conversation up, then a private note saying why the agent went quiet.
+  //    That sequence, its order and its cooldown live in the spend-ceiling module rather than here,
+  //    because the debounce flush owes the customer exactly the same three things when the ceiling
+  //    is crossed inside the debounce window. What stays local is what only this caller can supply:
+  //    the fenced primitives above, which know that a conversation a human took is one the bot no
+  //    longer speaks in. ──
+  if (ctx.agentId !== null && ctx.agentEnabled && isNewIncomingMessage(n)) {
+    const ceiling = await spendCeilingVerdict({
+      tenantId,
+      source: "inbox",
+      base,
+    });
+    // ALREADY ANSWERED ⇒ NOTHING TO REFUSE, and nothing to report either. The same fan-out this
+    // gate's occasion key is about sends one message down two routes, and the two read the ledger at
+    // different instants: the first can be under the ceiling, run its turn, and commit the usage
+    // that puts the tenant over before the second gets here. The second would then tell a customer
+    // the agent cannot answer, open the conversation for humans, and write an `error` line saying a
+    // turn was skipped for budget — about a message that was answered.
+    //
+    // The watermark is what says it was: `runAgentTurn` advances it on the message it posted for.
+    // Read only on the `over` branch, so the ordinary message pays nothing for it, and read BEFORE
+    // the announcement so a refusal that did not happen leaves no record of having happened.
+    //
+    // It does not close the whole race. A delivery landing inside the window between the other
+    // route's usage write and its watermark CAS sees neither, and that narrow interleaving is left
+    // to the CAS, which is what keeps the ANSWER single. What this closes is the wide half: a second
+    // delivery arriving after the first has finished, which needs no coincidence at all.
+    if (ceiling.state === "over") {
+      const handled = await readHandledWatermark({
+        tenantId,
+        conversationDbId: ctx.conv.id,
+        base,
+      });
+      const messageId = n.message?.id ?? null;
+      if (messageId !== null && handled !== null && handled >= messageId) {
+        logger.info(
+          "chatwoot: spend ceiling reached (conv=%s) — message %s was already answered, so nothing is said",
+          String(conversationId),
+          String(messageId),
+        );
+        return true;
+      }
+      // AND THE AGENT HAS TO BE RUNNABLE FOR THE BUDGET TO BE WHAT STOPPED IT. `ctx.agentEnabled`
+      // is the operator's switch and not the whole question: `loadAgentConfig` also returns null
+      // when the agent row is gone, and when the model `credentialRef` no longer resolves (deleted
+      // from the vault, or a NAME stored where a `vault:<id>` belongs). In both cases `runAgentTurn`
+      // returns `agent-unavailable` before a model is built, so the same message under a ceiling
+      // with room is already unanswered — refusing here would tell the customer and the operator
+      // that a budget silenced an agent that could not have spoken anyway, and send them to raise a
+      // number that changes nothing.
+      //
+      // NOTHING TO ANSWER ⇒ NOTHING TO REFUSE, on the direct path as on the flush's. A message that
+      // renders to nothing for the agent — blank content, an attachment type we do not recognise, a
+      // reaction — makes `runAgentTurn` return `skipped` before any billed call, so under a ceiling
+      // with room this customer is already unanswered and in silence. Refusing it would send them
+      // the operator's sentence, put the conversation in a human's queue and write an `error` line,
+      // all about a message no model was ever going to see. Asked with `incomingRenderable`, the
+      // same shape the turn renders from, so the two cannot drift.
+      if (!renderInboundMessage(incomingRenderable(n))) {
+        logger.info(
+          "chatwoot: spend ceiling reached (conv=%s) — but the message renders to nothing, so there is no turn to refuse",
+          String(conversationId),
+        );
+        return false;
+      }
+      // Read only on the refusing branch, so the ordinary message pays nothing for it, and asked of
+      // the SAME function the turn asks rather than a second copy of its rules.
+      // `skipExperiment` because resolving an A/B variant INSERTS the thread's assignment: a probe
+      // must not enrol a turn that is not going to run.
+      //
+      // A PROBE THAT COULD NOT ANSWER IS NOT AN AGENT THAT CANNOT RUN, and the two must not collapse
+      // into one. The ceiling fails OPEN when the ceiling itself is unreadable — a customer must not
+      // be silenced by our own database hiccup — but here the verdict is read and says `over`, and
+      // this probe is only the escape hatch from it. An unreadable escape hatch does not open: the
+      // pool that refused this read has nothing to do with the budget the operator capped, and
+      // treating the error as "not runnable" would let the turn run and SPEND past the ceiling,
+      // which is the one outcome this gate exists to prevent.
+      const probe = await runScopedOn(base, sysCtx(tenantId), (db) =>
+        loadAgentConfig(
+          db,
+          {
+            tenantId,
+            instanceId,
+            conversationId,
+            agentId: ctx.agentId as bigint,
+            threadId: chatwootThreadId(tenantId, instanceId, conversationId),
+          },
+          { skipExperiment: true },
+        ),
+      ).then(
+        (cfg) => ({ read: true as const, cfg }),
+        (err) => {
+          logger.warn(
+            "chatwoot: could not read whether the agent is runnable (conv=%s): %s — the ceiling stands",
+            String(conversationId),
+            err instanceof Error ? err.message : String(err),
+          );
+          return { read: false as const, cfg: null };
+        },
+      );
+      if (probe.read && !probe.cfg) {
+        logger.info(
+          "chatwoot: spend ceiling reached (conv=%s) — but the agent is not runnable, so the silence is not the budget's",
+          String(conversationId),
+        );
+        return false;
+      }
+    }
+    announceSpendCeiling(
+      {
+        tenantId,
+        turnId: crypto.randomUUID(),
+        source: "inbox",
+        conversationId: ctx.conv.id,
+        agentId: ctx.agentId,
+        inboxId: ctx.conv.inboxId,
+        threadId: chatwootThreadId(tenantId, instanceId, conversationId),
+        base,
+      },
+      ceiling,
+      "inbox",
+      tenantId,
+      // ONE REFUSED MESSAGE, ONE LINE, which is what this gate promises and could not keep on its
+      // own. Chatwoot fans an incoming message to the conversation's assigned agent bot AND to the
+      // inbox's, and the two deliveries run concurrently under two ids, so an unkeyed announcement
+      // put two `over` rows and two alert bumps on the Logs page for one customer. The sequence
+      // below is already single-flighted per conversation; this is the same fan-out reaching the
+      // line thirty lines above it. Keyed by the message the delivery carries, so nothing about a
+      // DIFFERENT message can be swallowed with it.
+      // The INSTANCE is part of the message's identity: Chatwoot message ids are account-local, so
+      // a tenant connected to two Chatwoot instances has two different messages numbered the same,
+      // and a key without it would hand the second one the first's window — one refused customer
+      // losing their row and their alert, which is the exact invariant this key exists to keep.
+      n.message?.id == null
+        ? undefined
+        : {
+            key: `message:${instanceId}:${n.message.id}`,
+            windowMs: SPEND_CEILING_MESSAGE_WINDOW_MS,
+          },
+    );
+    if (ceiling.state === "over") {
+      await announceSpendCeilingOnConversation({
+        tenantId,
+        conversationRowId: ctx.conv.id,
+        // The message is the refusal, so two deliveries of it coalesce and two messages do not.
+        // Without an id (an event shape that carries none) the delivery names itself, which
+        // coalesces nothing and is the safe direction: saying it twice beats not saying it.
+        occasion: `message:${n.message?.id ?? crypto.randomUUID()}`,
+        cfg: ceiling.cfg,
+        verdict: ceiling,
+        postPublicMessage,
+        postPrivateNote,
+        handoff: () => openConversationForHumans("spend-ceiling", null),
+      });
+      logger.info(
+        "chatwoot: spend ceiling reached (conv=%s used=%s ceiling=%s) — the turn did not run",
+        String(conversationId),
+        String(ceiling.usedTokens),
+        String(ceiling.ceilingTokens),
+      );
+      return true;
+    }
+  }
+
   // ── Contact authorization gate: an agent that may only serve contacts a system outside the
   //    console knows about (docs/contact-auth.md) asks it before spending a turn. Last of the gates
   //    on purpose: a conversation an earlier gate already silenced costs no authorization call. The
@@ -2534,43 +2768,8 @@ async function maybeConsumeCommandOrGate(params: {
         return false;
       };
 
-      const openForHumans = async (teamId: number | null): Promise<boolean> => {
-        try {
-          // The same fence the customer copy carries, for the same reason: the authorization
-          // request is a network round-trip to somebody else's endpoint, and a human can take the
-          // conversation while it is in flight. Without this, the copy was correctly withheld and
-          // the conversation was reopened and re-routed to a team anyway — a human's conversation
-          // pulled back out of their hands by a gate that had already decided to stay quiet.
-          if (!(await stillOurs())) {
-            logger.info(
-              "chatwoot: contact-auth handoff skipped (conv=%s) — the conversation is no longer the bot's",
-              String(conversationId),
-            );
-            return false;
-          }
-          const client = await personaClient();
-          await client.toggleStatus(conversationId, "open");
-          if (teamId !== null && (await teamTargetUsable(teamId))) {
-            try {
-              await client.assignTeam(conversationId, teamId);
-            } catch (err) {
-              logger.warn(
-                "chatwoot: contact-auth team assignment failed (conv=%s): %s",
-                String(conversationId),
-                errMsg(err),
-              );
-            }
-          }
-          return true;
-        } catch (err) {
-          logger.warn(
-            "chatwoot: contact-auth handoff failed (conv=%s): %s",
-            String(conversationId),
-            errMsg(err),
-          );
-          return false;
-        }
-      };
+      const openForHumans = (teamId: number | null): Promise<boolean> =>
+        openConversationForHumans("contact-auth", teamId, teamTargetUsable);
       const verdict = await authorizeContact({
         tenantId,
         agentId,

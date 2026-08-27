@@ -12,7 +12,10 @@ import {
   clearMediaAnnotations,
   stashMediaAnnotation,
 } from "@/modules/chatwoot/annotations";
-import type { ChatwootClient } from "@/modules/chatwoot/client";
+import {
+  type ChatwootClient,
+  ChatwootMissingTokenError,
+} from "@/modules/chatwoot/client";
 import { flushDebounceJob } from "@/modules/debounce/handler";
 import {
   armDebounce,
@@ -20,6 +23,7 @@ import {
   resolveDebounceConfig,
 } from "@/modules/debounce/service";
 import { advanceHandledWatermark } from "@/modules/debounce/watermark";
+import { settleFlowEvents } from "@/modules/flowlog/scheduled";
 import type { ClaimedJob } from "@/modules/scheduler/service";
 import {
   claimDueDebounceJobs,
@@ -106,27 +110,53 @@ function makeResolveStub(opts: {
   sent: Array<[number, string]>;
   calls: { getMessages: number };
   toggles: Array<[number, string]>;
+  notes?: Array<[number, string]>;
+  // Every write in the order it left, for the callers that assert a SEQUENCE. Three arrays cannot
+  // say which came first, and the order is the part of the spend-ceiling contract that a fence
+  // makes load-bearing.
+  order?: string[];
 }) {
   let i = 0;
-  const client = {
-    getMessages: async () => {
-      const page = opts.pages[Math.min(i, opts.pages.length - 1)] ?? {
-        payload: [],
-      };
-      i += 1;
-      opts.calls.getMessages += 1;
-      return page;
-    },
-    sendMessage: async (conversationId: number, content: string) => {
-      opts.sent.push([conversationId, content]);
-      return {};
-    },
-    toggleStatus: async (conversationId: number, status: string) => {
-      opts.toggles.push([conversationId, status]);
-      return {};
-    },
-  } as unknown as ChatwootClient;
-  return async () => client;
+  // Built from the CONFIG it is handed, so the token profile is part of what this stub personifies.
+  // `toggle_status` is a bot-token endpoint (docs/chatwoot.md), and the real client refuses an empty
+  // one before anything leaves the process (issue #79) instead of reporting Chatwoot's 401 for a
+  // credential nobody sent. A stub that ignored the config would let a caller that forgot the
+  // persona token record a handoff that never happened.
+  return async (cfg: { botToken?: string }) =>
+    ({
+      getMessages: async () => {
+        const page = opts.pages[Math.min(i, opts.pages.length - 1)] ?? {
+          payload: [],
+        };
+        i += 1;
+        opts.calls.getMessages += 1;
+        return page;
+      },
+      sendMessage: async (conversationId: number, content: string) => {
+        if (!cfg.botToken) {
+          throw new ChatwootMissingTokenError("conversations/messages");
+        }
+        opts.sent.push([conversationId, content]);
+        opts.order?.push("message");
+        return {};
+      },
+      sendPrivateNote: async (conversationId: number, content: string) => {
+        if (!cfg.botToken) {
+          throw new ChatwootMissingTokenError("conversations/messages");
+        }
+        opts.notes?.push([conversationId, content]);
+        opts.order?.push("note");
+        return {};
+      },
+      toggleStatus: async (conversationId: number, status: string) => {
+        if (!cfg.botToken) {
+          throw new ChatwootMissingTokenError("conversations/toggle_status");
+        }
+        opts.toggles.push([conversationId, status]);
+        opts.order?.push("toggle");
+        return {};
+      },
+    }) as unknown as ChatwootClient;
 }
 
 function page(
@@ -1580,8 +1610,9 @@ describe.skipIf(!dbUp)("debounce", () => {
       toggles,
     });
     // The command lands ON the send: everything before it answered truthfully, and the resolve is
-    // the only write still ahead.
-    const client = await makeClient();
+    // the only write still ahead. Built with the persona token the real loader would hand it (the
+    // fixture's `BOT`), because this one instance is handed straight to the flush.
+    const client = await makeClient({ botToken: "BOT" });
     const holder = client as unknown as Record<
       string,
       (...a: never[]) => unknown
@@ -3149,6 +3180,470 @@ describe.skipIf(!dbUp)("debounce", () => {
       const conv = await runThrowingFlush(866, false);
       expect(conv.lastError).not.toBeNull();
       expect(conv.lastErrorAt).not.toBeNull();
+    });
+  });
+
+  // THE SECOND ASK (issue #146). The webhook's spend gate covers the MESSAGE; the flush runs minutes
+  // later and is where the turn actually spends. A tenant that crosses its ceiling inside that
+  // window — from its own other conversations, or from this one's earlier burst — would otherwise
+  // have an already-armed flush spend past it, and many armed conversations would do it together.
+  describe("with the spend ceiling reached between arming and the flush", () => {
+    let previousTenantSettings: unknown = null;
+    // The OPERATOR'S sentence, deliberately not the shipped default: an expectation written against
+    // the defaults object would also pass on a flush that ignored the configuration entirely and
+    // hard-coded the same string.
+    const CEILING_COPY = "Orçamento do mês esgotado, já chamei alguém.";
+
+    beforeAll(async () => {
+      const before = await suDb.tenant.findUniqueOrThrow({
+        where: { id: tenantId },
+        select: { settings: true },
+      });
+      previousTenantSettings = before.settings;
+      await suDb.tenant.update({
+        where: { id: tenantId },
+        data: {
+          settings: {
+            ...(before.settings as object),
+            spendCeiling: {
+              enabled: true,
+              monthlyInboxTokens: 1000,
+              overCeilingMessage: CEILING_COPY,
+            },
+          },
+        },
+      });
+      await suDb.llmUsage.create({
+        data: {
+          tenantId,
+          model: "gpt-4o-mini",
+          source: "inbox",
+          promptTokens: 1200,
+          completionTokens: 0,
+        },
+      });
+    });
+
+    afterAll(async () => {
+      await suDb.llmUsage.deleteMany({ where: { tenantId } });
+      await suDb.tenant.update({
+        where: { id: tenantId },
+        data: { settings: previousTenantSettings as object },
+      });
+    });
+
+    test("the flush spends nothing, says why, hands off, and counts the burst as handled", async () => {
+      await seedConversation(910);
+      const sent: Array<[number, string]> = [];
+      const toggles: Array<[number, string]> = [];
+      const notes: Array<[number, string]> = [];
+      const order: string[] = [];
+      const out = await flushDebounceJob({
+        job: jobFor(910, { lastMessageId: 7 }),
+        base: appDb,
+        deps: {
+          // The assertion is the factory: a flush that reaches the model at all fails here.
+          makeModel: () => {
+            throw new Error("the model must not be invoked over the ceiling");
+          },
+          makeClient: makeResolveStub({
+            pages: [page([{ id: 7, content: "oi" }])],
+            sent,
+            calls: { getMessages: 0 },
+            toggles,
+            notes,
+            order,
+          }),
+          checkpointer: new MemorySaver(),
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      // THE WHOLE CONTRACT, not a piece of it. This refusal is the first one the conversation gets,
+      // so the customer hears the operator's sentence here or never: the handoff below takes the
+      // conversation out of `pending`, and from then on no message of theirs reaches a gate again.
+      expect(sent).toEqual([[910, CEILING_COPY]]);
+      // ...the conversation goes to the human queue, because unlike a refused contact nobody
+      // upstream refused anything, so it would otherwise sit with a bot that will never answer...
+      expect(toggles).toEqual([[910, "open"]]);
+      // ...and the operator gets the reason, which has to say the handoff HAPPENED. The note is
+      // asserted on the clause the handoff decides rather than on the whole rendered string: the
+      // digits go through `toLocaleString`, and pinning them here would pin the runner's ICU too.
+      expect(notes.length).toBe(1);
+      expect(notes[0]?.[0]).toBe(910);
+      expect(notes[0]?.[1]).toContain("limite de tokens do mês foi atingido");
+      expect(notes[0]?.[1]).toContain("aberta para atendimento humano");
+      // The ORDER, which is load-bearing in both directions: the copy leaves before the open,
+      // because after it the conversation is no longer the bot's and the fence would rightly
+      // withhold it; the note comes last, because it is the only one that can report whether the
+      // handoff happened.
+      expect(order).toEqual(["message", "toggle", "note"]);
+      // The burst counts as handled, so it is not re-flushed into the same wall forever.
+      expect(await watermarkOf(910)).toBe(7);
+      await clearFlowLog(suDb, { tenantId });
+    });
+
+    // A HUMAN CLAIMING THE CONVERSATION WHILE THE GATE DECIDES. The gate at the top of the flush
+    // judged the instant before two database reads, and `open` is not a neutral write: it ends the
+    // bot's attribution and puts the conversation back in the routing queue, so applying it to a
+    // conversation an agent just took pulls it out of their hands.
+    //
+    // The window is opened where it really is — inside the ledger read — by an extended client that
+    // flips the assignee the first time the ceiling's own query runs. That is the same seam the
+    // fail-open test uses, and it is the only one that reproduces the ordering without a sleep.
+    test("a human who claims the conversation during the read keeps it", async () => {
+      await seedConversation(912);
+      let flipped = 0;
+      const raced = appDb.$extends({
+        query: {
+          async $allOperations({ operation, args, query }) {
+            if (operation === "$queryRaw" && flipped === 0) {
+              const sql = ((args as { strings?: string[] }).strings ?? []).join(
+                " ",
+              );
+              if (sql.includes("FROM llm_usage")) {
+                flipped += 1;
+                await suDb.conversation.updateMany({
+                  where: {
+                    tenantId,
+                    chatwootInstanceId: instanceId,
+                    chatwootConversationId: 912,
+                  },
+                  data: { assigneeType: "User", assigneeId: 4242 },
+                });
+              }
+            }
+            return query(args);
+          },
+        },
+      }) as unknown as typeof appDb;
+      const sent: Array<[number, string]> = [];
+      const toggles: Array<[number, string]> = [];
+      const notes: Array<[number, string]> = [];
+      const out = await flushDebounceJob({
+        job: jobFor(912, { lastMessageId: 11 }),
+        base: raced,
+        deps: {
+          makeModel: () => {
+            throw new Error("the model must not be invoked over the ceiling");
+          },
+          makeClient: makeResolveStub({
+            pages: [page([{ id: 11, content: "oi" }])],
+            sent,
+            calls: { getMessages: 0 },
+            toggles,
+            notes,
+          }),
+          checkpointer: new MemorySaver(),
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      // The window this test is about actually opened; without this the assertion below would pass
+      // on a run where the ledger read never happened.
+      expect(flipped).toBe(1);
+      // The conversation is the human's now, so the gate leaves the status alone and says nothing
+      // over their shoulder...
+      expect(toggles).toEqual([]);
+      expect(sent).toEqual([]);
+      // ...but the operator still gets the note, which is the one of the three that a takeover does
+      // not withhold: it is invisible to the customer, and a conversation a human just inherited is
+      // exactly where the reason for the silence still needs saying. It reports NO handoff, because
+      // none happened.
+      expect(notes.length).toBe(1);
+      expect(notes[0]?.[1]).toContain("limite de tokens do mês foi atingido");
+      expect(notes[0]?.[1]).not.toContain("aberta para atendimento humano");
+      // ...and the burst still counts as handled, exactly as it does when the gate was already
+      // closed on the way in: the ceiling decided about the TENANT, and that holds either way.
+      expect(await watermarkOf(912)).toBe(11);
+      await clearFlowLog(suDb, { tenantId });
+    });
+
+    // A BURST THAT WAS ALREADY ANSWERED IS NOT A BURST TO REFUSE. A claimed job can be retried after
+    // an earlier attempt advanced the watermark past this payload's own last id: that attempt
+    // answered the burst and died before the scheduler could mark the job done. Over the ceiling,
+    // the retry would tell the customer the agent cannot answer, hand the conversation off, and
+    // write a refusal, all about a burst the customer already has an answer to.
+    test("a burst an earlier attempt already answered is not refused again", async () => {
+      await seedConversation(914);
+      // What that earlier attempt left behind, and the only trace of it this retry can read.
+      await advanceHandledWatermark({
+        tenantId,
+        conversationDbId: (
+          await suDb.conversation.findFirstOrThrow({
+            where: { tenantId, chatwootConversationId: 914 },
+            select: { id: true },
+          })
+        ).id,
+        toMessageId: 15,
+        base: appDb,
+      });
+      const sent: Array<[number, string]> = [];
+      const toggles: Array<[number, string]> = [];
+      const notes: Array<[number, string]> = [];
+      const out = await flushDebounceJob({
+        job: jobFor(914, { lastMessageId: 15 }),
+        base: appDb,
+        deps: {
+          makeModel: () => {
+            throw new Error("the model must not be invoked over the ceiling");
+          },
+          makeClient: makeResolveStub({
+            // The re-fetch finds the same message, and the watermark is what makes it not pending.
+            pages: [page([{ id: 15, content: "oi" }])],
+            sent,
+            calls: { getMessages: 0 },
+            toggles,
+            notes,
+          }),
+          checkpointer: new MemorySaver(),
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      expect(sent).toEqual([]);
+      expect(toggles).toEqual([]);
+      expect(notes).toEqual([]);
+      // ...and no refusal line, because nothing was refused.
+      await settleFlowEvents();
+      const rows = await suDb.executionLog.findMany({
+        // Scoped to this flush's own thread, not to the tenant: the fixture is shared with the
+        // refusals above, and a tenant-wide read would be asserting about their rows too.
+        where: { tenantId, threadId: threadOf(914), stage: "spend_ceiling" },
+        select: { level: true },
+      });
+      expect(rows).toEqual([]);
+      await clearFlowLog(suDb, { tenantId });
+    });
+
+    // THE COMMAND, LANDING ON THE REFUSAL. `/reset` retires the burst, and a flush already claimed is
+    // past every cancel — the same window the turn path fences with `stillWanted`. Ownership cannot
+    // stand in for it here: the reset hands the conversation BACK to the bot, so the gate says yes
+    // at exactly the moment the command has said no. Nothing may be said, nothing reopened, and the
+    // burst must not be declared handled: it was withdrawn, not answered.
+    test("a burst retired while claimed is not told about the ceiling", async () => {
+      await seedConversation(913);
+      const thread = threadOf(913);
+      const row = await suDb.schedulerJob.create({
+        data: {
+          tenantId,
+          kind: "DEBOUNCE",
+          dedupeKey: debounceDedupeKey(thread),
+          status: "CLAIMED",
+          runAt: new Date(),
+          payload: {
+            threadId: thread,
+            agentBotId: 9,
+            burstStartedAt: 1,
+            lastMessageId: 13,
+          },
+        },
+        select: { id: true, claimSeq: true },
+      });
+      await retireJobsByDedupeKey(
+        tenantId,
+        "DEBOUNCE",
+        debounceDedupeKey(thread),
+        suDb,
+      );
+      const sent: Array<[number, string]> = [];
+      const toggles: Array<[number, string]> = [];
+      const notes: Array<[number, string]> = [];
+      const out = await flushDebounceJob({
+        job: {
+          ...jobFor(913, { lastMessageId: 13 }),
+          id: row.id,
+          claimSeq: row.claimSeq,
+        },
+        base: appDb,
+        deps: {
+          makeModel: () => {
+            throw new Error("the model must not be invoked over the ceiling");
+          },
+          makeClient: makeResolveStub({
+            pages: [page([{ id: 13, content: "oi" }])],
+            sent,
+            calls: { getMessages: 0 },
+            toggles,
+            notes,
+          }),
+          checkpointer: new MemorySaver(),
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      expect(sent).toEqual([]);
+      expect(toggles).toEqual([]);
+      expect(notes).toEqual([]);
+      // ...AND NO LINE, which is the half the acts above do not cover. The refusal is a write like
+      // the other three: `over` is `error` severity, so the line pages the alert channels, and the
+      // announcement CLAIMS the notice window as it decides — a line about a withdrawn burst would
+      // also swallow the window a real refusal needs later. The shape of the row this asserts the
+      // absence of is proved by the refusals in the sibling tests above.
+      await settleFlowEvents();
+      const rows = await suDb.executionLog.findMany({
+        // This flush's own thread, not the tenant: the fixture is shared with those refusals.
+        where: { tenantId, threadId: threadOf(913), stage: "spend_ceiling" },
+        select: { level: true },
+      });
+      expect(rows).toEqual([]);
+      // The one that outlives the command: the burst is still the customer's.
+      expect(await watermarkOf(913)).toBeNull();
+      await clearFlowLog(suDb, { tenantId });
+    });
+
+    // ONE LINE PER REFUSED BURST, not one per attempt at it. Advancing the watermark is the LAST
+    // thing the refusing branch does and it is a database write, so a flush that says its piece and
+    // then dies is re-pended by the scheduler and runs again on the same burst — a second `error`
+    // line and a second page to the alert channels about one refusal.
+    //
+    // The retry is modelled by putting the conversation back in the state a crashed settlement
+    // leaves it in: the copy went out, the watermark did not move. Running the same job again from
+    // there is exactly what the worker does.
+    test("a burst refused twice by a retried job is one line, not two", async () => {
+      await seedConversation(916);
+      const sent: Array<[number, string]> = [];
+      const toggles: Array<[number, string]> = [];
+      const notes: Array<[number, string]> = [];
+      const run = () =>
+        flushDebounceJob({
+          job: jobFor(916, { lastMessageId: 19 }),
+          base: appDb,
+          deps: {
+            makeModel: () => {
+              throw new Error("the model must not be invoked over the ceiling");
+            },
+            makeClient: makeResolveStub({
+              pages: [page([{ id: 19, content: "oi" }])],
+              sent,
+              calls: { getMessages: 0 },
+              toggles,
+              notes,
+            }),
+            checkpointer: new MemorySaver(),
+          },
+        });
+
+      expect(await run()).toEqual({ outcome: "done" });
+      // What the crash left behind: settled nothing.
+      await suDb.conversation.updateMany({
+        where: { tenantId, chatwootConversationId: 916 },
+        data: { lastHandledMessageId: null },
+      });
+      expect(await run()).toEqual({ outcome: "done" });
+
+      await settleFlowEvents();
+      const rows = await suDb.executionLog.findMany({
+        where: { tenantId, threadId: threadOf(916), stage: "spend_ceiling" },
+        select: { level: true },
+      });
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.level).toBe("error");
+      // The customer hears it once too, which is the notice cooldown rather than this key: two
+      // fences over one retry, and both are asserted because either one alone would pass while the
+      // other was broken.
+      expect(sent).toHaveLength(1);
+      await clearFlowLog(suDb, { tenantId });
+    });
+
+    // NOTHING TO ANSWER ⇒ NOTHING TO REFUSE, and the watermark cannot see this one. The burst was
+    // never answered — an earlier attempt did not run — but the message it armed on is gone from the
+    // thread, or renders to no answerable text. Without the ceiling that burst reaches
+    // `coalesceAndRunTurn`, which returns "empty" and says nothing to anybody; over it, the refusal
+    // would send the operator's sentence to a customer who is not waiting for one and put the
+    // conversation in a human's queue over a burst with nothing in it.
+    test("a burst with nothing answerable in it is not refused", async () => {
+      await seedConversation(915);
+      const sent: Array<[number, string]> = [];
+      const toggles: Array<[number, string]> = [];
+      const notes: Array<[number, string]> = [];
+      const out = await flushDebounceJob({
+        job: jobFor(915, { lastMessageId: 17 }),
+        base: appDb,
+        deps: {
+          makeModel: () => {
+            throw new Error("the model must not be invoked over the ceiling");
+          },
+          makeClient: makeResolveStub({
+            // The message the job armed on is gone from the thread — deleted between the arming and
+            // this flush. The other shape of "nothing answerable" (a message with no text and no
+            // attachment) reaches the same answer through the same selector, which drops it before
+            // it can be rendered.
+            pages: [page([])],
+            sent,
+            calls: { getMessages: 0 },
+            toggles,
+            notes,
+          }),
+          checkpointer: new MemorySaver(),
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      expect(sent).toEqual([]);
+      expect(toggles).toEqual([]);
+      expect(notes).toEqual([]);
+      // ...and no refusal line, because nothing was refused.
+      await settleFlowEvents();
+      const rows = await suDb.executionLog.findMany({
+        where: { tenantId, threadId: threadOf(915), stage: "spend_ceiling" },
+        select: { level: true },
+      });
+      expect(rows).toEqual([]);
+      // And the watermark is exactly where an empty burst leaves it outside the ceiling: untouched,
+      // because nothing was answered and nothing was withdrawn. The branch that DOES settle it is
+      // the one where a real message renders to nothing and never will.
+      expect(await watermarkOf(915)).toBeNull();
+      await clearFlowLog(suDb, { tenantId });
+    });
+
+    test("with handoff off, the burst is still dropped and no status is touched", async () => {
+      await suDb.tenant.update({
+        where: { id: tenantId },
+        data: {
+          settings: {
+            ...(previousTenantSettings as object),
+            spendCeiling: {
+              enabled: true,
+              monthlyInboxTokens: 1000,
+              overCeilingMessage: CEILING_COPY,
+              handoffEnabled: false,
+            },
+          },
+        },
+      });
+      await seedConversation(911);
+      const sent: Array<[number, string]> = [];
+      const toggles: Array<[number, string]> = [];
+      const notes: Array<[number, string]> = [];
+      const out = await flushDebounceJob({
+        job: jobFor(911, { lastMessageId: 9 }),
+        base: appDb,
+        deps: {
+          makeModel: () => {
+            throw new Error("the model must not be invoked over the ceiling");
+          },
+          makeClient: makeResolveStub({
+            pages: [page([{ id: 9, content: "oi" }])],
+            sent,
+            calls: { getMessages: 0 },
+            toggles,
+            notes,
+          }),
+          checkpointer: new MemorySaver(),
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      // The copy and the note do NOT depend on the handoff: with the open switched off the customer
+      // is the only one who can tell the agent went quiet, and this burst is the last chance to say
+      // it — the conversation stays `pending`, but nothing re-delivers the burst already dropped.
+      expect(sent).toEqual([[911, CEILING_COPY]]);
+      expect(toggles).toEqual([]);
+      expect(notes.length).toBe(1);
+      expect(notes[0]?.[1]).not.toContain("aberta para atendimento humano");
+      expect(await watermarkOf(911)).toBe(9);
+      await clearFlowLog(suDb, { tenantId });
     });
   });
 });

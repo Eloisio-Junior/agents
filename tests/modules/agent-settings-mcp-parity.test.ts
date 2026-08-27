@@ -72,6 +72,16 @@ const READER_GLOBS = [
 // written off — with the measurement, not with an opinion. That distinction cost a round: the probe
 // records which key a reader touches, and it cannot know which BAG the runtime hands that reader.
 const NOT_PUBLISHED: Record<string, string> = {
+  spendCeiling:
+    "NOT an agent-settings block. `readSpendCeilingConfig` is only ever handed a TENANT's settings " +
+    "bag: `readTenantSpendCeiling` selects it off the `tenants` row, and the other five call sites " +
+    "are `tenant-settings/service.ts` reading and patching that same row. No call site anywhere " +
+    "reaches `agent.settings`, and the ceiling is a tenant-wide budget by design — it counts one " +
+    "ledger for every agent the tenant runs, so publishing it per agent would offer a knob whose " +
+    "value the next agent's screen would silently contradict. It is configurable through " +
+    "`PATCH /v1/tenant-settings/spend-ceiling` and the console's own screen. If it is ever to reach " +
+    "MCP it belongs to `tenant_settings_update`, which today carries embedding and langfuse only — " +
+    "`company` sits outside it for the same reason, so this is not the ceiling's own gap.",
   appointmentReminders:
     "NOT an agent-settings block. `readAppointmentReminderConfig` is only ever called with " +
     "`sel.config` — the Google Calendar integration INSTANCE's config (toolpacks/google-calendar.ts, " +

@@ -12,6 +12,11 @@ import {
   type FlowContext,
   withFlowStage,
 } from "@/modules/flowlog/service";
+import {
+  announceSpendCeilingWarning,
+  assertPlaygroundSpendCeiling,
+  spendCeilingVerdict,
+} from "@/modules/spend-ceiling/service";
 import { tryResolveVaultEntry } from "@/modules/vault/service";
 import { visionAcceptsDocuments } from "./document-support";
 import {
@@ -278,6 +283,58 @@ export async function extractInboundFile(
   )
     return skip("document_not_supported");
 
+  // THE SPEND CEILING, asked here and not by the caller. Vision runs on the incoming attachment
+  // BEFORE the webhook's gates decide anything, so the turn ceiling upstream has not run yet and
+  // an image sent into a spent month would be billed with nothing to stop it.
+  //
+  // ASKED ONCE THE CALL IS KNOWN TO BE POSSIBLE, immediately before it, and not at the top of this
+  // function. A refusal says that spend was what stood in the way, and everything above — an unknown
+  // provider, a missing credential, a type this endpoint cannot read — is a reason the provider was
+  // never going to be called at all, so a `vision` line saying the attachment was skipped for budget
+  // would name a cause that was not operative. The download above is a Chatwoot fetch, not a billed
+  // one, and it is what tells this function the attachment's type in the first place.
+  //
+  // It is the REFUSAL half that this ordering is for. The warning is a statement about the MONTH,
+  // true whether or not this particular call runs, so a window it claims early costs at most a
+  // staler percentage in the line the operator reads — see the waiver in `.codex-review-waived`,
+  // which is where that adjudication lives.
+  //
+  // IT ANNOUNCES THE WARNING AND NOT THE REFUSAL, which is the one thing this gate does differently
+  // from the other four, and the asymmetry is what the two halves leave behind.
+  //
+  // `spend_ceiling` `over` is written per refused MESSAGE, and this runs on the same message the
+  // webhook gate refuses moments later: writing it here would put two refusal rows and two alert
+  // bumps on the Logs page for one customer message, and the count of refusals is the number an
+  // operator reads off that page. Nothing is lost by staying quiet, because the `vision` line below
+  // says `skipped` with `spend_ceiling` as its reason, which is the stage the reader filters by when
+  // they are asking why an attachment was never read.
+  //
+  // The WARNING leaves no such trace: the call proceeds, the attachment is read, and no line
+  // anywhere says the month crossed its fraction. And the gate that would have said it may never
+  // run — vision is upstream of every one of them, so a human-owned conversation, a silenced agent,
+  // a redirect or an hour outside the schedule consumes the delivery first, and this billed call is
+  // the only thing that happened. It cannot double-write: the warning's window is claimed once, so
+  // a gate that follows and asks the same question writes nothing.
+  //
+  // The playground's own file path asks in the same place, for the same reason, and differs only in
+  // what it does with the answer: it goes through `assertPlaygroundSpendCeiling`, where no webhook
+  // gate follows it and both halves are its own to announce.
+  const ceiling = await spendCeilingVerdict({
+    tenantId: params.tenantId,
+    source: "inbox",
+    base,
+  });
+  announceSpendCeilingWarning(params.flow, ceiling, "inbox", params.tenantId);
+  if (ceiling.state === "over") {
+    logger.info(
+      "vision: spend ceiling reached (tenant=%s used=%s ceiling=%s) — the attachment was not read",
+      String(params.tenantId),
+      String(ceiling.usedTokens),
+      String(ceiling.ceilingTokens),
+    );
+    return skip("spend_ceiling");
+  }
+
   let extracted: VisionResult;
   try {
     extracted = await extractWithRetry({
@@ -432,6 +489,14 @@ export async function extractPlaygroundFile(
     );
   }
 
+  // CAN WE READ THIS AT ALL, asked before the ceiling. A ceiling refusal is a statement that spend
+  // was the thing standing in the way, and for a file whose type this provider cannot read there
+  // was never any spend to refuse — the extraction returns `unsupported` in a month with budget to
+  // spare, so a 429 in a spent one reports a refusal that did not happen and sends the operator
+  // looking at their budget over a file that would have been rejected either way. The check needs
+  // `entry`, because whether documents are accepted depends on the resolved base URL, which is why
+  // the credential resolution moves up with it: an unreadable credential is a configuration error
+  // like the `!cfg.enabled` one already above the ceiling, not something the budget decided.
   const kind = visionKindForMime(params.mimeType);
   if (
     !kind ||
@@ -440,6 +505,15 @@ export async function extractPlaygroundFile(
   ) {
     return { kind: "unsupported", text: "" };
   }
+
+  // The playground's own ceiling, asked once the file is known to be extractable and before the
+  // provider round trip. It throws (see `assertPlaygroundSpendCeiling`), so an operator uploading a
+  // file into a spent month is told why instead of watching the extraction produce nothing.
+  await assertPlaygroundSpendCeiling({
+    tenantId: params.ctx.tenantId as bigint,
+    base,
+    flow: params.flow,
+  });
 
   try {
     const extracted = await extractWithRetry({

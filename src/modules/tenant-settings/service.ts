@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { Prisma, PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
@@ -5,6 +6,11 @@ import { AppError } from "@/lib/errors";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { auditMutation } from "@/modules/audit/service";
 import { unprintableProblem } from "@/modules/documents/printable";
+import {
+  readSpendCeilingConfig,
+  type SpendCeilingConfig,
+  spendCeilingSettingsSchema,
+} from "@/modules/spend-ceiling/settings";
 import { requireVaultRef, vaultRefWhere } from "@/modules/vault/service";
 
 // Per-tenant settings live in the Tenant.settings JSON column. RLS scopes the row to the active
@@ -154,6 +160,7 @@ export interface TenantSettingsDto {
   embedding: EmbeddingSettings;
   langfuse: LangfuseSettings;
   company: CompanySettings;
+  spendCeiling: SpendCeilingConfig;
 }
 
 export async function getTenantSettings(
@@ -167,6 +174,10 @@ export async function getTenantSettings(
       embedding: parseEmbeddingSettings(raw),
       langfuse: parseLangfuseSettings(raw),
       company: parseCompanySettings(raw),
+      // Read with the RUNTIME's own lenient reader, not a schema of this module's: the console has
+      // to show the operator the numbers the gate will actually apply, and a second parser here
+      // would be a second answer to that question the day one of them clamps differently.
+      spendCeiling: readSpendCeilingConfig(raw),
     };
   });
 }
@@ -202,11 +213,15 @@ function sides<T>(
 // default (a credential is a `vault:<id>` reference here, never a value; that is the vault rule this
 // column has been held to since #124).
 async function patchBlock<
-  T extends EmbeddingSettings | LangfuseSettings | CompanySettings,
+  T extends
+    | EmbeddingSettings
+    | LangfuseSettings
+    | CompanySettings
+    | SpendCeilingConfig,
 >(
   ctx: TenantContext,
   base: PrismaClient,
-  key: "embedding" | "langfuse" | "company",
+  key: "embedding" | "langfuse" | "company" | "spendCeiling",
   // Handed BOTH states, the one being replaced and the one replacing it, so a block can report what
   // MOVED without carrying what it holds. The company profile is the block that needs the
   // difference: see `sides` below for the shape the other three use.
@@ -510,6 +525,65 @@ export async function setCompanyLogoKey(
         // buster has to be to mean anything.
         logoVersion: Math.max(now, current.logoVersion + 1),
       });
+    },
+  );
+}
+
+export type SpendCeilingUpdateInput = Partial<SpendCeilingConfig>;
+
+// Updates the spend-ceiling block. Validated on the way IN (see `spendCeilingSettingsSchema`) so a
+// ceiling typed with an extra zero comes back as a 422 the operator can read, rather than as a
+// silently clamped number that would only surface as a month of unmetered traffic.
+//
+// Merged under the row lock, like every other block here: the ceiling screen and the alert-channel
+// screen are different requests against one JSON column, and a merge outside the lock is how one
+// save erases the other.
+export async function updateSpendCeiling(
+  ctx: TenantContext,
+  patch: SpendCeilingUpdateInput,
+  base: PrismaClient = basePrisma,
+): Promise<SpendCeilingConfig> {
+  return patchBlock(
+    ctx,
+    base,
+    "spendCeiling",
+    {
+      action: "tenant_settings.spend_ceiling_set",
+      target: "tenant_settings:spendCeiling",
+      // THE NUMBERS THEMSELVES, because they are what the trail is about: this block decides whether
+      // the agent answers a customer at all, and "somebody moved the ceiling" is unanswerable without
+      // saying from what to what. None of them is a secret or PII — a token count, a percentage, two
+      // switches and a cooldown.
+      //
+      // The customer-facing sentence is the exception, and it is FINGERPRINTED rather than quoted:
+      // it is free text an operator writes, so quoting it would paste a paragraph into every row for
+      // a field the console reads back in full anyway. A bare "set" cannot answer the question the
+      // trail is actually asked — one sentence replaced by another read as unchanged on both sides —
+      // so what goes in is a short digest, which differs exactly when the text differs and carries
+      // none of it back. `null` stays `null`, because "cleared" is a state and not a value.
+      project: sides((raw) => {
+        const b = readSpendCeilingConfig(raw);
+        return {
+          enabled: b.enabled,
+          monthlyInboxTokens: b.monthlyInboxTokens,
+          monthlyPlaygroundTokens: b.monthlyPlaygroundTokens,
+          warnAtPercent: b.warnAtPercent,
+          handoffEnabled: b.handoffEnabled,
+          noticeCooldownSeconds: b.noticeCooldownSeconds,
+          overCeilingMessage:
+            b.overCeilingMessage === null
+              ? null
+              : createHash("sha256")
+                  .update(b.overCeilingMessage)
+                  .digest("hex")
+                  .slice(0, 12),
+        };
+      }),
+    },
+    (raw) => {
+      const current = readSpendCeilingConfig(raw);
+      // not-caller-input: the STORED block merged with the patch, so a failure here is not necessarily the caller's
+      return spendCeilingSettingsSchema.parse({ ...current, ...patch });
     },
   );
 }
