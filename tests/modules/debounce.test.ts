@@ -1509,6 +1509,59 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(await watermarkOf(801)).toBeNull();
   });
 
+  // A PARTIAL REPLY MUST NOT CLOSE THE CONVERSATION (issue #429). The old code kept this rule by
+  // accident — a send that failed mid-reply threw, and a throw discards the deferred intent — so
+  // reporting instead of throwing is what woke the path up. The cost of getting it wrong: the model
+  // called `resolve_conversation` believing it had answered, the customer holds the first balloon
+  // and not the rest, and `resolved` is what tells the operator there is nothing left to do.
+  //
+  // The turn still reports `posted`: the customer HAS part of it, and re-running would send that
+  // part twice. The two questions differ and cannot share one answer.
+  test("a reply that failed halfway does not resolve the conversation", async () => {
+    await withSplitEnabled(async () => {
+      await seedConversation(924);
+      const sent: Array<[number, string]> = [];
+      const toggles: Array<[number, string]> = [];
+      let n = 0;
+      const client = {
+        getMessages: async () =>
+          page([{ id: 7, content: "pode encerrar depois de responder" }]),
+        sendMessage: async (conversationId: number, content: string) => {
+          n += 1;
+          // Balloon 1 lands; balloon 2 and the consolidated retry do not.
+          if (n >= 2) throw new Error("chatwoot 502");
+          sent.push([conversationId, content]);
+          return { id: 500 + n };
+        },
+        toggleStatus: async (conversationId: number, status: string) => {
+          toggles.push([conversationId, status]);
+          return {};
+        },
+        toggleTyping: async () => ({}),
+      } as unknown as ChatwootClient;
+
+      const out = await flushDebounceJob({
+        job: jobFor(924, { lastMessageId: 7 }),
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new ResolveThenReplyModel(
+              "Certo!\n\nJá encerro por aqui.",
+            ) as unknown as BaseChatModel,
+          makeClient: async () => client,
+          checkpointer: new MemorySaver(),
+          sleep: async () => {},
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      // The customer got the first balloon and nothing else...
+      expect(sent).toEqual([[924, "Certo!"]]);
+      // ...so the conversation stays open. This is the assertion the throw used to make for us.
+      expect(toggles).toEqual([]);
+    });
+  });
+
   test("superseded mid-turn discards the resolve intent (no toggle, watermark untouched)", async () => {
     await seedConversation(810);
     const sent: Array<[number, string]> = [];
@@ -1730,6 +1783,226 @@ describe.skipIf(!dbUp)("debounce", () => {
         data: { settings: before.settings as object },
       });
     }
+  });
+
+  // ── A balloon that fails mid-reply (issue #429) ────────────────────────────
+  //
+  // The flush is where the duplication the split can cause is actually reachable, and it is not the
+  // path the issue named: there IS no Chatwoot webhook retry (the receiver acks <5s and processes
+  // detached, so Chatwoot is handed a 200 and never re-sends). What retries is the WORKER — a throw
+  // here bubbles out of `flushDebounceJob` with the watermark unadvanced, so the next attempt
+  // coalesces the same burst and answers it again. A reply that threw on its second balloon would
+  // therefore put the first balloon in the conversation twice, and run every side-effecting tool the
+  // turn chose a second time.
+  //
+  // Which is why what already landed decides: the turn reports, the watermark moves, and no retry is
+  // armed. Written against the flush rather than as a unit test because the unit cannot see the
+  // watermark, and the watermark is the whole mechanism.
+  function makeFailingStub(opts: {
+    pages: unknown[];
+    sent: Array<[number, string]>;
+    calls: { getMessages: number };
+    failOn: (n: number) => boolean;
+  }) {
+    let i = 0;
+    let n = 0;
+    const client = {
+      getMessages: async () => {
+        const pg = opts.pages[Math.min(i, opts.pages.length - 1)] ?? {
+          payload: [],
+        };
+        i += 1;
+        opts.calls.getMessages += 1;
+        return pg;
+      },
+      sendMessage: async (conversationId: number, content: string) => {
+        n += 1;
+        if (opts.failOn(n)) throw new Error("chatwoot 502");
+        opts.sent.push([conversationId, content]);
+        return {};
+      },
+      toggleTyping: async () => ({}),
+    } as unknown as ChatwootClient;
+    return async () => client;
+  }
+
+  async function withSplitEnabled<T>(fn: () => Promise<T>): Promise<T> {
+    const before = await suDb.agent.findUniqueOrThrow({
+      where: { id: agentDbId },
+      select: { settings: true },
+    });
+    await suDb.agent.update({
+      where: { id: agentDbId },
+      data: {
+        settings: { ...(before.settings as object), split: { enabled: true } },
+      },
+    });
+    try {
+      return await fn();
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentDbId },
+        data: { settings: before.settings as object },
+      });
+    }
+  }
+
+  test("a balloon that fails mid-reply does not re-answer the burst", async () => {
+    await withSplitEnabled(async () => {
+      await seedConversation(920);
+      const sent: Array<[number, string]> = [];
+      const out = await flushDebounceJob({
+        job: jobFor(920, { lastMessageId: 7 }),
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new FakeListChatModel({
+              responses: ["Olá!\n\nComo vai?\n\nPosso ajudar?"],
+            }) as unknown as BaseChatModel,
+          makeClient: makeFailingStub({
+            pages: [page([{ id: 7, content: "oi" }])],
+            sent,
+            calls: { getMessages: 0 },
+            // The SECOND balloon, with the first already in the conversation.
+            failOn: (n) => n === 2,
+          }),
+          checkpointer: new MemorySaver(),
+          sleep: async () => {},
+        },
+      });
+
+      // Did not throw: the worker arms no retry, so nothing re-sends what landed.
+      expect(out).toEqual({ outcome: "done" });
+      // And the customer has the whole answer, the remainder consolidated into one send. The first
+      // balloon appears exactly once — the assertion the duplication would break.
+      expect(sent).toEqual([
+        [920, "Olá!"],
+        [920, "Como vai?\n\nPosso ajudar?"],
+      ]);
+      // The watermark moved, which is the mechanical half of "no retry re-answers this burst": left
+      // where it was, the next attempt would coalesce the same message again.
+      expect(await watermarkOf(920)).toBe(7);
+    });
+  });
+
+  // THE CASE THE WHOLE DECISION TURNS ON, and the one a passing consolidated retry hides: a balloon
+  // landed AND the remainder's retry failed too, so the customer holds a truncated answer that
+  // nothing is going to complete.
+  //
+  // "Nothing is going to complete it" is MEASURED, and it is the opposite of what this file claimed
+  // first. A throw here buys no re-answer to fear: `shouldPost` claims the burst with a monotonic
+  // CAS (`lastHandledMessageId < toMessageId`) immediately before the first balloon, so the
+  // watermark is already 7 when the second send fails, and a worker retry coalesces nothing and
+  // posts nothing. Measured against a real Chatwoot on BOTH retry paths — the flush here, and the
+  // delivery recovery, whose second pass ran the whole turn and came back "superseded".
+  //
+  // What the throw did buy was the OPERATOR: `lastError` is written on a throw and on nothing else,
+  // and the flush clears it on "posted". So reporting this as plain "posted" erases the only
+  // conversation-level sign that a customer is sitting on one of three balloons — measured live,
+  // where the fixed code came back `lastError: (none)` on exactly this input while the unfixed code
+  // showed the 502. Hence the separate word and the badge the turn writes itself.
+  test("a balloon landed and the remainder failed: reported, and the operator is told", async () => {
+    await withSplitEnabled(async () => {
+      await seedConversation(922);
+      // The burst's own delivery died mid-processing and the sweep already reported it, which is
+      // what makes the settlement WORD observable (same device as the capped-message test above).
+      // Half an answer IS an answer for this question: the customer heard back on this message, so
+      // calling it merely `consumed` would tell the loss list nothing ever replied here.
+      const strand = await suDb.chatwootWebhookDelivery.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          deliveryId: `flush-partial-${process.pid}`,
+          event: "message_created",
+          status: "DEAD",
+          receivedAt: new Date(Date.now() - 60_000),
+          claimedAt: new Date(Date.now() - 60_000),
+          conversationId: 922,
+          inboundMessageId: 7,
+        },
+        select: { id: true },
+      });
+      const sent: Array<[number, string]> = [];
+      const out = await flushDebounceJob({
+        job: jobFor(922, { lastMessageId: 7 }),
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new FakeListChatModel({
+              responses: ["Olá!\n\nComo vai?\n\nPosso ajudar?"],
+            }) as unknown as BaseChatModel,
+          makeClient: makeFailingStub({
+            pages: [page([{ id: 7, content: "oi" }])],
+            sent,
+            calls: { getMessages: 0 },
+            // The second balloon AND the consolidated retry of the remainder.
+            failOn: (n) => n >= 2,
+          }),
+          checkpointer: new MemorySaver(),
+          sleep: async () => {},
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      // Half an answer, delivered once — the consolidated retry does not re-send what landed.
+      expect(sent).toEqual([[922, "Olá!"]]);
+      // Already claimed before the first balloon, which is why no throw could have re-answered it.
+      expect(await watermarkOf(922)).toBe(7);
+      // THE ASSERTION THE DECISION RESTS ON. The flush clears `lastError` on "posted"; a partial
+      // delivery must leave the conversation carrying one instead, or the customer's missing half is
+      // invisible everywhere an operator looks.
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: 922 },
+        select: { lastError: true, lastErrorAt: true },
+      });
+      expect(conv.lastError).not.toBeNull();
+      expect(conv.lastError).toContain("incompleta");
+      expect(conv.lastErrorAt).not.toBeNull();
+      expect((await correctionLine(922)).detail).toMatchObject({
+        outcome: "answered_late",
+      });
+      await suDb.chatwootWebhookDelivery.delete({ where: { id: strand.id } });
+      await clearFlowLog(suDb, { tenantId });
+    });
+  });
+
+  // The other side of the asymmetry, and the reason the first test is not simply "never throw".
+  // Nothing reached the customer, so there is nothing a retry could duplicate — and the throw is the
+  // only way the operator hears about it at all: `lastError` is written on a throw and on nothing
+  // else. Swallowed, this would be a customer waiting on an agent that reported success.
+  test("a reply where NO balloon landed is a failed turn, and says so", async () => {
+    await withSplitEnabled(async () => {
+      await seedConversation(921);
+      const sent: Array<[number, string]> = [];
+      const run = flushDebounceJob({
+        job: jobFor(921, { lastMessageId: 7 }),
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new FakeListChatModel({
+              responses: ["Olá!\n\nComo vai?"],
+            }) as unknown as BaseChatModel,
+          makeClient: makeFailingStub({
+            pages: [page([{ id: 7, content: "oi" }])],
+            sent,
+            calls: { getMessages: 0 },
+            failOn: () => true,
+          }),
+          checkpointer: new MemorySaver(),
+          sleep: async () => {},
+        },
+      });
+      // Awaited: `expect(...).rejects` returns a promise, and an un-awaited one passes whatever the
+      // call actually did — the exact shape of green that proves nothing.
+      await expect(run).rejects.toThrow();
+
+      expect(sent).toEqual([]);
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: 921 },
+        select: { lastError: true },
+      });
+      expect(conv.lastError).not.toBeNull();
+    });
   });
 
   test("a human assignee closes the gate before any Chatwoot fetch", async () => {
@@ -2994,6 +3267,7 @@ describe.skipIf(!dbUp)("debounce", () => {
   // that already read `images.sent`, and the third place it has to hold.
   describe("with a turn that sends an image before its reply", () => {
     const IMG_URL = "https://cdn.loja.com.br/produtos/camiseta.png";
+    const IMG_URL2 = "https://cdn.loja.com.br/produtos/calca.png";
     const imageDeps = {
       fetchImpl: (async () =>
         new Response(
@@ -3033,6 +3307,215 @@ describe.skipIf(!dbUp)("debounce", () => {
         where: { id: agentDbId },
         data: { settings: previousSettings as object },
       });
+    });
+
+    // The image is delivered BEFORE the text (a reply must not swallow the attachment), so a text
+    // send that fails after it leaves the customer holding part of the answer even though no balloon
+    // landed — which is what makes `delivered: 0` alone the wrong thing to throw on (issue #429).
+    // A throw here re-runs the turn and posts that picture a second time. Same rule the attachment-
+    // only branch above already keeps, and this is the third site it has to be written at.
+    // THE THIRD LEG, and the one the table exists for: the text lands but a promised file does not.
+    // Asking only about the reply here is how a conversation closed with the customer holding the
+    // words and not the photo they were about. The decision is `mayCloseConversation`, which this
+    // proves the call site actually consults (the table proves the rule; adoption is a second test).
+    test("an attachment that failed keeps the conversation open even when the text lands", async () => {
+      await seedConversation(926);
+      const sent: Array<[number, string]> = [];
+      const toggles: Array<[number, string]> = [];
+      const client = {
+        getMessages: async () =>
+          page([{ id: 7, content: "manda a foto e encerra" }]),
+        sendFileAttachment: async () => {
+          throw new Error("chatwoot 502");
+        },
+        sendMessage: async (conversationId: number, content: string) => {
+          sent.push([conversationId, content]);
+          return { id: 900 };
+        },
+        toggleStatus: async (conversationId: number, status: string) => {
+          toggles.push([conversationId, status]);
+          return {};
+        },
+        toggleTyping: async () => ({}),
+      } as unknown as ChatwootClient;
+
+      const model = {
+        invoke: async () => new AIMessage("Aqui está!"),
+        bindTools: (_t: unknown) => {
+          let n = 0;
+          return {
+            invoke: async () => {
+              n += 1;
+              return n === 1
+                ? new AIMessage({
+                    content: "",
+                    tool_calls: [
+                      {
+                        name: "send_image",
+                        args: { url: IMG_URL },
+                        id: "call_img",
+                      },
+                      {
+                        name: "resolve_conversation",
+                        args: {},
+                        id: "call_resolve",
+                      },
+                    ],
+                  })
+                : new AIMessage("Aqui está!");
+            },
+          };
+        },
+      };
+
+      const out = await flushDebounceJob({
+        job: jobFor(926, { lastMessageId: 7 }),
+        base: appDb,
+        deps: {
+          makeModel: () => model as unknown as BaseChatModel,
+          makeClient: async () => client,
+          checkpointer: new MemorySaver(),
+          imageDeps,
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      // The words arrived...
+      expect(sent).toEqual([[926, "Aqui está!"]]);
+      // ...the picture they are about did not, so the attendance is not finished.
+      expect(toggles).toEqual([]);
+    });
+
+    // THE SAME RULE ON THE ATTACHMENT-ONLY BRANCH, and this half predates #429: a batch where one
+    // file lands and another fails already reached `applyDeferredResolve`, because `failed` was read
+    // for the throw and not for the close. The customer holds one of the two pictures the agent
+    // promised, and `resolved` says the attendance is finished.
+    test("a batch where one attachment failed does not resolve the conversation", async () => {
+      await seedConversation(925);
+      const attachments: string[] = [];
+      const toggles: Array<[number, string]> = [];
+      const client = {
+        getMessages: async () => page([{ id: 7, content: "manda as fotos" }]),
+        sendFileAttachment: async (
+          _c: number,
+          _b: ArrayBuffer,
+          name: string,
+        ) => {
+          // The first picture lands, the second does not.
+          if (attachments.length >= 1) throw new Error("chatwoot 502");
+          attachments.push(name);
+          return {};
+        },
+        sendMessage: async () => ({}),
+        toggleStatus: async (conversationId: number, status: string) => {
+          toggles.push([conversationId, status]);
+          return {};
+        },
+        toggleTyping: async () => ({}),
+      } as unknown as ChatwootClient;
+
+      // Two pictures and a close, in one response, with no final text: the attachment-only branch.
+      const model = {
+        invoke: async () => new AIMessage(""),
+        bindTools: (_t: unknown) => {
+          let n = 0;
+          return {
+            invoke: async () => {
+              n += 1;
+              return n === 1
+                ? new AIMessage({
+                    content: "",
+                    tool_calls: [
+                      {
+                        name: "send_image",
+                        args: { url: IMG_URL },
+                        id: "call_img_1",
+                      },
+                      {
+                        name: "send_image",
+                        args: { url: IMG_URL2 },
+                        id: "call_img_2",
+                      },
+                      {
+                        name: "resolve_conversation",
+                        args: {},
+                        id: "call_resolve",
+                      },
+                    ],
+                  })
+                : new AIMessage("");
+            },
+          };
+        },
+      };
+
+      const out = await flushDebounceJob({
+        job: jobFor(925, { lastMessageId: 7 }),
+        base: appDb,
+        deps: {
+          makeModel: () => model as unknown as BaseChatModel,
+          makeClient: async () => client,
+          checkpointer: new MemorySaver(),
+          imageDeps,
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      // One picture reached the customer, so the turn is not a failure...
+      expect(attachments).toHaveLength(1);
+      // ...and the conversation stays open, because the other one did not.
+      expect(toggles).toEqual([]);
+    });
+
+    test("a text send that fails after an image is not a failed turn", async () => {
+      await seedConversation(923);
+      const sent: Array<[number, string]> = [];
+      const attachments: string[] = [];
+      const client = {
+        getMessages: async () => page([{ id: 7, content: "manda a foto" }]),
+        sendFileAttachment: async (
+          _c: number,
+          _b: ArrayBuffer,
+          name: string,
+        ) => {
+          attachments.push(name);
+          return {};
+        },
+        sendMessage: async () => {
+          throw new Error("chatwoot 502");
+        },
+        toggleTyping: async () => ({}),
+      } as unknown as ChatwootClient;
+
+      const out = await flushDebounceJob({
+        job: jobFor(923, { lastMessageId: 7 }),
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new SendImageThenReplyModel(
+              "É essa aqui!",
+              IMG_URL,
+            ) as unknown as BaseChatModel,
+          makeClient: async () => client,
+          checkpointer: new MemorySaver(),
+          imageDeps,
+        },
+      });
+
+      expect(out).toEqual({ outcome: "done" });
+      expect(attachments).toHaveLength(1);
+      expect(sent).toEqual([]);
+      // The retry that a throw would arm is what would send that picture again.
+      expect(await watermarkOf(923)).toBe(7);
+      // AND THE THIRD SHAPE OF A PARTIAL DELIVERY (issue #429), which this branch used to report as
+      // plain `posted`: the customer holds the picture and none of the words. "Not a failed turn"
+      // and "nothing to tell the operator" are different facts, and reporting it as a clean post
+      // makes the flush CLEAR whatever badge the conversation was carrying.
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: 923 },
+        select: { lastError: true },
+      });
+      expect(conv.lastError).toContain("incompleta");
     });
 
     test("a burst retired after the image still counts as answered", async () => {

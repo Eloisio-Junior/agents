@@ -4,6 +4,7 @@ import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
+import { mayCloseConversation, postedOutcomeFor } from "@/graph/close-intent";
 import { withKeyedQueue } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { overlayMediaAnnotations } from "@/modules/chatwoot/annotations";
@@ -25,6 +26,7 @@ import { renderInboundMessage } from "@/modules/chatwoot/render";
 import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
 import type { AuthContext } from "@/modules/contact-auth/check";
 import { withAuthContextSection } from "@/modules/contact-auth/context";
+import { recordConversationError } from "@/modules/conversations/error";
 import {
   type ObservedConversation,
   observeBeforeClose,
@@ -44,7 +46,7 @@ import {
 } from "@/modules/guardrails/gate";
 import type { ImageFetchDeps } from "@/modules/images/fetch";
 import { armCompaction } from "@/modules/memory/compact";
-import { deliverReply } from "@/modules/split/service";
+import { deliverReply, type ReplyDelivery } from "@/modules/split/service";
 import { synthesizeReply } from "@/modules/tts/service";
 import { shouldReplyWithAudio } from "@/modules/tts/settings";
 import {
@@ -104,6 +106,14 @@ function sysCtx(tenantId: bigint): TenantContext {
 
 export type RunAgentTurnOutcome =
   | "posted"
+  // PART of what the turn promised reached the customer, and the rest is not coming (issue #429).
+  // Everything that keys off "did this turn answer" reads it like "posted" — the burst is consumed,
+  // the watermark advances, the ledger row is settled — because the customer HAS part of it and a
+  // re-run would send that part twice. The one thing it must NOT do is clear the operator's error
+  // badge, which is why it is a separate word instead of a boolean the callers would each have to
+  // remember to ask for. Produced by `postedOutcomeFor` from the same two bits that decide whether
+  // the turn may close the conversation.
+  | "posted-partial"
   | "skipped"
   // NO AGENT IS BOUND to this inbox. The mirror creates a row for any inbox that sends traffic, so
   // this is the state a channel connected in Chatwoot and never bound here sits in, and the caller
@@ -150,6 +160,35 @@ export interface RuntimeDeps {
   // that leans on real time to cross the boundary passes for the wrong reason the moment the
   // machine is slow enough to cross it before the first read.
   now?: () => Date;
+}
+
+// THE BADGE FOR A DELIVERY THAT ENDED INCOMPLETE, written at the two sites that can produce one (a
+// reply, attachments alone) so `"posted-partial"` is never a word without the line that explains it.
+//
+// It exists because the callers cannot write it: past the return the turn is a word, and both of
+// them read that word as an answer and CLEAR the badge. Measured against a real Chatwoot before this
+// existed — a reply whose second balloon failed and whose retry failed too came back "posted", the
+// flush cleared `lastError`, and a customer holding one of three balloons sat on a conversation
+// whose only operator-visible state said the last turn went fine. The cause stays in the flow log
+// (`stage: "split"`, `outcome: "send_failed"`); this is the badge that sends an operator to look.
+//
+// Best-effort by contract (see recordConversationError): bookkeeping must never turn a half-answer
+// that WAS delivered into a thrown turn.
+async function notePartialDelivery(params: {
+  tenantId: bigint;
+  instanceId: bigint;
+  conversationId: number;
+  base: PrismaClient;
+}): Promise<void> {
+  await recordConversationError({
+    tenantId: params.tenantId,
+    instanceId: params.instanceId,
+    chatwootConversationId: params.conversationId,
+    error: new Error(
+      "a entrega ficou incompleta: parte do que o turno prometeu não chegou ao cliente, e não será reenviada",
+    ),
+    base: params.base,
+  });
 }
 
 export interface RunLoadedTurnParams {
@@ -681,12 +720,14 @@ export async function runLoadedTurn(
 
   // One piece of customer-facing text, delivered the way this agent delivers text: as audio when the
   // modality calls for it, otherwise split into typing-paced balloons. Returns how many balloons
-  // landed (1 for audio). TTS is best-effort — a synthesis failure falls back to text and never
-  // drops the message.
+  // landed (1 for audio) AND whether part of the reply is missing — `deliverReply` no longer reports
+  // a partial send by throwing (issue #429), so the two have to travel together for the callers
+  // below to keep deciding what a total failure means. TTS is best-effort — a synthesis failure
+  // falls back to text and never drops the message.
   const deliverText = async (
     text: string,
     voiceReply: boolean | null,
-  ): Promise<number | "stale"> => {
+  ): Promise<ReplyDelivery | "stale"> => {
     const wantAudio = shouldReplyWithAudio(
       loaded.ttsConfig.mode,
       params.userSentAudio ?? false,
@@ -736,7 +777,7 @@ export async function runLoadedTurn(
             threadId,
             text.length,
           );
-          return 1;
+          return { delivered: 1, failed: false };
         }
       } catch (e) {
         logger.warn(
@@ -759,11 +800,12 @@ export async function runLoadedTurn(
       writeCalledOff,
     );
     logger.info(
-      "chatwoot agent replied: conv=%s thread=%s len=%d balloons=%d",
+      "chatwoot agent replied: conv=%s thread=%s len=%d balloons=%d partial=%s",
       String(conversationId),
       threadId,
       text.length,
-      balloons,
+      balloons.delivered,
+      String(balloons.failed),
     );
     return balloons;
   };
@@ -824,8 +866,12 @@ export async function runLoadedTurn(
       // later gate can catch — it leaves before them. A run called off during the model call reaches
       // exactly here, so this is where it stops. The transfer itself stays done: the tool ran, the
       // conversation is the human queue's, and withholding the sentence is the part still ours.
-      if (delivered === "stale" || delivered === 0) return;
-      deliveredBalloons = delivered;
+      //
+      // NOTE: a partial send is not raised here, unlike the reply path below. This whole delivery is
+      // best-effort by design (the catch around it says why), so a missing half of the goodbye must
+      // not become a turn error on a conversation that was answered and correctly handed over.
+      if (delivered === "stale" || delivered.delivered === 0) return;
+      deliveredBalloons = delivered.delivered;
     } catch (e) {
       // Best-effort, the semantics the line had while the tool sent it. The transfer succeeded, so
       // branding the turn as errored would stamp lastError and announce "a human has to take over"
@@ -1395,7 +1441,18 @@ export async function runLoadedTurn(
       // Skipped, not returned on: closing a conversation the operator has just cleared is a write
       // of its own, and by here something may already have reached the customer — the outcome still
       // has to describe that.
-      if (!(await writeCalledOff())) {
+      //
+      // AND SKIPPED ON A PARTIAL BATCH: the customer holds some of what the turn owed them, so a
+      // `resolved` conversation tells the operator this attendance is finished when the agent knows
+      // it is not. The rule itself lives in ./close-intent.ts, asked the same way at all three
+      // sites — it was answered differently at each until a review round found them one by one.
+      if (
+        mayCloseConversation({
+          replyPartial: false,
+          attachmentFailed: failed,
+        }) &&
+        !(await writeCalledOff())
+      ) {
         await applyDeferredResolve(client, conversationId, turnState, flow, {
           tenantId,
           instanceId,
@@ -1403,7 +1460,22 @@ export async function runLoadedTurn(
           observed: recheck.observed,
         });
       }
-      return sent || handedOff ? "posted" : "empty";
+      // Partial here too, and the same rule: a batch where one file failed is an attendance the
+      // customer did not fully receive, so it neither closes nor clears the badge.
+      if (!sent && !handedOff) return "empty";
+      const postedFiles = postedOutcomeFor({
+        replyPartial: false,
+        attachmentFailed: failed,
+      });
+      if (postedFiles === "posted-partial") {
+        await notePartialDelivery({
+          tenantId,
+          instanceId,
+          conversationId,
+          base,
+        });
+      }
+      return postedFiles;
     }
 
     // The image lands before the text that talks about it, and before the TTS branch: an audio
@@ -1424,6 +1496,30 @@ export async function runLoadedTurn(
       return attachments.sent ? "posted" : refuse("stale");
 
     const delivered = await deliverText(reply, recheck.voiceReply);
+    // NOTHING LANDED AND A SEND FAILED: a failed turn, and the ONE shape of partial delivery that
+    // still throws (issue #429). Nothing reached the customer, so there is nothing a retry could
+    // duplicate — which is exactly what makes the throw safe here and unsafe one balloon later. The
+    // throw is also the only way the operator hears about it: the callers record a turn error
+    // (private note, lastError, alert) on a throw and on nothing else, and the recovery reads it to
+    // decide the row is still owed an answer.
+    //
+    // Same rule as the attachment-only branch above, and stated the same way there: delivered
+    // nothing AND failed is a failure; delivered nothing without failing is not.
+    //
+    // NOTE: ...unless an ATTACHMENT already went out. Then the customer holds part of the answer,
+    // and a re-run would send that attachment a second time — the same reason the branch below
+    // reports "posted" rather than standing down.
+    if (
+      delivered !== "stale" &&
+      delivered.failed &&
+      delivered.delivered === 0
+    ) {
+      if (!attachments.sent) {
+        throw new Error(
+          "envio da resposta: nenhum balão foi entregue ao cliente",
+        );
+      }
+    }
     // Zero is the split loop standing down on its FIRST balloon: nothing reached the customer, so
     // this is a stale turn and not a delivered one. Treating every number as posted would advance
     // the handled watermark over a burst nobody answered, and the next flush starts after it.
@@ -1432,10 +1528,48 @@ export async function runLoadedTurn(
     // and the third place it has to be written: the images were delivered before this line ran, so a
     // command landing in the text send leaves a customer holding part of the answer. "stale" would
     // hand the burst back to the next flush, which sends that attachment again.
-    if (delivered === "stale" || delivered === 0) {
-      return attachments.sent ? "posted" : refuse("stale");
+    if (delivered === "stale" || delivered.delivered === 0) {
+      if (!attachments.sent) return refuse("stale");
+      // The attachment IS the answer the customer got, and this is the third shape of a partial
+      // delivery rather than a fourth kind of success: a text send that failed outright leaves them
+      // holding the file and none of the words, which is exactly what the badge exists to say.
+      //
+      // `stale` is deliberately NOT partial. Nothing was attempted after the fence, by decision, and
+      // reporting the operator's own /reset as an incomplete delivery puts `lastError` back on the
+      // conversation they had just cleared — the rule `deliverReply` states for the same case.
+      // `attachmentFailed` is still asked on that path, because a file that failed BEFORE the fence
+      // failed on its own.
+      const postedOnFiles = postedOutcomeFor({
+        replyPartial: delivered !== "stale" && delivered.failed,
+        attachmentFailed: attachments.failed,
+      });
+      if (postedOnFiles === "posted-partial") {
+        await notePartialDelivery({
+          tenantId,
+          instanceId,
+          conversationId,
+          base,
+        });
+      }
+      return postedOnFiles;
     }
-    deliveredBalloons = delivered;
+    deliveredBalloons = delivered.delivered;
+    // AN ATTENDANCE THE CUSTOMER DID NOT FULLY RECEIVE DOES NOT CLOSE, and this branch owes the
+    // answer for BOTH halves of what the turn promised: the text AND the files that went out ahead
+    // of it. Asking only about the text is how a reply that landed while a promised photo did not
+    // still closed the conversation.
+    //
+    // The reply is still `posted` for retry bookkeeping — the customer HAS part of it, and re-running
+    // would send that part twice — so the two questions genuinely differ. The flow lines from the
+    // failed sends are what tell the operator why the conversation stayed open.
+    const posted = postedOutcomeFor({
+      replyPartial: delivered.failed,
+      attachmentFailed: attachments.failed,
+    });
+    if (posted === "posted-partial") {
+      await notePartialDelivery({ tenantId, instanceId, conversationId, base });
+      return posted;
+    }
     // Same rule as the branch above: the reply is out, the resolve is a separate write.
     if (await writeCalledOff()) return "posted";
     await applyDeferredResolve(client, conversationId, turnState, flow, {
