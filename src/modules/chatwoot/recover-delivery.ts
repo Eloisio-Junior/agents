@@ -1101,9 +1101,12 @@ async function runRecovery(params: {
   // same loss described above, on the topology where the fence cannot see it. Closing that means
   // taking the durable claim (`markTurnOwning`) here, and that is not a wider version of this hold:
   // it WAITS on an append's lease and on the reset's row lock, so it changes what the fence MEANS
-  // rather than extending its reach. Left as issue #203's remaining edge, on the same grounds the
-  // nudge paragraph above states: docs/deploy.md §4 declares one replica, and every reader that this
-  // hold has to reach lives in it.
+  // rather than extending its reach. Tracked as issue #428 and NOT as #203's remaining edge, which
+  // is what it was first written as: #203 enumerated three consumers of this fence and left two of
+  // them deliberately, on the grounds that a compaction re-arms and a nudge races one reply. A reset
+  // recovers from nothing — it is an operator's deliberate deletion, undone — so it is a fourth
+  // consumer rather than one of those two. Left here on the invariant docs/deploy.md §4 declares:
+  // one replica, where every reader this hold has to reach lives in it.
   markTurnReserved(handoffKey);
   markTurnReserved(graphKey);
   try {
