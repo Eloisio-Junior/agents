@@ -5,6 +5,8 @@ import { AppError, NotFoundError } from "@/lib/errors";
 import { parseInput } from "@/lib/parse-input";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { redactEndpoint } from "@/modules/audit/projection";
+import { auditMutation, projectionMoved } from "@/modules/audit/service";
 import { requireVaultRef } from "@/modules/vault/service";
 import { isOutboundEvent, type OutboundEvent } from "./events";
 import { syncTenantHeartbeat } from "./heartbeat";
@@ -56,6 +58,30 @@ function toDto(row: {
     enabled: row.enabled,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
+  };
+}
+
+// What the audit row carries: the subscription as the operator sees it, minus the identifiers and
+// timestamps the row already holds in its own columns.
+//
+// The URL is REDACTED to its origin even though the column holds it in the clear and every read
+// surface returns it whole, because those are deletable and this row is not: an operator who pastes
+// a Discord webhook here and corrects it a minute later would otherwise have left its token in an
+// append-only row. Where the value is STORED says nothing about whether it is a secret, and the
+// destinations these are pointed at put the credential in the path — `redactEndpoint` says the rest.
+// Identity is not lost: the row's `target` names this subscription exactly.
+//
+// `secretRef` is on it, and it is a reference rather than a secret by construction: this service is
+// the only writer of the column (measured) and it canonicalizes every value through
+// `requireVaultRef`, so what the row names is the vault entry and never what is inside it. Recording
+// it is the point — rotating or clearing a signing secret changes what a receiver verifying HMAC
+// sees, and that is exactly the class of change a trail exists to attribute.
+function auditProjection(dto: WebhookSubscriptionDto) {
+  return {
+    urlMasked: redactEndpoint(dto.url),
+    events: dto.events,
+    enabled: dto.enabled,
+    secretRef: dto.secretRef,
   };
 }
 
@@ -121,7 +147,7 @@ export async function createWebhookSubscription(
     const secretRef = parsed.secretRef
       ? await requireVaultRef(db, parsed.secretRef, "secretRef")
       : null;
-    return db.webhookSubscription.create({
+    const created = await db.webhookSubscription.create({
       data: {
         tenantId,
         url: parsed.url,
@@ -131,6 +157,12 @@ export async function createWebhookSubscription(
       },
       select: SELECT,
     });
+    await auditMutation(db, ctx, {
+      action: "webhook.create",
+      target: `webhook:${created.id}`,
+      after: auditProjection(toDto(created)),
+    });
+    return created;
   });
   // Reconcile the per-tenant heartbeat emitter against the new subscription state.
   await syncTenantHeartbeat(tenantId, base);
@@ -180,16 +212,53 @@ export async function updateWebhookSubscription(
     if (typeof data.secretRef === "string") {
       data.secretRef = await requireVaultRef(db, data.secretRef, "secretRef");
     }
+    // LOCKED, then read, and both inside the transaction the write happens in. The MCP tool read
+    // this one layer up and outside any transaction, which is the half of the seam that could not be
+    // fixed from up there — and an unlocked read in here is only better by a margin: at READ
+    // COMMITTED two concurrent PATCHes both read state A, the first commits B, and the second's
+    // `updateMany` then blocks, wakes, writes C and files a row saying A became C. B's change is
+    // attributed to whoever wrote C. Six of the audited families already take this lock before their
+    // snapshot (`agents`, `tenants`, `tenant_settings`, branding by advisory lock, and the delivery
+    // requeue two files away); this is the same statement at a seventh site.
+    await db.$queryRaw`SELECT 1 FROM "webhook_subscriptions" WHERE "id" = ${id} FOR UPDATE`;
+    const current = await db.webhookSubscription.findFirst({
+      where: { id },
+      select: SELECT,
+    });
     const res = await db.webhookSubscription.updateMany({
       where: { id },
       data,
     });
-    if (res.count === 0)
+    if (res.count === 0 || !current)
       throw new NotFoundError(
         "webhook subscription not found",
         "errors.webhookSubscriptionNotFound",
       );
-    return db.webhookSubscription.findFirst({ where: { id }, select: SELECT });
+    const updated = await db.webhookSubscription.findFirst({
+      where: { id },
+      select: SELECT,
+    });
+    if (updated) {
+      const before = auditProjection(toDto(current));
+      const shown = auditProjection(toDto(updated));
+      // A destination that moved where the projection cannot show it: two URLs on the same host
+      // redact to the same string, and rotating the token of a Discord-shaped endpoint is exactly
+      // that shape. The boolean is what the row carries instead — that it changed, never what it
+      // changed to.
+      const hidden =
+        current.url !== updated.url && before.urlMasked === shown.urlMasked;
+      const after = hidden ? { ...shown, urlReplaced: true } : shown;
+      // The trail records changes: a caller is free to PATCH a field to the value it already holds.
+      if (hidden || projectionMoved(before, after)) {
+        await auditMutation(db, ctx, {
+          action: "webhook.update",
+          target: `webhook:${id}`,
+          before,
+          after,
+        });
+      }
+    }
+    return updated;
   });
   if (!row)
     throw new NotFoundError(
@@ -212,10 +281,26 @@ export async function deleteWebhookSubscription(
   // the subscription. Operator-initiated, so dropping its delivery ledger is acceptable — and it is
   // now a ledger somebody may be reading (issue #305), which is why the order is written down.
   const count = await runScopedOn(base, ctx, async (db) => {
+    // Locked, then read before the delete: the row is what the audit records, and after
+    // `deleteMany` there is nothing left to name what was removed. The lock is the same one the
+    // update takes, and for the same reason — an update committing between this read and the delete
+    // would leave the row describing a subscription that no longer looked like that.
+    await db.$queryRaw`SELECT 1 FROM "webhook_subscriptions" WHERE "id" = ${id} FOR UPDATE`;
+    const current = await db.webhookSubscription.findFirst({
+      where: { id },
+      select: SELECT,
+    });
     await db.outboundWebhookDelivery.deleteMany({
       where: { subscriptionId: id },
     });
     const res = await db.webhookSubscription.deleteMany({ where: { id } });
+    if (res.count > 0 && current) {
+      await auditMutation(db, ctx, {
+        action: "webhook.delete",
+        target: `webhook:${id}`,
+        before: auditProjection(toDto(current)),
+      });
+    }
     return res.count;
   });
   if (count === 0)
