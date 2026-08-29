@@ -287,6 +287,10 @@ export function unwaived(
 async function sources(): Promise<Map<string, string>> {
   const files = new Map<string, string>();
   for await (const file of new Glob("src/**/*.{ts,tsx}").scan(".")) {
+    // RAW on purpose. `bigIntArgs` runs its own `blankNonCode` for the detection and then takes the
+    // argument's TEXT as the ledger key, so pre-stripping rewrites the keys: `BigInt(ref.slice(
+    // "vault:".length))` becomes an argument full of spaces and the waiver stops matching. The one
+    // sweep in this family that must not be handed stripped source (found by review).
     files.set(file, await Bun.file(file).text());
   }
   return files;
