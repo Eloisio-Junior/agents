@@ -8,7 +8,7 @@ import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { redactEndpoint } from "@/modules/audit/projection";
 import { auditMutation, projectionMoved } from "@/modules/audit/service";
-import { requireVaultRef } from "@/modules/vault/service";
+import { readableVaultRef, requireVaultRef } from "@/modules/vault/service";
 import { FLOW_LEVELS, FLOW_STAGES } from "./stages";
 
 // CRUD for AlertChannel (external alert sinks for execution-flow warnings/errors). Mirrors the
@@ -32,7 +32,19 @@ export interface AlertChannelDto {
   minLevel: string;
   stages: string[];
   // Whether an HMAC signing secret is configured (the value never leaves the vault).
+  //
+  // Derivable from `secretRef` below, and kept because it is the published v1 shape and the MCP
+  // tool's own description names it. Both are read off the same column by `toDto`, so they cannot
+  // come apart.
   hasSecret: boolean;
+  // The vault REFERENCE (`vault:<id>`) of that secret, or null. Not the secret: this service is one
+  // of the two writers of the column and canonicalizes every value through `requireVaultRef`, the
+  // same grounds on which `WebhookSubscriptionDto` returns its own.
+  //
+  // It is on the DTO so the console can show WHICH credential signs and let the operator take it
+  // away — `hasSecret` can do neither. It is `readableVaultRef` of the column and not the column:
+  // this one predates #126 and can hold arbitrary text, which a projection must never publish.
+  secretRef: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -83,6 +95,7 @@ function toDto(row: {
     minLevel: row.minLevel,
     stages: row.stages,
     hasSecret: row.secretRef !== null,
+    secretRef: readableVaultRef(row.secretRef),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -95,10 +108,15 @@ function toDto(row: {
 // URL embeds a bot token, and an audit row is readable by every tenant admin — the one place a
 // projection built by hand would put it back in the clear.
 //
-// `secretRef` IS on it, in full, and it is a reference rather than a secret by construction: this
-// service is the only writer of the column (measured) and it canonicalizes every value through
-// `requireVaultRef`. The DTO's `hasSecret` would not do: it is the same boolean before and after a
-// ROTATION, so the one change a signing secret can undergo would leave no row.
+// `secretRef` IS on it, because the DTO's `hasSecret` would not do: it is the same boolean before and
+// after a ROTATION, so the one change a signing secret can undergo would leave no row. It goes through
+// `readableVaultRef` like the DTO — this service canonicalizes every value it writes, but the column
+// predates #126 and holds whatever came in before that, and an audit row is append-only and readable
+// by every tenant admin: the one place a mistake here cannot be taken back.
+//
+// `secretRefOpaque` is what keeps the trail honest once the redaction exists. Without it a legacy
+// value reads as null on both sides of a clear, `projectionMoved` sees nothing, and the one save that
+// removed a signing secret writes no row at all — the same silence the DTO's `hasSecret` had.
 function auditProjection(row: {
   name: string;
   type: string;
@@ -115,7 +133,9 @@ function auditProjection(row: {
     minLevel: row.minLevel,
     stages: row.stages,
     enabled: row.enabled,
-    secretRef: row.secretRef,
+    secretRef: readableVaultRef(row.secretRef),
+    secretRefOpaque:
+      row.secretRef !== null && readableVaultRef(row.secretRef) === null,
   };
 }
 

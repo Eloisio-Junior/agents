@@ -71,6 +71,39 @@ export function readVaultRefId(ref: string): bigint | null {
   return id < 0n || id > MAX_DB_ID ? null : id;
 }
 
+// The one form of a STORED ref that is safe to hand to a reader, or null when the stored value does
+// not name an entry at all.
+//
+// Every ref column was guarded by `requireVaultRef` on all of its writers in one commit (#126, and
+// the two `secretRef` columns are the measured case); before it the schema was
+// `z.string().min(1).max(128)` and the value went in verbatim. So a row can hold arbitrary text — an
+// API caller who read the field name as "the secret" and typed one in put it there — and a projection
+// that echoes the column publishes it to every reader of that projection, which is exactly what the
+// promise "the signing secret never leaves the vault" says cannot happen.
+//
+// What it proves is that the value IS a reference — the prefix plus an in-range integer — and not that
+// the entry exists. That distinction is deliberate, and it is why the guard can stay a pure function.
+// A ref whose entry was DELETED still comes back, so the picker can say "Credential unavailable" and
+// the operator learns what happened; verifying existence would replace that with silence and put a
+// tenant-scoped query inside every projection, including the ones that run in an audit transaction.
+//
+// The bound is what makes that safe rather than merely cheap: the output is never the stored string.
+// It is `vault:` plus the DECIMAL rendering of a parsed BigInt in [0, MAX_DB_ID], so `vault:0x1F4`
+// leaves as `vault:500` and everything an HMAC secret actually looks like — hex, base64, `sha256=…`,
+// any bare name — reads as null. Reaching the remaining sliver takes a stored value of the form
+// `vault:<digits>`, which is reference syntax: someone writing a raw secret writes the secret, not the
+// prefix. (Review round 5 read this as a secret-disclosure path; the table in
+// `tests/modules/alert-channel-secret-roundtrip.test.ts` is the measurement.)
+//
+// Canonical rather than verbatim for the values it DOES read: `vault: 7`, `vault:0007` and `vault:0x7`
+// all name entry 7, and echoing the stored spelling would hand a client back something
+// `requireVaultRef` refuses on the way in — a rename turned into an unsavable form.
+export function readableVaultRef(stored: string | null): string | null {
+  if (stored === null) return null;
+  const id = readVaultRefId(stored);
+  return id === null ? null : formatVaultRef(id);
+}
+
 export function vaultRefWhere(ref: string): { id: bigint } {
   return { id: readVaultRefId(ref) ?? -1n };
 }
