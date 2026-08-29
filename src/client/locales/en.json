@@ -1166,6 +1166,9 @@
       "tools": "Tools"
     },
     "tabs": "Agent settings",
+    "takeover": "When a person answers",
+    "takeoverHint": "A colleague answering the customer moves the conversation to the human queue and the agent stops replying to it. Chatwoot does not do this on its own. A reply typed in the Chatwoot composer always counts; a reply typed on the paired phone counts on Baileys, native and uazapi connections, not on Z-API. To hand a conversation back, use Return to AI on the Conversations page.",
+    "takeoverOnHumanReply": "Stop answering when a person replies to the customer",
     "temperature": "Temperature",
     "temperatureHint": "0-2 (optional)",
     "toolPreconditions": {
