@@ -11,14 +11,34 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
-    # NOTE: a REAL Postgres, not a mock. Roughly 1600 of this suite's assertions are database-backed
-    # and every one of them is gated on `describe.skipIf(!dbUp)`, so without a server here they do
-    # not fail: they SKIP, and the job reports green having never run the end-to-end layer the
-    # project's testing standard is built on. A stubbed database would be worse than none, because
-    # row-level security is enforced by the server and a stub cannot enforce it.
+    # NOT SHARDED YET, AND WHAT IS LEFT IN THE WAY IS ONE TEST.
     #
-    # pgvector, not plain postgres: `scripts/db-bootstrap.sql` runs CREATE EXTENSION vector. pg17 is
-    # what every docker-compose in this repo ships, so CI tests the server operators actually run.
+    # Four shards (one job each, own vCPUs, own database) took the test step from 157s to 36-61s and
+    # the wall from 217s to ~109s. What came back red was not the split: the same `--shard=1/4` fails
+    # on a clean origin/main, because this suite was only ever green in the order the full serial run
+    # happens to give it. Four causes were found and fixed on this branch, taking the four shards from
+    # 19 failures to 1:
+    #
+    #   - src/app.ts exported ONE Elysia instance, and three files mutated it: two registered their
+    #     own routes on it, one called `listen()`. Elysia compiles its router on first use, so a later
+    #     file's route never existed and its request fell through to the `/*` SPA handler, and a
+    #     stopped-but-compiled app answered later `handle()` calls with 500s. `buildApp()` is the fix.
+    #   - one file replaced `@/modules/rag/service` in the module registry. Re-registering the real
+    #     module in `afterAll` is a second global rewrite, and whether it lands before another file's
+    #     imports resolve is an ordering nobody controls. A `spyOn` on the module object restores.
+    #
+    # THE ONE LEFT: tests/client/components/UserMenu.test.tsx stubs `react-i18next` (plus the auth and
+    # theme contexts) with `mock.module`, which has no reliable undo, and
+    # tests/client/document-starters-race.test.tsx switches the REAL i18n language to prove a stale
+    # response cannot overwrite a newer one. Against the stub the switch does nothing. Both files
+    # already document the hazard from their own side. Two fixes were measured and rejected: restoring
+    # the modules in `afterAll` does not undo the leak, and dropping the stub for the real instance
+    # makes UserMenu itself order-dependent and breaks the stub ledger in
+    # tests/lib/module-mock-package.test.ts, which lists that stub on purpose.
+    #
+    # `bun test --parallel` is NOT affected and runs clean: it implies `--isolate`, so each file gets
+    # its own module registry and a `mock.module` cannot reach the next file. Only a shard, which runs
+    # serially inside its job, shares one.
     services:
       postgres:
         image: pgvector/pgvector:pg17
@@ -26,7 +46,13 @@ jobs:
           POSTGRES_PASSWORD: postgres
         ports:
           - 5432:5432
+        # tmpfs for the DATA DIRECTORY: this database is created, migrated, written to for three
+        # minutes and thrown away, so nothing it writes has to survive the job, and 183 of this
+        # suite's files are database-backed. On a 4-vCPU runner the server competes for the same
+        # cores as the tests, and every fsync it does is paid out of them. Borrowed from the
+        # Chatwoot upstream, which does the same on its own spec matrix.
         options: >-
+          --mount type=tmpfs,destination=/var/lib/postgresql/data
           --health-cmd "pg_isready -U postgres"
           --health-interval 5s
           --health-timeout 5s
