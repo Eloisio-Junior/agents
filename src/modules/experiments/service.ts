@@ -5,6 +5,8 @@ import config from "@/config";
 import { NotFoundError } from "@/lib/errors";
 import { parseInput } from "@/lib/parse-input";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import { markUndisclosed, undisclosedMoved } from "@/modules/audit/projection";
+import { auditMutation, projectionMoved } from "@/modules/audit/service";
 
 // Prompt A/B experiments. A thread is bucketed to a variant DETERMINISTICALLY (so re-resolution is
 // stable), and the assignment is persisted race-safely via createMany({skipDuplicates}) — an
@@ -109,6 +111,42 @@ export async function resolveVariantOverride(
   return variants.find((v) => v.key === key)?.systemPrompt ?? null;
 }
 
+// What the audit row carries.
+//
+// Same two halves as the other four families: identity, policy and shape are PROJECTED, everything
+// else is listed in `UNDISCLOSED` below and compared without being carried.
+//
+// The variants contribute their KEYS and WEIGHTS and never their `systemPrompt`. A prompt is the
+// largest field an experiment holds, and what a reader needs from a variant change is that the
+// split moved and which arm it moved for; the prompt is readable on the experiment for as long as
+// the experiment exists, and this row outlives it. But editing one arm's prompt while leaving its
+// key and weight alone is a substantive change to the experiment and moves nothing above, so the
+// whole variant array is compared.
+//
+// `tests/modules/audit-config-families.test.ts` holds the fence over this model's columns.
+function auditProjection(r: {
+  name: string;
+  agentId: bigint | null;
+  variants: unknown;
+  enabled: boolean;
+}) {
+  const variants = Array.isArray(r.variants) ? r.variants : [];
+  return {
+    name: r.name,
+    agentId: r.agentId === null ? null : String(r.agentId),
+    enabled: r.enabled,
+    variants: variants.map((v) => {
+      const o = (v ?? {}) as Record<string, unknown>;
+      return { key: o.key ?? null, weight: o.weight ?? null };
+    }),
+  };
+}
+
+// The column the projection above may not publish, compared and never carried
+// (`@/modules/audit/projection`). A variant carries its own prompt overrides, which is exactly the
+// free text a row may not keep; what the row shows is which keys exist and how the traffic splits.
+const UNDISCLOSED = ["variants"] as const;
+
 // ── CRUD ──
 
 export async function listExperiments(
@@ -153,7 +191,12 @@ export async function createExperiment(params: {
         variants: variants as unknown as object,
         enabled: params.enabled ?? true,
       },
-      select: { id: true },
+      select: EXPERIMENT_SELECT,
+    });
+    await auditMutation(db, params.ctx, {
+      action: "experiment.create",
+      target: `experiment:${exp.id}`,
+      after: auditProjection(exp),
     });
     return { id: exp.id };
   });
@@ -201,9 +244,12 @@ export async function updateExperiment(params: {
       ? parseInput(z.array(variantWriteSchema), params.variants, "variants")
       : undefined;
   return runScopedOn(base, params.ctx, async (db) => {
+    // LOCKED before the snapshot the trail compares against: at READ COMMITTED two concurrent
+    // updates both read state A, the first commits B, and the second files a row saying A became C.
+    await db.$queryRaw`SELECT 1 FROM "experiments" WHERE "id" = ${params.id} FOR UPDATE`;
     const current = await db.experiment.findUnique({
       where: { id: params.id },
-      select: { id: true },
+      select: EXPERIMENT_SELECT,
     });
     if (!current) {
       throw new NotFoundError(
@@ -222,10 +268,22 @@ export async function updateExperiment(params: {
         ...(params.enabled !== undefined ? { enabled: params.enabled } : {}),
       },
     });
-    return db.experiment.findUniqueOrThrow({
+    const row = await db.experiment.findUniqueOrThrow({
       where: { id: params.id },
       select: EXPERIMENT_SELECT,
     });
+    const beforeProj = auditProjection(current);
+    const afterProj = auditProjection(row);
+    const undisclosed = undisclosedMoved(current, row, UNDISCLOSED);
+    if (undisclosed || projectionMoved(beforeProj, afterProj)) {
+      await auditMutation(db, params.ctx, {
+        action: "experiment.update",
+        target: `experiment:${params.id}`,
+        before: undisclosed ? markUndisclosed(beforeProj) : beforeProj,
+        after: undisclosed ? markUndisclosed(afterProj) : afterProj,
+      });
+    }
+    return row;
   });
 }
 
@@ -235,13 +293,25 @@ export async function deleteExperiment(
   base: PrismaClient = basePrisma,
 ): Promise<void> {
   await runScopedOn(base, ctx, async (db) => {
+    // Locked, then read before the delete: after `deleteMany` there is nothing left to name what
+    // was removed.
+    await db.$queryRaw`SELECT 1 FROM "experiments" WHERE "id" = ${id} FOR UPDATE`;
+    const current = await db.experiment.findUnique({
+      where: { id },
+      select: EXPERIMENT_SELECT,
+    });
     const res = await db.experiment.deleteMany({ where: { id } });
-    if (res.count === 0) {
+    if (res.count === 0 || !current) {
       throw new NotFoundError(
         "experiment not found",
         "errors.experimentNotFound",
       );
     }
+    await auditMutation(db, ctx, {
+      action: "experiment.delete",
+      target: `experiment:${id}`,
+      before: auditProjection(current),
+    });
   });
 }
 

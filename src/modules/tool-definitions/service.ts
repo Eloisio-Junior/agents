@@ -5,6 +5,13 @@ import { normalizeExpectedStatuses } from "@/graph/tools/http-status";
 import { AppError, ConflictError, NotFoundError } from "@/lib/errors";
 import { parseInput } from "@/lib/parse-input";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import {
+  markUndisclosed,
+  redactEndpoint,
+  refForAudit,
+  undisclosedMoved,
+} from "@/modules/audit/projection";
+import { auditMutation, projectionMoved } from "@/modules/audit/service";
 import { readAppointmentDeclaration } from "@/modules/tool-definitions/appointment";
 import { readableVaultRef, requireVaultRef } from "@/modules/vault/service";
 import { unsupportedBodyShape } from "./body-shape";
@@ -120,6 +127,87 @@ function toDto(r: {
     updatedAt: r.updatedAt,
   };
 }
+
+// What the audit row carries.
+//
+// Every mutable column of the row is in one of two halves, and the split is the point rather than
+// the contents of either. What is PROJECTED is identity, policy and shape — safe to keep in a row
+// that is append-only and outlives the definition. Everything else is listed in `UNDISCLOSED`
+// below, compared but never carried, so that a change to it still writes the row: a column left out
+// of BOTH halves changes without the row noticing, `projectionMoved` sees nothing, and the edit
+// writes nothing at all. Review found five such columns on the first pass of this PR.
+//
+// `urlTemplate` is REDACTED to its origin even though the column holds it whole and every read
+// surface returns it whole. The schema accepts any template, and a token in the path or the query
+// is how these are actually written — where a value is stored says nothing about whether it is a
+// secret, which is the reasoning `redactEndpoint` carries from #397. A relative template has no
+// origin to keep, so it masks to nothing; the comparison is what still reports that it moved.
+//
+// The RAW `credentialRef` is compared as well as projected, and that is not belt-and-braces: two
+// different opaque values both project as `{ref: null, opaque: true}`, so swapping one for the
+// other would move nothing. `requireVaultRef` has refused that spelling on the way in since #126,
+// which makes it a legacy row rather than a reachable write — but the fence answers for columns and
+// not for what today's writer happens to allow, and listing it costs one line.
+// `tests/modules/audit-config-families.test.ts` holds the fence: it reads the columns of this model
+// out of `prisma/schema.prisma` and fails while one is in neither half.
+function auditProjection(r: {
+  name: string;
+  label: string;
+  description: string | null;
+  method: string;
+  urlTemplate: string;
+  allowedHosts: string[];
+  headers: unknown;
+  inputSchema: unknown;
+  outputSchema: unknown;
+  query: unknown;
+  body: unknown;
+  credentialRef: string | null;
+  enabled: boolean;
+  expectedStatuses: number[];
+  ackEnabled: boolean;
+  ackMessage: string | null;
+  appointment: unknown;
+}) {
+  const cred = refForAudit(r.credentialRef);
+  return {
+    name: r.name,
+    label: r.label,
+    method: r.method,
+    urlMasked: redactEndpoint(r.urlTemplate),
+    // The COUNT, and not the entries. Every entry is `z.string().min(1).max(255)` and nothing more,
+    // and no test on the string can tell a hostname an operator meant from a secret they pasted:
+    // `ghp_0123`, `xoxb-1-2` and a dotted JWT are all things `URL` will happily call a host. So the
+    // same standard `redactEndpoint` applies to a URL applies here — where a value is STORED says
+    // nothing about whether it is a secret, and this row outlives every correction. What a reader
+    // needs from the trail is that the allowlist WIDENED, which the count says; which hosts it
+    // names is on the live read surface, and that one is deletable.
+    allowedHostCount: r.allowedHosts.length,
+    credentialRef: cred.ref,
+    credentialRefOpaque: cred.opaque,
+    enabled: r.enabled,
+    ackEnabled: r.ackEnabled,
+    expectedStatuses: r.expectedStatuses,
+  };
+}
+
+// The columns the projection above may not publish, compared and never carried
+// (`@/modules/audit/projection`). `urlTemplate` and `credentialRef` are in BOTH halves on purpose:
+// what the row shows is the origin and the readable ref, and what moves the trail is the whole
+// value, so rotating a token inside the path still records that the tool changed.
+const UNDISCLOSED = [
+  "allowedHosts",
+  "credentialRef",
+  "description",
+  "urlTemplate",
+  "headers",
+  "inputSchema",
+  "outputSchema",
+  "query",
+  "body",
+  "ackMessage",
+  "appointment",
+] as const;
 
 export const toolDefinitionCreateSchema = z
   .object({
@@ -272,6 +360,11 @@ export async function createToolDefinition(
       },
       select: SELECT,
     });
+    await auditMutation(db, ctx, {
+      action: "tool.create",
+      target: `tool:${row.id}`,
+      after: auditProjection(row),
+    });
     return toDto(row);
   });
 }
@@ -287,16 +380,15 @@ export async function updateToolDefinition(
   // write that sets the body is refused.
   assertSupportedBody(data.body);
   return runScopedOn(base, ctx, async (db) => {
+    // LOCKED before the snapshot the trail compares against, which is the rule the audited families
+    // already follow (`agents`, `tenants`, `tenant_settings`, branding, the delivery requeue, and
+    // the two the #397 round wrote). At READ COMMITTED two concurrent PATCHes both read state A;
+    // the first commits B; the second's `update` blocks, wakes and writes C — and files a row
+    // saying A became C, attributing B's change to whoever wrote C.
+    await db.$queryRaw`SELECT 1 FROM "tool_definitions" WHERE "id" = ${id} FOR UPDATE`;
     const current = await db.toolDefinition.findUnique({
       where: { id },
-      select: {
-        id: true,
-        urlTemplate: true,
-        query: true,
-        headers: true,
-        body: true,
-        inputSchema: true,
-      },
+      select: SELECT,
     });
     if (!current) {
       throw new NotFoundError(
@@ -364,6 +456,19 @@ export async function updateToolDefinition(
       where: { id },
       select: SELECT,
     });
+    const beforeProj = auditProjection(current);
+    const afterProj = auditProjection(row);
+    const undisclosed = undisclosedMoved(current, row, UNDISCLOSED);
+    // Only when something MOVED: the console PATCHes a whole editor tab per save, so a row per
+    // apply would fill the trail with saves that changed nothing (`docs/api-and-fleet.md`).
+    if (undisclosed || projectionMoved(beforeProj, afterProj)) {
+      await auditMutation(db, ctx, {
+        action: "tool.update",
+        target: `tool:${id}`,
+        before: undisclosed ? markUndisclosed(beforeProj) : beforeProj,
+        after: undisclosed ? markUndisclosed(afterProj) : afterProj,
+      });
+    }
     return toDto(row);
   });
 }
@@ -374,13 +479,26 @@ export async function deleteToolDefinition(
   base: PrismaClient = basePrisma,
 ): Promise<void> {
   await runScopedOn(base, ctx, async (db) => {
+    // Locked, then read before the delete: after `deleteMany` there is nothing left to name what
+    // was removed, and the same lock keeps a concurrent update from making the row describe a
+    // definition that never looked like that.
+    await db.$queryRaw`SELECT 1 FROM "tool_definitions" WHERE "id" = ${id} FOR UPDATE`;
+    const current = await db.toolDefinition.findUnique({
+      where: { id },
+      select: SELECT,
+    });
     const res = await db.toolDefinition.deleteMany({ where: { id } });
-    if (res.count === 0) {
+    if (res.count === 0 || !current) {
       throw new NotFoundError(
         "tool definition not found",
         "errors.toolDefinitionNotFound",
       );
     }
+    await auditMutation(db, ctx, {
+      action: "tool.delete",
+      target: `tool:${id}`,
+      before: auditProjection(current),
+    });
   });
 }
 

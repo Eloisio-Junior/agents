@@ -14,6 +14,13 @@ import {
 import { parseInput } from "@/lib/parse-input";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import {
+  markUndisclosed,
+  redactEndpoint,
+  refForAudit,
+  undisclosedMoved,
+} from "@/modules/audit/projection";
+import { auditMutation, projectionMoved } from "@/modules/audit/service";
 import { ensureFreshGoogleAccessToken } from "@/modules/vault/google-oauth";
 import { ensureFreshMcpAccessToken } from "@/modules/vault/mcp-oauth";
 import { isManagedOAuthKind } from "@/modules/vault/secret-types";
@@ -77,6 +84,52 @@ function toDto(r: {
     credentialRef: readableVaultRef(r.credentialRef),
   };
 }
+
+// What the audit row carries.
+//
+// Same two halves as the other four families: identity, policy and shape are PROJECTED, everything
+// else is listed in `UNDISCLOSED` below and compared without being carried. A column in neither
+// half changes without the row noticing, and `projectionMoved` then suppresses the write entirely.
+//
+// `url` is REDACTED to its origin. An MCP endpoint accepts any absolute URL, and userinfo, a path
+// segment and a query parameter are all places a token is actually carried — this row is
+// append-only and readable by every tenant admin, so it would outlive the correction. `command` is
+// projected as its LAUNCHER (`bunx`/`uvx`) for the same reason: a stdio invocation carries its
+// arguments, and an argument is where a self-hosted server's key goes. Both whole values are
+// compared, so a change to either is still visible as a change.
+//
+// The RAW `credentialRef` is compared as well as projected, and that is not belt-and-braces: two
+// different opaque values both project as `{ref: null, opaque: true}`, so swapping one for the
+// other would move nothing. `requireVaultRef` has refused that spelling on the way in since #126,
+// which makes it a legacy row rather than a reachable write — but the fence answers for columns and
+// not for what today's writer happens to allow, and listing it costs one line.
+// `tests/modules/audit-config-families.test.ts` holds the fence over this model's columns.
+function auditProjection(r: {
+  name: string;
+  transport: string;
+  url: string | null;
+  command: string | null;
+  credentialRef: string | null;
+  enabled: boolean;
+}) {
+  const cred = refForAudit(r.credentialRef);
+  return {
+    name: r.name,
+    transport: r.transport,
+    urlMasked: r.url === null ? null : redactEndpoint(r.url),
+    commandLauncher:
+      r.command === null ? null : stdioCommandLauncher(r.command),
+    credentialRef: cred.ref,
+    credentialRefOpaque: cred.opaque,
+    enabled: r.enabled,
+  };
+}
+
+// The columns the projection above may not publish, compared and never carried
+// (`@/modules/audit/projection`). All three are in BOTH halves: the row shows the URL's origin, the
+// stdio launcher and the readable ref, and the comparison sees the whole value, so a token moved
+// inside a path or an argument still records that the connection changed.
+const UNDISCLOSED = ["url", "command", "credentialRef"] as const;
 
 export const mcpConnectionCreateSchema = z
   .object({
@@ -224,6 +277,11 @@ export async function createMcpConnection(
       },
       select: SELECT,
     });
+    await auditMutation(db, ctx, {
+      action: "mcp_connection.create",
+      target: `mcp_connection:${row.id}`,
+      after: auditProjection(row),
+    });
     return toDto(row);
   });
 }
@@ -254,6 +312,15 @@ export async function updateMcpConnection(
     command: data.command !== undefined ? data.command : current.command,
   });
   return runScopedOn(base, ctx, async (db) => {
+    // LOCKED before the snapshot the trail compares against. The `current` read above is outside
+    // this transaction on purpose — it feeds the SSRF check, which does DNS — so it is not the
+    // snapshot: at READ COMMITTED two concurrent PATCHes would both read state A, the first commits
+    // B, and the second files a row saying A became C, attributing B's change to whoever wrote C.
+    await db.$queryRaw`SELECT 1 FROM "mcp_server_connections" WHERE "id" = ${id} FOR UPDATE`;
+    const snapshot = await db.mcpServerConnection.findUniqueOrThrow({
+      where: { id },
+      select: SELECT,
+    });
     if (data.name) await assertNameFree(db, data.name, id);
     const credentialRef = data.credentialRef
       ? await requireVaultRef(db, data.credentialRef, "credentialRef")
@@ -275,6 +342,17 @@ export async function updateMcpConnection(
       where: { id },
       select: SELECT,
     });
+    const beforeProj = auditProjection(snapshot);
+    const afterProj = auditProjection(row);
+    const undisclosed = undisclosedMoved(snapshot, row, UNDISCLOSED);
+    if (undisclosed || projectionMoved(beforeProj, afterProj)) {
+      await auditMutation(db, ctx, {
+        action: "mcp_connection.update",
+        target: `mcp_connection:${id}`,
+        before: undisclosed ? markUndisclosed(beforeProj) : beforeProj,
+        after: undisclosed ? markUndisclosed(afterProj) : afterProj,
+      });
+    }
     return toDto(row);
   });
 }
@@ -285,13 +363,25 @@ export async function deleteMcpConnection(
   base: PrismaClient = basePrisma,
 ): Promise<void> {
   await runScopedOn(base, ctx, async (db) => {
+    // Locked, then read before the delete: after `deleteMany` there is nothing left to name what
+    // was removed.
+    await db.$queryRaw`SELECT 1 FROM "mcp_server_connections" WHERE "id" = ${id} FOR UPDATE`;
+    const current = await db.mcpServerConnection.findUnique({
+      where: { id },
+      select: SELECT,
+    });
     const res = await db.mcpServerConnection.deleteMany({ where: { id } });
-    if (res.count === 0) {
+    if (res.count === 0 || !current) {
       throw new NotFoundError(
         "mcp connection not found",
         "errors.mcpConnectionNotFound",
       );
     }
+    await auditMutation(db, ctx, {
+      action: "mcp_connection.delete",
+      target: `mcp_connection:${id}`,
+      before: auditProjection(current),
+    });
   });
 }
 
