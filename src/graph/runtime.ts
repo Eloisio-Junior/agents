@@ -73,6 +73,7 @@ import {
   loadAgentConfig,
 } from "./prepare";
 import { undoRefusedTurn } from "./refused-turn";
+import { stillInSameEpisode } from "./reset-episode";
 import { AgentStatusReporter } from "./status";
 import {
   clearTurnOwning,
@@ -1747,9 +1748,23 @@ export async function runAgentTurn(
       : undefined;
 
   const outcome = await runLoadedTurn({
-    // Nothing queued this turn: it is the delivery itself, arriving from the webhook. There is no
-    // job for /reset to retire and no other run that could call it off.
-    stillWanted: null,
+    // Nothing QUEUED this turn — it is the delivery itself, arriving from the webhook — so there is
+    // no job for /reset to retire. What names this run instead is the EPISODE, read off the message
+    // it is answering, and ./reset-episode.ts carries the measurement: without it the operator's
+    // /reset is acknowledged and this turn then runs its tools on the conversation that was just
+    // cleared. `null` stays for a turn with no mirrored conversation to read the boundary from (the
+    // playground), where nothing can reset it either.
+    stillWanted:
+      convDbId === null
+        ? null
+        : stillInSameEpisode({
+            tenantId,
+            conversationDbId: convDbId,
+            // The same id the supersede gate claims with, and for a related reason: it is what
+            // names this run in the order the SOURCE put it in.
+            triggerMessageId: triggerId,
+            base,
+          }),
     loaded,
     authContext: params.authContext ?? null,
     tenantId,
@@ -1770,13 +1785,19 @@ export async function runAgentTurn(
   // fell back here) re-answers the whole recent page (issue #8). "superseded" stays put BY DESIGN:
   // the newer message's own turn advances past it. Best-effort — a watermark miss must not fail the
   // turn.
-  // "stale" joins it, for the opposite reason and the same effect: the run was called off, so the
-  // message it carried was withdrawn rather than handled. This path never produces it today (a
-  // webhook turn passes `stillWanted: null`), and it is listed so the next caller that does not
-  // inherit a silent advance.
+  // "stale" ADVANCES IT, and used not to. It was excluded when nothing on this path could produce
+  // it, on the reasoning that a called-off run withdraws its message rather than handling it — which
+  // is the flush's truth, where a re-armed flush answers the burst, and not this path's. Here the
+  // only thing that calls a run off is the operator's own /reset (./reset-episode.ts), nothing else
+  // is coming for the message, and the receiver settles its ledger row as CONSUMED. The watermark
+  // has to agree with the ledger: left behind, the row is terminal while the watermark still sits
+  // below the message, and the first flush after debounce is enabled re-answers it (issue #8).
+  //
+  // Not covered by the command's own advance, which is the shape a review round measured: /reset
+  // writes the boundary in its FIRST step and advances this watermark in its LAST, with a dozen
+  // Chatwoot calls in between, so a process dying in that stretch leaves exactly the gap above.
   if (
     outcome !== "superseded" &&
-    outcome !== "stale" &&
     n.message?.id != null &&
     loaded.conversationDbId !== null
   ) {

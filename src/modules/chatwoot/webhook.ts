@@ -2085,6 +2085,8 @@ async function maybeConsumeCommandOrGate(params: {
     // entry conversation leaves `redirectClosedAt` on the widget, and the funnel can be run again
     // but not closed again until the widget side is reset too. Named in the acknowledgement's own
     // scope rather than worked around — see the NOTE above the job cancellations.
+    // The command's own message, in Chatwoot's sequence: the boundary this episode ends at.
+    const commandMessageId = params.n.message?.id ?? null;
     const redirectAnchors = {
       redirectSentAt: null,
       // A counter, so it goes back to zero rather than to null.
@@ -2093,8 +2095,29 @@ async function maybeConsumeCommandOrGate(params: {
       redirectClosedAt: null,
     };
     await step("clear the conversation's watermarks", "marcadores", () =>
-      runScopedOn(base, sysCtx(tenantId), (db) =>
-        db.conversation.update({
+      runScopedOn(base, sysCtx(tenantId), async (db) => {
+        // THE EPISODE BOUNDARY: the message id the COMMAND itself carried, in Chatwoot's own order.
+        // Not a moment of ours — neither this write's, which happens after a live refresh, six job
+        // retirements and a dozen Chatwoot calls (a customer message landing in that stretch arrived
+        // AFTER the reset and is one the operator wants answered), nor the ledger row's, which is
+        // inserted on the detached path and therefore does not preserve the order two events arrived
+        // in (../../graph/reset-episode.ts).
+        //
+        // NEVER BACKWARDS, which is what makes it a statement of its own rather than another field
+        // in the update below. Two `/reset` deliveries are dispatched detached and nothing
+        // serializes them, so the older one can finish last; assigned, it would move the boundary
+        // back and let a turn from between the two commands run on a conversation the newer one
+        // cleared. `GREATEST` ignores a NULL, so the first reset writes its own value.
+        //
+        // A command with no message id is not reachable (it is parsed from the message's own text),
+        // and the guard is what keeps the column from holding a number that orders nothing.
+        if (commandMessageId !== null) {
+          await db.$executeRaw`
+            UPDATE conversations
+               SET reset_at_message_id = GREATEST(reset_at_message_id, ${commandMessageId})
+             WHERE id = ${ctx.conv.id}`;
+        }
+        return db.conversation.update({
           where: { id: ctx.conv.id },
           data: {
             lastInboundAt: null,
@@ -2107,8 +2130,8 @@ async function maybeConsumeCommandOrGate(params: {
             lastErrorAt: null,
             failureNoticeSentAt: null,
           },
-        }),
-      ),
+        });
+      }),
     );
 
     // Clear the agent's memory thread (per contact-inbox / channel), the AgentThread marker (the
@@ -3823,13 +3846,14 @@ export async function processChatwootDelivery(
           //               reported as a lost customer message every time the process dies in the
           //               tail after a deliberate supersede — which is the one thing separating this
           //               outcome from every other one on this path, since all of them close here.
-          //   stale       Not reachable at all: `runAgentTurn` passes `stillWanted: null`, because
-          //               nothing queued this turn and there is no job for /reset to retire. It is
-          //               NOT written into the condition, because a branch no input can take is a
-          //               branch no test can hold: it would read as a rule and be a comment. The
-          //               premise it rests on is asserted instead, in
-          //               tests/modules/delivery-sweep.test.ts, so the day something hands this path
-          //               a `stillWanted` the failure points here rather than passing silently.
+          //   stale       The operator's /reset withdrew the episode under this turn
+          //               (../../graph/reset-episode.ts). It settles like the rest, and the reason
+          //               is what leaving it open would buy: the sweep would run the delivery path
+          //               again half an hour later, into the conversation the command cleared, with
+          //               the message from before it — the defect that fence exists to close,
+          //               arriving through the recovery instead. "Consumed" is also the honest word
+          //               here, the same one the gate's own rows carry: a command withdrew it.
+          //               Asserted in tests/modules/chatwoot-reset-stale-turn.test.ts.
           //
           // NOTE: no `isNewIncoming` here, because the whole block is already inside it — an
           // incoming `message_updated` (our own media write-back coming around) never reaches this
