@@ -34,6 +34,10 @@ import {
 } from "@/modules/conversations/record-resolution";
 import { advanceHandledWatermark } from "@/modules/debounce/watermark";
 import {
+  applyFirstTurnGuard,
+  hasVisibleOutgoingMessage,
+} from "@/modules/first-turn/guard";
+import {
   emitFlowEvent,
   type FlowContext,
   withFlowStage,
@@ -1389,6 +1393,30 @@ export async function runLoadedTurn(
       reply = replacement;
     }
 
+    if (
+      reply &&
+      loaded.firstTurnGuardConfig.enabled &&
+      !handoffState.completed &&
+      !turnState.resolveRequested
+    ) {
+      try {
+        const messages = parseChatwootMessages(
+          await client.getMessages(conversationId),
+        );
+        reply = applyFirstTurnGuard({
+          config: loaded.firstTurnGuardConfig,
+          reply,
+          firstTurn: !hasVisibleOutgoingMessage(messages),
+          excluded: false,
+        }).reply;
+      } catch (err) {
+        logger.warn(
+          { err, conversationId: String(conversationId) },
+          "first-turn guard could not inspect the conversation; reply left unchanged",
+        );
+      }
+    }
+
     // Empty reply: no text to post, but the queued images and a deferred resolve intent still apply
     // (both are legitimate shapes with no final text). This runs AFTER the recheck and the supersede
     // gate on purpose: resolving under a takeover belongs to the human, and resolving under a
@@ -1818,3 +1846,4 @@ export async function runAgentTurn(
   }
   return outcome;
 }
+

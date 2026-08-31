@@ -1,5 +1,6 @@
 import { NATIVE_TOOL_NAMES } from "@/graph/tools/catalog";
 import { clipText } from "@/lib/text";
+import { FIRST_TURN_PREFIX_MAX } from "@/modules/first-turn/settings";
 
 // Caps on the operator-authored free text stored inside `agent.settings`, and the one place that
 // knows where that text lives.
@@ -165,6 +166,15 @@ function cappedFields(settings: unknown): CappedField[] {
     );
   }
   const followUp = bagOf(root.followUp);
+  const firstTurnGuard = bagOf(root.firstTurnGuard);
+  if (firstTurnGuard) {
+    add(
+      firstTurnGuard,
+      "prefix",
+      "firstTurnGuard.prefix",
+      FIRST_TURN_PREFIX_MAX,
+    );
+  }
   // Sliced like the reader does: it keeps FOLLOW_UP_MAX_STEPS and discards the rest before parsing,
   // so an instruction in a later step is text nothing reads.
   const steps = (Array.isArray(followUp?.steps) ? followUp.steps : []).slice(
@@ -239,3 +249,4 @@ export function clampOversizedTextInPlace(settings: unknown): OversizedText[] {
   }
   return out;
 }
+

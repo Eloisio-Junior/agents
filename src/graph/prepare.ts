@@ -51,6 +51,10 @@ import {
 import type { ObservedConversation } from "@/modules/conversations/record-resolution";
 import { resolveVariantOverride } from "@/modules/experiments/service";
 import {
+  type FirstTurnGuardConfig,
+  readFirstTurnGuardConfig,
+} from "@/modules/first-turn/settings";
+import {
   emitFlowEvent,
   type FlowContext,
   withFlowStage,
@@ -224,6 +228,7 @@ export interface AgentConfig {
   // WhatsApp 24h service-window gate for proactive sends + the contact name for template params.
   serviceWindowConfig: ServiceWindowConfig;
   handoffConfig: HandoffConfig;
+  firstTurnGuardConfig: FirstTurnGuardConfig;
   // Contact authorization gate (docs/contact-auth.md). Enforced by the webhook gate, the debounce
   // flush, the proactive nudge and the manual re-engage, NOT here; carried on the config so they
   // need no second settings read.
@@ -764,6 +769,7 @@ export async function loadAgentConfig(
     splitConfig: readSplitConfig(effSettings),
     serviceWindowConfig: readServiceWindowConfig(effSettings),
     handoffConfig: readHandoffConfig(effSettings),
+    firstTurnGuardConfig: readFirstTurnGuardConfig(effSettings),
     contactAuthConfig: readContactAuthConfig(effSettings),
     sendImageConfig: readSendImageConfig(effSettings),
     kanbanConfig: readKanbanConfig(effSettings),
@@ -1611,3 +1617,4 @@ export async function buildModelAndGraph(
     onHistoryTrim: deps.onHistoryTrim,
   });
 }
+

@@ -47,6 +47,11 @@ import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { renderInboundMessage } from "@/modules/chatwoot/render";
 import { documentToolName } from "@/modules/documents/templates";
 import {
+  applyFirstTurnGuard,
+  hasAssistantMessage,
+  turnCalledTool,
+} from "@/modules/first-turn/guard";
+import {
   emitFlowEvent,
   type FlowContext,
   withFlowStage,
@@ -695,6 +700,14 @@ export async function runPlaygroundTurn(
 
   const human = new HumanMessage({ content: text, id: humanId });
 
+  const before = await graph.getState({
+    configurable: { thread_id: threadId },
+  });
+  const priorMessages = Array.isArray(before.values?.messages)
+    ? (before.values.messages as BaseMessage[])
+    : [];
+  const firstAssistantTurn = !hasAssistantMessage(priorMessages);
+
   let result: Awaited<ReturnType<typeof graph.invoke>>;
   try {
     result = await withFlowStage(
@@ -728,7 +741,18 @@ export async function runPlaygroundTurn(
   const outGuard = raw
     ? await screen("output", raw)
     : { kind: "not-run" as const };
-  const reply = screenedText(outGuard, raw) ?? "";
+  const screenedReply = screenedText(outGuard, raw) ?? "";
+  const excluded = turnCalledTool(
+    result.messages,
+    new Set(["handoff_to_human", "resolve_conversation"]),
+  );
+  const guarded = applyFirstTurnGuard({
+    config: loaded.firstTurnGuardConfig,
+    reply: screenedReply,
+    firstTurn: firstAssistantTurn,
+    excluded,
+  });
+  const reply = guarded.reply;
   const trace: TraceEntry[] = [
     ...gTrace.slice(0, beforeGraph),
     ...buildPlaygroundTrace(result.messages, traceLabels),
@@ -754,7 +778,7 @@ export async function runPlaygroundTurn(
   // checkpointer alone and reads the raw reply. Left open deliberately — see `.codex-review-waived`
   // for what each way of closing it costs, all of them more than a seconds-long window on a
   // surface one operator drives.
-  if (gTrace.length > 0) {
+  if (gTrace.length > 0 || guarded.applied) {
     await savePlaygroundTurnNote(base, {
       ctx,
       agentId,
@@ -1446,3 +1470,4 @@ export async function runPlaygroundFileTurn(
     trace: [...visionTrace, ...turn.trace],
   };
 }
+

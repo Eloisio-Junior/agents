@@ -7,6 +7,7 @@ import { readChannelRedirectConfig } from "@/modules/channel-redirect/service";
 import { readAttributeContextConfig } from "@/modules/chatwoot/attributes";
 import { readContactAuthConfig } from "@/modules/contact-auth/settings";
 import { readDebounceConfig } from "@/modules/debounce/settings";
+import { readFirstTurnGuardConfig } from "@/modules/first-turn/settings";
 import {
   readObservabilityConfig,
   storableObservability,
@@ -55,6 +56,7 @@ export interface BehaviorSettings {
   serviceWindow: ReturnType<typeof readServiceWindowConfig>;
   grounding: { maxDistance: number | null };
   followUp: ReturnType<typeof readFollowUpConfig>;
+  firstTurnGuard: ReturnType<typeof readFirstTurnGuardConfig>;
   handoff: ReturnType<typeof readHandoffConfig>;
   // NOTE: The second block whose default is ON (see modules/handoff/settings for why), and it is kept
   // apart from `handoff` above because the Tools tab REPLACES that one wholesale.
@@ -96,6 +98,7 @@ export const BEHAVIOR_SETTINGS_KEYS = [
   "serviceWindow",
   "grounding",
   "followUp",
+  "firstTurnGuard",
   "handoff",
   "takeover",
   "sendImage",
@@ -134,6 +137,7 @@ export function readBehaviorSettings(
     serviceWindow: readServiceWindowConfig(settings),
     grounding: readGrounding(settings),
     followUp: readFollowUpConfig(settings),
+    firstTurnGuard: readFirstTurnGuardConfig(settings),
     handoff: readHandoffConfig(settings),
     takeover: readTakeoverConfig(settings),
     sendImage: readSendImageConfig(settings),
@@ -163,6 +167,7 @@ export interface BehaviorSettingsPatch {
   serviceWindow?: Record<string, unknown>;
   grounding?: Record<string, unknown>;
   followUp?: Record<string, unknown>;
+  firstTurnGuard?: Record<string, unknown>;
   handoff?: Record<string, unknown>;
   takeover?: Record<string, unknown>;
   sendImage?: Record<string, unknown>;
@@ -363,3 +368,4 @@ export function mergeBehaviorSettings(
   }
   return next;
 }
+

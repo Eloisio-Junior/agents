@@ -1,5 +1,6 @@
 import type { AgentConfig } from "@/graph/prepare";
 import { CONTACT_AUTH_DEFAULTS } from "@/modules/contact-auth/settings";
+import { FIRST_TURN_GUARD_DEFAULTS } from "@/modules/first-turn/settings";
 import { GUARDRAILS_DEFAULTS } from "@/modules/guardrails/settings";
 import { HANDOFF_DEFAULTS } from "@/modules/handoff/settings";
 import { SEND_IMAGE_DEFAULTS } from "@/modules/images/settings";
@@ -70,6 +71,7 @@ export function makeConfig(
     contactVoiceReply: null,
     splitConfig: SPLIT_DEFAULTS,
     serviceWindowConfig: SERVICE_WINDOW_DEFAULTS,
+    firstTurnGuardConfig: FIRST_TURN_GUARD_DEFAULTS,
     contactAuthConfig: CONTACT_AUTH_DEFAULTS,
     handoffConfig: HANDOFF_DEFAULTS,
     sendImageConfig: SEND_IMAGE_DEFAULTS,
@@ -90,3 +92,4 @@ export function makeConfig(
     ...over,
   } as AgentConfig;
 }
+
