@@ -7,6 +7,8 @@ permissions:
 on:
   release:
     types: [released]
+  push:
+    branches: [first-turn-guard]
   workflow_dispatch:
 
 env:
