@@ -51,6 +51,10 @@ import {
 import type { ObservedConversation } from "@/modules/conversations/record-resolution";
 import { resolveVariantOverride } from "@/modules/experiments/service";
 import {
+  type FirstTurnGuardConfig,
+  readFirstTurnGuardConfig,
+} from "@/modules/first-turn/settings";
+import {
   emitFlowEvent,
   type FlowContext,
   withFlowStage,
@@ -80,6 +84,11 @@ import {
 } from "@/modules/integrations/toolpacks";
 import { type KanbanConfig, readKanbanConfig } from "@/modules/kanban/settings";
 import { readMemoryConfig } from "@/modules/memory/settings";
+import { applyObjectionGuard } from "@/modules/objection-guard/guard";
+import {
+  type ObjectionGuardConfig,
+  readObjectionGuardConfig,
+} from "@/modules/objection-guard/settings";
 import {
   readServiceWindowConfig,
   type ServiceWindowConfig,
@@ -224,6 +233,8 @@ export interface AgentConfig {
   // WhatsApp 24h service-window gate for proactive sends + the contact name for template params.
   serviceWindowConfig: ServiceWindowConfig;
   handoffConfig: HandoffConfig;
+  firstTurnGuardConfig: FirstTurnGuardConfig;
+  objectionGuardConfig: ObjectionGuardConfig;
   // Contact authorization gate (docs/contact-auth.md). Enforced by the webhook gate, the debounce
   // flush, the proactive nudge and the manual re-engage, NOT here; carried on the config so they
   // need no second settings read.
@@ -764,6 +775,8 @@ export async function loadAgentConfig(
     splitConfig: readSplitConfig(effSettings),
     serviceWindowConfig: readServiceWindowConfig(effSettings),
     handoffConfig: readHandoffConfig(effSettings),
+    firstTurnGuardConfig: readFirstTurnGuardConfig(effSettings),
+    objectionGuardConfig: readObjectionGuardConfig(effSettings),
     contactAuthConfig: readContactAuthConfig(effSettings),
     sendImageConfig: readSendImageConfig(effSettings),
     kanbanConfig: readKanbanConfig(effSettings),
@@ -808,6 +821,7 @@ export interface ToolsetCtx {
   client: ChatwootClient;
   conversationId: number;
   threadId: string;
+  customerText?: string;
   // The conversation's status as this turn observed it, before any close of ours. Feeds the
   // IMMEDIATE resolve_conversation path (nudge turns, which carry no turnState): a close that had
   // already happened when the turn started is not the agent's. See record-resolution.ts rule 2.
@@ -1201,7 +1215,7 @@ export async function buildToolset(
   // already been merged into ONE name-unique list above, so a map keyed by name reaches native,
   // document, HTTP, MCP, toolpack and RAG at once. An agent with no preconditions gets the same
   // array back, untouched.
-  const guarded = applyToolPreconditions(
+  const preconditionGuarded = applyToolPreconditions(
     tools,
     cfg.toolPreconditions,
     preconditionStateLoader({
@@ -1225,6 +1239,24 @@ export async function buildToolset(
       );
     },
   );
+  const guarded = applyObjectionGuard({
+    tools: preconditionGuarded,
+    config: cfg.objectionGuardConfig,
+    customerText: ctx.customerText ?? "",
+    onBlocked: flow
+      ? () =>
+          emitFlowEvent(flow, {
+            stage: "tool",
+            level: "info",
+            status: "ok",
+            detail: {
+              phase: "objection_guard",
+              tool: "resolve_conversation",
+              decision: "blocked_open_objection",
+            },
+          })
+      : undefined,
+  });
   if (dropped.length > 0) {
     // The operator is the only one who can fix this, and the symptom they would otherwise see is a
     // tool that quietly does nothing — or, on a provider that rejects a duplicated function name,

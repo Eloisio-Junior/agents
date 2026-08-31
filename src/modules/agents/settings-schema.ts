@@ -13,6 +13,7 @@ import {
   TOOL_INSTRUCTIONS_MAX,
 } from "@/modules/agents/text-caps";
 import { REDIRECT_DELAY_UNITS } from "@/modules/channel-redirect/service";
+import { FIRST_TURN_PREFIX_MAX } from "@/modules/first-turn/settings";
 import {
   FULL_DETAIL_MAX_HOURS,
   parseIsoInstant,
@@ -20,6 +21,10 @@ import {
 import { FOLLOW_UP_DELAY_UNITS } from "@/modules/followups/settings";
 import { GUARDRAIL_ACTIONS } from "@/modules/guardrails/settings";
 import { HANDOFF_MODES } from "@/modules/handoff/settings";
+import {
+  OBJECTION_GUARD_PATTERN_MAX,
+  OBJECTION_GUARD_PATTERNS_MAX,
+} from "@/modules/objection-guard/settings";
 import { STT_PROVIDER_NAMES } from "@/modules/stt/providers";
 import { LANG_RE } from "@/modules/stt/settings";
 import { TTS_PROVIDER_NAMES } from "@/modules/tts/providers";
@@ -220,6 +225,28 @@ const grounding = z.looseObject({
     .nullable()
     .optional()
     .describe("cosine ceiling for a knowledge hit; null = no filter"),
+});
+
+const firstTurnGuard = z.looseObject({
+  enabled: z.boolean().optional(),
+  prefix: z
+    .string()
+    .optional()
+    .describe(
+      `literal prefix prepended to the first public assistant reply; limited to ${FIRST_TURN_PREFIX_MAX} characters`,
+    ),
+});
+
+const objectionGuardPatterns = z
+  .array(z.string())
+  .describe(
+    `literal comparison patterns; up to ${OBJECTION_GUARD_PATTERNS_MAX} entries of ${OBJECTION_GUARD_PATTERN_MAX} characters each are retained`,
+  );
+
+const objectionGuard = z.looseObject({
+  enabled: z.boolean().optional(),
+  openObjectionPatterns: objectionGuardPatterns.optional(),
+  definitiveRefusalPatterns: objectionGuardPatterns.optional(),
 });
 
 // BLANK IS WHAT THE READER THROWS AWAY, so the schema is where it gets declared. `readToolInstructions`
@@ -738,6 +765,8 @@ export const BEHAVIOR_PATCH_SHAPE = {
   serviceWindow: serviceWindow.optional(),
   grounding: grounding.optional(),
   followUp: followUp.optional(),
+  firstTurnGuard: firstTurnGuard.optional(),
+  objectionGuard: objectionGuard.optional(),
   handoff: handoff.optional(),
   takeover: takeover.optional(),
   limits: limits.optional(),

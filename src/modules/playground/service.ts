@@ -47,6 +47,11 @@ import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { renderInboundMessage } from "@/modules/chatwoot/render";
 import { documentToolName } from "@/modules/documents/templates";
 import {
+  applyFirstTurnGuard,
+  hasAssistantMessage,
+  turnCalledTool,
+} from "@/modules/first-turn/guard";
+import {
   emitFlowEvent,
   type FlowContext,
   withFlowStage,
@@ -263,6 +268,7 @@ function buildPlaygroundToolset(
     // operator goes to find out what their agent does — a refused call never reaches the inner tool,
     // so ToolFlowLogger sees no run either and there is nothing else to read.
     flow: FlowContext | undefined;
+    customerText?: string;
   },
 ): Promise<StructuredToolInterface[]> {
   return buildToolset(
@@ -274,6 +280,7 @@ function buildPlaygroundToolset(
       client: {} as ChatwootClient,
       conversationId: 0,
       threadId: params.threadId,
+      customerText: params.customerText,
     },
     {
       // Conversation tools (handoff/resolve/…) are SIMULATED (no real effect); utility tools
@@ -310,6 +317,7 @@ async function buildPlaygroundGraph(params: {
   // spend ceiling may only refuse a target that EXISTS — see the comment at their gates. Passing it
   // through keeps that ordering from costing a second read of the same agent row.
   loaded?: AgentConfig;
+  customerText?: string;
   // Same warn line the reactive turn leaves when a model call had to be retried. The caller passes
   // it because the FlowContext is the caller's.
   onModelRetry?: (info: ModelRetryInfo) => void;
@@ -354,6 +362,7 @@ async function buildPlaygroundGraph(params: {
     base,
     deps: params.deps,
     flow: params.flow,
+    customerText: params.customerText,
   });
   const toolMocks = params.overrides?.toolMocks;
   const tools = applyToolMocks(rawTools, toolMocks);
@@ -546,6 +555,7 @@ export async function runPlaygroundTurn(
       turnId,
       flow,
       loaded: loadedConfig,
+      customerText: text,
       onModelRetry: ({ attempt, provider, model }) =>
         emitFlowEvent(flow, {
           stage: "generate",
@@ -695,6 +705,14 @@ export async function runPlaygroundTurn(
 
   const human = new HumanMessage({ content: text, id: humanId });
 
+  const before = await graph.getState({
+    configurable: { thread_id: threadId },
+  });
+  const priorMessages = Array.isArray(before.values?.messages)
+    ? (before.values.messages as BaseMessage[])
+    : [];
+  const firstAssistantTurn = !hasAssistantMessage(priorMessages);
+
   let result: Awaited<ReturnType<typeof graph.invoke>>;
   try {
     result = await withFlowStage(
@@ -728,7 +746,18 @@ export async function runPlaygroundTurn(
   const outGuard = raw
     ? await screen("output", raw)
     : { kind: "not-run" as const };
-  const reply = screenedText(outGuard, raw) ?? "";
+  const screenedReply = screenedText(outGuard, raw) ?? "";
+  const excluded = turnCalledTool(
+    result.messages,
+    new Set(["handoff_to_human", "resolve_conversation"]),
+  );
+  const guarded = applyFirstTurnGuard({
+    config: loaded.firstTurnGuardConfig,
+    reply: screenedReply,
+    firstTurn: firstAssistantTurn,
+    excluded,
+  });
+  const reply = guarded.reply;
   const trace: TraceEntry[] = [
     ...gTrace.slice(0, beforeGraph),
     ...buildPlaygroundTrace(result.messages, traceLabels),
@@ -754,7 +783,7 @@ export async function runPlaygroundTurn(
   // checkpointer alone and reads the raw reply. Left open deliberately — see `.codex-review-waived`
   // for what each way of closing it costs, all of them more than a seconds-long window on a
   // surface one operator drives.
-  if (gTrace.length > 0) {
+  if (gTrace.length > 0 || guarded.applied) {
     await savePlaygroundTurnNote(base, {
       ctx,
       agentId,
@@ -932,6 +961,7 @@ export async function runPlaygroundFollowup(
       turnId,
       flow,
       loaded: loadedConfig,
+      customerText: "",
       onModelRetry: ({ attempt, provider, model }) =>
         emitFlowEvent(flow, {
           stage: "generate",

@@ -211,7 +211,12 @@ const SETTINGS_DESC_CEILING = 2_000;
 // BLOCK and not a field on an existing one, which is what makes it cost more than its own sentence —
 // the thirteen-times-published patterns above are per block. Re-measured on the tree that ships:
 // 22,567.
-const SETTINGS_SCHEMA_CEILING = 22_600;
+// firstTurnGuard adds one opt-in boolean and one bounded literal prefix. Measured at 22,804 on the
+// combined tree; the ceiling moves deliberately rather than hiding the public settings contract.
+// objectionGuard adds its opt-in toggle plus the two bounded pattern lists. Measured at 23,243;
+// keeping it public is what lets an operator configure the guard per agent instead of hard-coding
+// one tenant's Portuguese phrases into the shared runtime.
+const SETTINGS_SCHEMA_CEILING = 23_350;
 
 describe("MCP tool descriptions", () => {
   test("agent_settings_set stays under its ceiling", async () => {
@@ -367,6 +372,10 @@ describe("MCP tool descriptions", () => {
   // And the `takeover` block of issue #430 takes it to 52,154. One boolean, 54 characters of total
   // payload, which is the honest price of a NEW block rather than a field on an existing one — the
   // same 33 characters this addition cost above, published once here.
+  // The typed firstTurnGuard block takes the combined schema total to 52,391. It remains public so
+  // operators can configure the opt-in guard through MCP; the ceiling moves to the measured band.
+  // The typed objectionGuard block takes the combined total to 52,830. Both pattern lists stay
+  // visible because their precedence is operator policy, not a language-specific runtime default.
   test("the whole tools/list payload stays under its ceiling", async () => {
     const all = await listed();
     let desc = 0;
@@ -376,7 +385,7 @@ describe("MCP tool descriptions", () => {
       schema += t.schema.length;
     }
     expect(desc).toBeLessThanOrEqual(27_250);
-    expect(schema).toBeLessThanOrEqual(52_200);
+    expect(schema).toBeLessThanOrEqual(52_950);
   });
 
   // Why the document write tools declare `blocks`/`fields` as loose arrays and put the vocabulary in

@@ -34,6 +34,10 @@ import {
 } from "@/modules/conversations/record-resolution";
 import { advanceHandledWatermark } from "@/modules/debounce/watermark";
 import {
+  applyFirstTurnGuard,
+  hasVisibleOutgoingMessage,
+} from "@/modules/first-turn/guard";
+import {
   emitFlowEvent,
   type FlowContext,
   withFlowStage,
@@ -564,6 +568,7 @@ export async function runLoadedTurn(
       client,
       conversationId,
       threadId,
+      customerText: params.text,
       messageId: params.messageId,
       imageDeps: params.deps?.imageDeps,
       documentsStorageDir: params.deps?.documentsStorageDir,
@@ -1387,6 +1392,30 @@ export async function runLoadedTurn(
       const replacement = screenedText(outGuard, screened);
       if (replacement === null) return refuse("blocked");
       reply = replacement;
+    }
+
+    if (
+      reply &&
+      loaded.firstTurnGuardConfig.enabled &&
+      !handoffState.completed &&
+      !turnState.resolveRequested
+    ) {
+      try {
+        const messages = parseChatwootMessages(
+          await client.getMessages(conversationId),
+        );
+        reply = applyFirstTurnGuard({
+          config: loaded.firstTurnGuardConfig,
+          reply,
+          firstTurn: !hasVisibleOutgoingMessage(messages),
+          excluded: false,
+        }).reply;
+      } catch (err) {
+        logger.warn(
+          { err, conversationId: String(conversationId) },
+          "first-turn guard could not inspect the conversation; reply left unchanged",
+        );
+      }
     }
 
     // Empty reply: no text to post, but the queued images and a deferred resolve intent still apply

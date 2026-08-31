@@ -7,6 +7,7 @@ import { readChannelRedirectConfig } from "@/modules/channel-redirect/service";
 import { readAttributeContextConfig } from "@/modules/chatwoot/attributes";
 import { readContactAuthConfig } from "@/modules/contact-auth/settings";
 import { readDebounceConfig } from "@/modules/debounce/settings";
+import { readFirstTurnGuardConfig } from "@/modules/first-turn/settings";
 import {
   readObservabilityConfig,
   storableObservability,
@@ -20,6 +21,7 @@ import {
 import { readSendImageConfig } from "@/modules/images/settings";
 import { readKanbanConfig } from "@/modules/kanban/settings";
 import { readMemoryConfig } from "@/modules/memory/settings";
+import { readObjectionGuardConfig } from "@/modules/objection-guard/settings";
 import { readServiceWindowConfig } from "@/modules/service-window/service";
 import { readSplitConfig } from "@/modules/split/service";
 import { readSttConfig } from "@/modules/stt/settings";
@@ -55,6 +57,8 @@ export interface BehaviorSettings {
   serviceWindow: ReturnType<typeof readServiceWindowConfig>;
   grounding: { maxDistance: number | null };
   followUp: ReturnType<typeof readFollowUpConfig>;
+  firstTurnGuard: ReturnType<typeof readFirstTurnGuardConfig>;
+  objectionGuard: ReturnType<typeof readObjectionGuardConfig>;
   handoff: ReturnType<typeof readHandoffConfig>;
   // NOTE: The second block whose default is ON (see modules/handoff/settings for why), and it is kept
   // apart from `handoff` above because the Tools tab REPLACES that one wholesale.
@@ -96,6 +100,8 @@ export const BEHAVIOR_SETTINGS_KEYS = [
   "serviceWindow",
   "grounding",
   "followUp",
+  "firstTurnGuard",
+  "objectionGuard",
   "handoff",
   "takeover",
   "sendImage",
@@ -134,6 +140,8 @@ export function readBehaviorSettings(
     serviceWindow: readServiceWindowConfig(settings),
     grounding: readGrounding(settings),
     followUp: readFollowUpConfig(settings),
+    firstTurnGuard: readFirstTurnGuardConfig(settings),
+    objectionGuard: readObjectionGuardConfig(settings),
     handoff: readHandoffConfig(settings),
     takeover: readTakeoverConfig(settings),
     sendImage: readSendImageConfig(settings),
@@ -163,6 +171,8 @@ export interface BehaviorSettingsPatch {
   serviceWindow?: Record<string, unknown>;
   grounding?: Record<string, unknown>;
   followUp?: Record<string, unknown>;
+  firstTurnGuard?: Record<string, unknown>;
+  objectionGuard?: Record<string, unknown>;
   handoff?: Record<string, unknown>;
   takeover?: Record<string, unknown>;
   sendImage?: Record<string, unknown>;
