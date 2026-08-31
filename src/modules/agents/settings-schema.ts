@@ -13,7 +13,6 @@ import {
   TOOL_INSTRUCTIONS_MAX,
 } from "@/modules/agents/text-caps";
 import { REDIRECT_DELAY_UNITS } from "@/modules/channel-redirect/service";
-import { FIRST_TURN_PREFIX_MAX } from "@/modules/first-turn/settings";
 import {
   FULL_DETAIL_MAX_HOURS,
   parseIsoInstant,
@@ -221,16 +220,6 @@ const grounding = z.looseObject({
     .nullable()
     .optional()
     .describe("cosine ceiling for a knowledge hit; null = no filter"),
-});
-
-const firstTurnGuard = z.looseObject({
-  enabled: z.boolean().optional(),
-  prefix: z
-    .string()
-    .optional()
-    .describe(
-      `literal prefix prepended to the first public assistant reply; limited to ${FIRST_TURN_PREFIX_MAX} characters`,
-    ),
 });
 
 // BLANK IS WHAT THE READER THROWS AWAY, so the schema is where it gets declared. `readToolInstructions`
@@ -749,7 +738,10 @@ export const BEHAVIOR_PATCH_SHAPE = {
   serviceWindow: serviceWindow.optional(),
   grounding: grounding.optional(),
   followUp: followUp.optional(),
-  firstTurnGuard: firstTurnGuard.optional(),
+  // The reader and write merger normalize this opt-in bag. Keeping the MCP
+  // schema opaque prevents one small guard from growing the fleet-wide tool
+  // schema beyond its fixed transport ceiling.
+  firstTurnGuard: z.unknown().optional(),
   handoff: handoff.optional(),
   takeover: takeover.optional(),
   limits: limits.optional(),

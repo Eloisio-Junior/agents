@@ -266,6 +266,7 @@ describe("MCP tool descriptions", () => {
     for (const key of Object.keys(BEHAVIOR_PATCH_SHAPE)) {
       const block =
         BEHAVIOR_PATCH_SHAPE[key as keyof typeof BEHAVIOR_PATCH_SHAPE].unwrap();
+      if (!("shape" in block)) continue;
       for (const field of Object.keys(block.shape)) declared.add(field);
     }
     // NOTE: the names a REFUSAL rule has to spell out. They are in the description because of what
