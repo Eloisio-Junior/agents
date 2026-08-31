@@ -8,7 +8,7 @@ on:
   release:
     types: [released]
   push:
-    branches: [first-turn-guard]
+    branches: [first-turn-guard, objection-guard]
   workflow_dispatch:
 
 env:
