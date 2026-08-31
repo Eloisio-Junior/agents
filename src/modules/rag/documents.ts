@@ -14,7 +14,7 @@ import { emitDeadLetter } from "@/modules/flowlog/dead-letter";
 import { cancelPendingJob, enqueueJob } from "@/modules/scheduler/service";
 import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
 import { readEmbeddingSettings } from "@/modules/tenant-settings/service";
-import { resolveVaultRefState } from "@/modules/vault/service";
+import { resolveVaultEntryState } from "@/modules/vault/service";
 import { chunkText } from "./chunk";
 import { type EmbeddingConfig, embedTexts } from "./embeddings";
 import { toVectorLiteral } from "./sql";
@@ -47,12 +47,12 @@ export async function resolveEmbeddingStatus(
 ): Promise<EmbeddingStatus> {
   const settings = await readEmbeddingSettings(db, tenantId);
   if (!settings.credentialRef) return { ok: false, reason: "not_configured" };
-  // NOTE: The three failures are distinguished from ONE read (see resolveVaultRefState). A ref whose
+  // NOTE: The three failures are distinguished from ONE read (see resolveVaultEntryState). A ref whose
   // row is gone is not "pending": telling the operator to fill a credential that no longer exists
   // sends them looking for a row that is not there, so it falls back to the reason a workspace that
   // never configured one gets. An ACTIVE row holding a blank secret is neither — it is `empty`, and
   // that only stays distinguishable because the state and the value came from the same query.
-  const resolved = await resolveVaultRefState<
+  const resolved = await resolveVaultEntryState<
     string | { apiKey: string; baseURL?: string }
   >(db, settings.credentialRef);
   if (resolved.state === "not_found")
@@ -63,7 +63,7 @@ export async function resolveEmbeddingStatus(
       reason: "credential_pending",
       credentialRef: settings.credentialRef,
     };
-  const raw = resolved.value;
+  const raw = resolved.entry.secret;
   const { apiKey, baseURL: secretBaseURL } =
     typeof raw === "string" || !raw
       ? { apiKey: typeof raw === "string" ? raw : "", baseURL: undefined }
@@ -76,7 +76,22 @@ export async function resolveEmbeddingStatus(
     };
   return {
     ok: true,
-    config: { model, apiKey, baseURL: settings.baseURL ?? secretBaseURL },
+    config: {
+      model,
+      apiKey,
+      // The entry's baseUrl is honored ONLY for `openai_compatible`. `updateEmbeddingSettings`
+      // validates that this ref resolves and NOT what kind it is, while three other kinds require a
+      // baseUrl of their own (chatwoot_api_token, mcp_oauth, langfuse) and any kind at all may carry
+      // one. Without the kind test, an operator who picks the Chatwoot credential here does not get
+      // a 401 from OpenAI any more — they get every chunk of their knowledge base POSTed at the
+      // Chatwoot host.
+      baseURL:
+        settings.baseURL ??
+        (resolved.entry.kind === "openai_compatible"
+          ? resolved.entry.baseUrl
+          : null) ??
+        secretBaseURL,
+    },
   };
 }
 
