@@ -134,4 +134,3 @@ describe("first-turn guard settings", () => {
     expect(read.prefix).toHaveLength(FIRST_TURN_PREFIX_MAX);
   });
 });
-

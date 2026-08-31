@@ -1470,4 +1470,3 @@ export async function runPlaygroundFileTurn(
     trace: [...visionTrace, ...turn.trace],
   };
 }
-

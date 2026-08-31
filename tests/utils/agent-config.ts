@@ -92,4 +92,3 @@ export function makeConfig(
     ...over,
   } as AgentConfig;
 }
-

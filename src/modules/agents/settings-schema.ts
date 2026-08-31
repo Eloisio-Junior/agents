@@ -770,4 +770,3 @@ export const BEHAVIOR_PATCH_SHAPE = {
 export type BehaviorPatchArgs = z.infer<
   z.ZodObject<typeof BEHAVIOR_PATCH_SHAPE>
 >;
-

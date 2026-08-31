@@ -343,4 +343,3 @@ describe("behavior-settings — the merge stores what is stored, not what is der
     ).toBeNull();
   });
 });
-

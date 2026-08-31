@@ -368,4 +368,3 @@ export function mergeBehaviorSettings(
   }
   return next;
 }
-

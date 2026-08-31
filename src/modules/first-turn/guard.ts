@@ -63,4 +63,3 @@ export function applyFirstTurnGuard(params: {
   }
   return { reply: `${config.prefix}\n\n${reply}`, applied: true };
 }
-

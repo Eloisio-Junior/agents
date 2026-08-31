@@ -249,4 +249,3 @@ export function clampOversizedTextInPlace(settings: unknown): OversizedText[] {
   }
   return out;
 }
-
