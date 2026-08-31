@@ -541,6 +541,12 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
       // cannot fail on a field the dispatcher never set.
       occasionId: `delivery:${r.deliveryId}`,
     });
+    const paymentNudge = nudges[0]?.nudge as
+      | { instructions?: string }
+      | undefined;
+    expect(paymentNudge?.instructions).toContain(
+      "payment was already received/confirmed",
+    );
 
     // The conversion is still recorded (durable barrier) and the delivery ends PROCESSED.
     const conv = await suDb.conversionEvent.findFirst({

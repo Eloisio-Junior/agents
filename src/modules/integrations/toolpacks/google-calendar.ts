@@ -540,12 +540,46 @@ const CALENDAR_ID_DESC =
 const AVAILABILITY_CALENDAR_ID_DESC =
   'OPTIONAL, and usually omitted. Leave it out to search EVERY calendar in `<allowed_calendars>` at once, which is what answers "who is free first?" or "any <specialty> tomorrow?" in one call; each returned slot names the calendar that can take it. Pass it (name or id) ONLY when the customer has already chosen a professional, or when they asked about that one specifically.';
 
-function projectEvent(ev: Record<string, unknown>) {
+function instantInTimeZone(
+  value: string | null,
+  timeZone: string,
+): string | null {
+  if (!value || ALL_DAY_RE.test(value)) return value;
+  const instant = Date.parse(value);
+  if (Number.isNaN(instant)) return value;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(instant));
+  const part = (type: string) =>
+    parts.find((candidate) => candidate.type === type)?.value ?? "00";
+  const localAsUtc = Date.UTC(
+    Number(part("year")),
+    Number(part("month")) - 1,
+    Number(part("day")),
+    Number(part("hour")),
+    Number(part("minute")),
+    Number(part("second")),
+  );
+  const offsetMinutes = Math.round((localAsUtc - instant) / 60_000);
+  const sign = offsetMinutes < 0 ? "-" : "+";
+  const absolute = Math.abs(offsetMinutes);
+  const offset = `${sign}${String(Math.floor(absolute / 60)).padStart(2, "0")}:${String(absolute % 60).padStart(2, "0")}`;
+  return `${part("year")}-${part("month")}-${part("day")}T${part("hour")}:${part("minute")}:${part("second")}${offset}`;
+}
+
+function projectEvent(ev: Record<string, unknown>, timeZone: string) {
   return {
     id: typeof ev.id === "string" ? ev.id : null,
     summary: typeof ev.summary === "string" ? ev.summary : null,
-    start: flattenTime(ev.start),
-    end: flattenTime(ev.end),
+    start: instantInTimeZone(flattenTime(ev.start), timeZone),
+    end: instantInTimeZone(flattenTime(ev.end), timeZone),
     htmlLink: typeof ev.htmlLink === "string" ? ev.htmlLink : undefined,
     // NOTE: the Meet room (hangoutLink) — THE link to hand the customer; htmlLink is only the event's
     // calendar page, useless to a lead without access to the calendar.
@@ -652,6 +686,7 @@ function buildListEventsTool(
 ): StructuredToolInterface {
   const allowed = resolveAllowedCalendarIds(sel.config);
   const labels = resolveCalendarLabels(sel.config);
+  const timeZone = resolveTimeZone(sel.config);
   return failableTool(
     async (input: {
       timeMin?: string;
@@ -709,7 +744,9 @@ function buildListEventsTool(
           "gcal: list re-verify dropped events the server-side contact fence returned",
         );
       }
-      return JSON.stringify(owned.map(projectEvent));
+      return JSON.stringify(
+        owned.map((event) => projectEvent(event, timeZone)),
+      );
     },
     {
       name: "calendar_list_events",
@@ -1356,7 +1393,7 @@ function buildCreateEventTool(
           calendarLabel: labels[calendarId] ?? null,
         });
       }
-      return JSON.stringify(projectEvent(data));
+      return JSON.stringify(projectEvent(data, timeZone));
     },
     {
       name: "calendar_create_event",
@@ -1535,7 +1572,7 @@ function buildUpdateEventTool(
           });
         }
       }
-      return JSON.stringify(projectEvent(data));
+      return JSON.stringify(projectEvent(data, timeZone));
     },
     {
       name: "calendar_update_event",

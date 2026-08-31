@@ -964,6 +964,31 @@ describe("google calendar toolpack — list + availability", () => {
     ]);
   });
 
+  test("list renders Google UTC instants in the configured business timezone", async () => {
+    const { impl } = stubFetch(200, {
+      items: [
+        {
+          id: "utc",
+          summary: "Consulta",
+          start: { dateTime: "2026-09-03T17:00:00Z" },
+          end: { dateTime: "2026-09-03T18:00:00Z" },
+          extendedProperties: stampedExt,
+        },
+      ],
+    });
+    const out = (await toolFor(
+      "calendar_list_events",
+      { timeZone: "America/Sao_Paulo" },
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke({})) as string;
+    expect(JSON.parse(out)).toMatchObject([
+      {
+        start: "2026-09-03T14:00:00-03:00",
+        end: "2026-09-03T15:00:00-03:00",
+      },
+    ]);
+  });
+
   test("check_availability posts a freeBusy query and defaults the timeZone to São Paulo", async () => {
     const { impl, calls } = stubFetch(200, {
       calendars: { primary: { busy: [] } },

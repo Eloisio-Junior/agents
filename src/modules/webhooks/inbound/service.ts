@@ -394,14 +394,27 @@ function buildNudge(
   // the spend ceiling inside the first's window, would lose its flow line and its alert.
   deliveryId: bigint,
 ): AgentNudge {
+  const status = asString(payload.status) ?? null;
+  const value = typeof payload.value === "number" ? payload.value : null;
+  const currency = asString(payload.currency) ?? null;
+  const confirmedPayment =
+    source === "ASAAS" && (status === "RECEIVED" || status === "CONFIRMED");
   return {
     source,
     kind: "agent_nudge",
     occasionId: `delivery:${deliveryId}`,
-    status: asString(payload.status) ?? null,
-    value: typeof payload.value === "number" ? payload.value : null,
-    currency: asString(payload.currency) ?? null,
+    status,
+    value,
+    currency,
     summary: asString(payload.summary) ?? null,
+    ...(confirmedPayment
+      ? {
+          instructions:
+            "This event is authoritative proof that the payment was already received/confirmed. " +
+            "Tell the customer clearly that payment was confirmed. Do not say it is pending, registered but awaiting confirmation, or that payment confirms attendance. " +
+            "Payment and attendance confirmation are independent states.",
+        }
+      : {}),
   };
 }
 
