@@ -68,6 +68,7 @@ enum SchedulerJobKind {
   INGEST_MESSAGE
   DELIVERY_SWEEP
   DELIVERY_RECOVERY
+  PAYMENT_APPOINTMENT
 }
 
 enum SchedulerJobStatus {
@@ -1241,6 +1242,7 @@ model ConversionEvent {
   tenantId   BigInt   @map("tenant_id")
   threadId   String   @map("thread_id")
   source     String
+  externalId String   @map("external_id")
   value      Decimal? @db.Decimal(14, 2)
   currency   String?
   metadata   Json     @default("{}")
@@ -1248,7 +1250,7 @@ model ConversionEvent {
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
-  @@unique([tenantId, threadId, source])
+  @@unique([tenantId, source, externalId])
   @@map("conversion_events")
 }
 

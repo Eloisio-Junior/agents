@@ -79,8 +79,21 @@ const SECV4_CONTACT_KEY = "secv4Contact";
 // calendar_confirm_appointment, injected from code, never surfaced to the model). Frozen for the
 // same reason as SECV4_CONTACT_KEY above.
 const SECV4_CONFIRMED_KEY = "secv4Confirmed";
+const SECV4_PAYMENT_CONFIRMED_KEY = "secv4PaymentConfirmedAt";
 // Title prefix that marks a confirmed appointment (applied idempotently).
 const CONFIRMED_PREFIX = "[CONFIRMADO] ";
+const PAID_PREFIX = "[PAGO] ";
+
+function hasLeadingMarker(summary: string, marker: string): boolean {
+  return (
+    summary.match(/^(?:\[(?:PAGO|CONFIRMADO)\] )*/)?.[0]?.includes(marker) ??
+    false
+  );
+}
+
+function addLeadingMarker(summary: string, marker: string): string {
+  return hasLeadingMarker(summary, marker) ? summary : `${marker}${summary}`;
+}
 
 // The allowlist of calendars the agent may operate on, bound to config. Empty/missing → [] (NO
 // calendar): fail-closed, so the tools refuse until the operator explicitly picks a calendar, instead
@@ -1617,6 +1630,81 @@ function buildCancelEventTool(
   );
 }
 
+export async function markGoogleCalendarAppointmentPaid(
+  sel: IntegrationSelection,
+  ctx: ToolpackCtx,
+  input: { eventId: string; calendarId: string },
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const stamp = contactStamp(ctx);
+  if (!stamp) return { ok: false, error: NO_CONTACT };
+  const token = await resolveToken(sel, ctx);
+  if (!token) return { ok: false, error: NOT_CONNECTED };
+  const pick = pickCalendarId(
+    resolveAllowedCalendarIds(sel.config),
+    resolveCalendarLabels(sel.config),
+    input.calendarId,
+  );
+  if ("error" in pick) return { ok: false, error: pick.error };
+  let owner: GcalResponse;
+  try {
+    owner = await gcalFetch(
+      `/calendars/${encodeURIComponent(pick.id)}/events/${encodeURIComponent(input.eventId)}?fields=extendedProperties,summary`,
+      { method: "GET", token },
+      ctx,
+    );
+  } catch {
+    return { ok: false, error: "Failed to reach Google Calendar." };
+  }
+  if (owner.status === 404) return { ok: false, error: FOREIGN_EVENT };
+  if (owner.status < 200 || owner.status >= 300) {
+    return {
+      ok: false,
+      error: `Google Calendar returned HTTP ${owner.status}.`,
+    };
+  }
+  const event = (owner.json ?? {}) as Record<string, unknown>;
+  if (eventStamp(event) !== stamp) return { ok: false, error: FOREIGN_EVENT };
+  const summary = typeof event.summary === "string" ? event.summary : "";
+  const extended =
+    event.extendedProperties && typeof event.extendedProperties === "object"
+      ? (event.extendedProperties as Record<string, unknown>)
+      : {};
+  const currentPrivate =
+    extended.private && typeof extended.private === "object"
+      ? (extended.private as Record<string, unknown>)
+      : {};
+  let patched: GcalResponse;
+  try {
+    patched = await gcalFetch(
+      `/calendars/${encodeURIComponent(pick.id)}/events/${encodeURIComponent(input.eventId)}`,
+      {
+        method: "PATCH",
+        token,
+        body: {
+          summary: addLeadingMarker(summary, PAID_PREFIX),
+          extendedProperties: {
+            private: {
+              ...currentPrivate,
+              [SECV4_CONTACT_KEY]: stamp,
+              [SECV4_PAYMENT_CONFIRMED_KEY]: new Date().toISOString(),
+            },
+          },
+        },
+      },
+      ctx,
+    );
+  } catch {
+    return { ok: false, error: "Failed to reach Google Calendar." };
+  }
+  if (patched.status < 200 || patched.status >= 300) {
+    return {
+      ok: false,
+      error: `Google Calendar rejected the payment marker (HTTP ${patched.status}).`,
+    };
+  }
+  return { ok: true };
+}
+
 function buildConfirmAppointmentTool(
   sel: IntegrationSelection,
   ctx: ToolpackCtx,
@@ -1654,9 +1742,7 @@ function buildConfirmAppointmentTool(
       if (eventStamp(ownerEv) !== stamp) return FOREIGN_EVENT;
       const currentSummary =
         typeof ownerEv.summary === "string" ? ownerEv.summary : "";
-      const newSummary = currentSummary.startsWith(CONFIRMED_PREFIX)
-        ? currentSummary
-        : `${CONFIRMED_PREFIX}${currentSummary}`;
+      const newSummary = addLeadingMarker(currentSummary, CONFIRMED_PREFIX);
       const body: Record<string, unknown> = {
         summary: newSummary,
         // Re-assert the contact stamp alongside the confirmation marker: a PATCH on the private map must

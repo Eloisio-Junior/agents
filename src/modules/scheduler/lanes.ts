@@ -63,6 +63,7 @@ export const JOB_LANE: Record<SchedulerJobKind, SchedulerLane> = {
   // concurrency (below), not a tick of its own — a lane would give it a budget INDEPENDENT of the
   // turns a live customer is queueing for, which is the opposite of what a recovery should get.
   DELIVERY_RECOVERY: "shared",
+  PAYMENT_APPOINTMENT: "shared",
 };
 
 // Whether ONE job of this kind spends capacity at an external provider that the rest of the product
@@ -104,6 +105,7 @@ export const JOB_SPENDS_PROVIDER: Record<SchedulerJobKind, boolean> = {
   // turn decides to use. The whole reason it is a kind of its own rather than work the sweep does
   // inline.
   DELIVERY_RECOVERY: true,
+  PAYMENT_APPOINTMENT: true,
 };
 
 // How many provider-spending jobs the shared lane may run at once, out of the model budget. NEVER
@@ -142,6 +144,7 @@ export const JOB_DELETE_ON_DONE: Record<SchedulerJobKind, boolean> = {
   // count is bounded by how many deliveries have ever been stranded. What the record of the work is
   // here is the ledger row itself, which is terminal either way.
   DELIVERY_RECOVERY: true,
+  PAYMENT_APPOINTMENT: false,
 };
 
 // Whether the NUMBER of rows of this kind follows inbound traffic, rather than a population the
@@ -187,6 +190,7 @@ export const JOB_TRAFFIC_PROPORTIONAL: Record<SchedulerJobKind, boolean> = {
   // right answer for a different reason: a reply that late is stale whatever delayed it. Reserving
   // capacity here would be mechanism for a backlog nobody has measured.
   DELIVERY_RECOVERY: true,
+  PAYMENT_APPOINTMENT: false,
 };
 
 // WHAT ONE KIND'S DEATH MEANS TO THE OPERATOR, at the only moment the scheduler can state it
@@ -254,6 +258,7 @@ export const JOB_DEATH_LEVEL: Record<SchedulerJobKind, FlowLevel> = {
   // second `error` would be the same customer message waking somebody twice, which is how a channel
   // stops being read.
   DELIVERY_RECOVERY: "warn",
+  PAYMENT_APPOINTMENT: "error",
 };
 
 export function kindsInLane(

@@ -36,6 +36,7 @@ import {
   startCompactionWorker,
   stopCompactionWorker,
 } from "@/modules/memory/worker";
+import { registerPaymentAppointmentHandler } from "@/modules/payments/appointment";
 import { registerRagIngestHandler } from "@/modules/rag/documents";
 import { startScheduler, stopScheduler } from "@/modules/scheduler/worker";
 import { registerHeartbeatHandler } from "@/modules/webhooks/outbound/heartbeat";
@@ -173,6 +174,7 @@ if (config.schedulerWorker.enabled) {
   registerHeartbeatHandler();
   registerFlowlogRetentionHandler();
   registerAppointmentReminderHandler();
+  registerPaymentAppointmentHandler();
   registerRedirectFollowUpHandlers();
   registerMemoryHandlers();
   registerDeliverySweepHandler();

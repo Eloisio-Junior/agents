@@ -17,6 +17,7 @@ import type {
   InboundEventKind,
   NormalizedInboundEvent,
 } from "@/modules/integrations/types";
+import { upsertJobRow } from "@/modules/scheduler/service";
 import { resolveVaultRefState } from "@/modules/vault/service";
 import {
   type InboundAuthFailure,
@@ -709,6 +710,9 @@ async function dispatchConversion(
         tenantId,
         threadId: ref.threadId,
         source,
+        // paymentId distinguishes two legitimate Asaas payments in one conversation. Providers
+        // without an event id retain the previous one-conversion-per-thread/source identity.
+        externalId: paymentId ?? externalId ?? ref.threadId,
         value,
         currency,
         metadata: (payload.metadata ?? {}) as Prisma.InputJsonValue,
@@ -723,6 +727,35 @@ async function dispatchConversion(
       ref.threadId,
       source,
     );
+  }
+  if (result.count > 0 && source === "ASAAS" && paymentId) {
+    const appointments = await db.appointment.findMany({
+      where: {
+        threadId: ref.threadId,
+        cancelledAt: null,
+        startAt: { gt: new Date() },
+      },
+      orderBy: { startAt: "asc" },
+      take: 2,
+      select: { provider: true, externalId: true, calendarId: true },
+    });
+    const appointment = appointments.length === 1 ? appointments[0] : null;
+    if (appointment?.provider === "google_calendar") {
+      await upsertJobRow(db, {
+        tenantId,
+        kind: "PAYMENT_APPOINTMENT",
+        dedupeKey: `payment-appointment:${paymentId}`,
+        runAt: new Date(),
+        rearm: "same-work",
+        payload: {
+          refId: String(ref.id),
+          threadId: ref.threadId,
+          paymentId,
+          eventId: appointment.externalId,
+          calendarId: appointment.calendarId || "primary",
+        },
+      });
+    }
   }
   return { threadId: ref.threadId, recorded: result.count > 0 };
 }

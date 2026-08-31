@@ -68,7 +68,8 @@ export type SchedulerJobKind =
   | "MEMORY_COMPACT"
   | "INGEST_MESSAGE"
   | "DELIVERY_SWEEP"
-  | "DELIVERY_RECOVERY";
+  | "DELIVERY_RECOVERY"
+  | "PAYMENT_APPOINTMENT";
 
 export interface ClaimedJob {
   id: bigint;

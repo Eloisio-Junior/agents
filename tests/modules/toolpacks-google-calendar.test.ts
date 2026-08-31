@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import type { ToolMessage } from "@langchain/core/messages";
 import type { PrismaClient } from "@/../generated/prisma/client";
-import { googleCalendarToolpack } from "@/modules/integrations/toolpacks/google-calendar";
+import {
+  googleCalendarToolpack,
+  markGoogleCalendarAppointmentPaid,
+} from "@/modules/integrations/toolpacks/google-calendar";
 import type {
   IntegrationSelection,
   ToolpackCtx,
@@ -727,6 +730,60 @@ describe("google calendar toolpack — appointment reminders + confirmation", ()
     )?.invoke({ eventId: "ev_3" });
     const body = bodyOf(calls[1] as { init: RequestInit });
     expect(body.summary).toBe("[CONFIRMADO] Consulta");
+  });
+
+  test("payment marker adds [PAGO], preserves [CONFIRMADO] and private properties", async () => {
+    const { impl, calls } = stubFetch(200, {
+      id: "ev_paid",
+      summary: "[CONFIRMADO] Consulta",
+      extendedProperties: {
+        private: { ...stampedExt.private, existing: "kept" },
+      },
+    });
+    const out = await markGoogleCalendarAppointmentPaid(
+      sel({ config: { calendarIds: ["primary"] } }),
+      baseCtx({ fetchImpl: impl }),
+      { eventId: "ev_paid", calendarId: "primary" },
+    );
+    expect(out).toEqual({ ok: true });
+    expect(calls[0]?.init.method).toBe("GET");
+    expect(calls[1]?.init.method).toBe("PATCH");
+    const body = bodyOf(calls[1] as { init: RequestInit });
+    expect(body.summary).toBe("[PAGO] [CONFIRMADO] Consulta");
+    const ext = body.extendedProperties as { private: Record<string, unknown> };
+    expect(ext.private.existing).toBe("kept");
+    expect(ext.private.secv4Contact).toBe(STAMP);
+    expect(typeof ext.private.secv4PaymentConfirmedAt).toBe("string");
+  });
+
+  test("payment marker is idempotent across the leading marker chain", async () => {
+    const { impl, calls } = stubFetch(200, {
+      id: "ev_paid",
+      summary: "[CONFIRMADO] [PAGO] Consulta",
+      extendedProperties: stampedExt,
+    });
+    await markGoogleCalendarAppointmentPaid(
+      sel({ config: { calendarIds: ["primary"] } }),
+      baseCtx({ fetchImpl: impl }),
+      { eventId: "ev_paid", calendarId: "primary" },
+    );
+    const body = bodyOf(calls[1] as { init: RequestInit });
+    expect(body.summary).toBe("[CONFIRMADO] [PAGO] Consulta");
+  });
+
+  test("payment marker refuses another contact's event without PATCH", async () => {
+    const { impl, calls } = stubFetch(200, {
+      id: "ev_foreign",
+      summary: "Consulta",
+      extendedProperties: { private: { secv4Contact: "1:99" } },
+    });
+    const out = await markGoogleCalendarAppointmentPaid(
+      sel({ config: { calendarIds: ["primary"] } }),
+      baseCtx({ fetchImpl: impl }),
+      { eventId: "ev_foreign", calendarId: "primary" },
+    );
+    expect(out).toMatchObject({ ok: false });
+    expect(calls).toHaveLength(1);
   });
 
   test("confirm refuses another contact's event (no PATCH)", async () => {
