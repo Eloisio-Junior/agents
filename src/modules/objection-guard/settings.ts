@@ -17,14 +17,20 @@ export const OBJECTION_GUARD_DEFAULTS: ObjectionGuardConfig = {
 
 function patterns(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
-  return [
+  const unique = [
     ...new Set(
       value
         .filter((item): item is string => typeof item === "string")
         .map((item) => clipText(item.trim(), OBJECTION_GUARD_PATTERN_MAX))
         .filter(Boolean),
     ),
-  ].slice(0, OBJECTION_GUARD_PATTERNS_MAX);
+  ];
+  const result: string[] = [];
+  for (const item of unique) {
+    if (result.length >= OBJECTION_GUARD_PATTERNS_MAX) break;
+    result.push(item);
+  }
+  return result;
 }
 
 export function readObjectionGuardConfig(

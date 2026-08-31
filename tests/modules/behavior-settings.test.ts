@@ -73,6 +73,32 @@ describe("behavior-settings — firstTurnGuard", () => {
   });
 });
 
+describe("behavior-settings — objectionGuard", () => {
+  test("is opt-in and normalizes configured patterns", () => {
+    expect(BEHAVIOR_SETTINGS_KEYS).toContain("objectionGuard");
+    expect(readBehaviorSettings({}).objectionGuard).toEqual({
+      enabled: false,
+      openObjectionPatterns: [],
+      definitiveRefusalPatterns: [],
+    });
+    const next = mergeBehaviorSettings(
+      {},
+      {
+        objectionGuard: {
+          enabled: true,
+          openObjectionPatterns: ["  está caro  ", "está caro"],
+          definitiveRefusalPatterns: ["  não tenho interesse  "],
+        },
+      },
+    );
+    expect(next.objectionGuard).toEqual({
+      enabled: true,
+      openObjectionPatterns: ["está caro"],
+      definitiveRefusalPatterns: ["não tenho interesse"],
+    });
+  });
+});
+
 // vision is part of the shared behavior surface (so it is settable via the MCP agent_settings_set
 // partial-merge path, like stt/tts). These cover the wiring without a DB.
 describe("behavior-settings — vision", () => {
