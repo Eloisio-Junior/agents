@@ -268,6 +268,7 @@ function buildPlaygroundToolset(
     // operator goes to find out what their agent does — a refused call never reaches the inner tool,
     // so ToolFlowLogger sees no run either and there is nothing else to read.
     flow: FlowContext | undefined;
+    customerText?: string;
   },
 ): Promise<StructuredToolInterface[]> {
   return buildToolset(
@@ -279,6 +280,7 @@ function buildPlaygroundToolset(
       client: {} as ChatwootClient,
       conversationId: 0,
       threadId: params.threadId,
+      customerText: params.customerText,
     },
     {
       // Conversation tools (handoff/resolve/…) are SIMULATED (no real effect); utility tools
@@ -315,6 +317,7 @@ async function buildPlaygroundGraph(params: {
   // spend ceiling may only refuse a target that EXISTS — see the comment at their gates. Passing it
   // through keeps that ordering from costing a second read of the same agent row.
   loaded?: AgentConfig;
+  customerText?: string;
   // Same warn line the reactive turn leaves when a model call had to be retried. The caller passes
   // it because the FlowContext is the caller's.
   onModelRetry?: (info: ModelRetryInfo) => void;
@@ -359,6 +362,7 @@ async function buildPlaygroundGraph(params: {
     base,
     deps: params.deps,
     flow: params.flow,
+    customerText: params.customerText,
   });
   const toolMocks = params.overrides?.toolMocks;
   const tools = applyToolMocks(rawTools, toolMocks);
@@ -551,6 +555,7 @@ export async function runPlaygroundTurn(
       turnId,
       flow,
       loaded: loadedConfig,
+      customerText: text,
       onModelRetry: ({ attempt, provider, model }) =>
         emitFlowEvent(flow, {
           stage: "generate",
@@ -956,6 +961,7 @@ export async function runPlaygroundFollowup(
       turnId,
       flow,
       loaded: loadedConfig,
+      customerText: "",
       onModelRetry: ({ attempt, provider, model }) =>
         emitFlowEvent(flow, {
           stage: "generate",

@@ -568,6 +568,7 @@ export async function runLoadedTurn(
       client,
       conversationId,
       threadId,
+      customerText: params.text,
       messageId: params.messageId,
       imageDeps: params.deps?.imageDeps,
       documentsStorageDir: params.deps?.documentsStorageDir,

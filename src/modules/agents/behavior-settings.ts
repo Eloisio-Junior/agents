@@ -8,6 +8,7 @@ import { readAttributeContextConfig } from "@/modules/chatwoot/attributes";
 import { readContactAuthConfig } from "@/modules/contact-auth/settings";
 import { readDebounceConfig } from "@/modules/debounce/settings";
 import { readFirstTurnGuardConfig } from "@/modules/first-turn/settings";
+import { readObjectionGuardConfig } from "@/modules/objection-guard/settings";
 import {
   readObservabilityConfig,
   storableObservability,
@@ -57,6 +58,7 @@ export interface BehaviorSettings {
   grounding: { maxDistance: number | null };
   followUp: ReturnType<typeof readFollowUpConfig>;
   firstTurnGuard: ReturnType<typeof readFirstTurnGuardConfig>;
+  objectionGuard: ReturnType<typeof readObjectionGuardConfig>;
   handoff: ReturnType<typeof readHandoffConfig>;
   // NOTE: The second block whose default is ON (see modules/handoff/settings for why), and it is kept
   // apart from `handoff` above because the Tools tab REPLACES that one wholesale.
@@ -99,6 +101,7 @@ export const BEHAVIOR_SETTINGS_KEYS = [
   "grounding",
   "followUp",
   "firstTurnGuard",
+  "objectionGuard",
   "handoff",
   "takeover",
   "sendImage",
@@ -138,6 +141,7 @@ export function readBehaviorSettings(
     grounding: readGrounding(settings),
     followUp: readFollowUpConfig(settings),
     firstTurnGuard: readFirstTurnGuardConfig(settings),
+    objectionGuard: readObjectionGuardConfig(settings),
     handoff: readHandoffConfig(settings),
     takeover: readTakeoverConfig(settings),
     sendImage: readSendImageConfig(settings),
@@ -168,6 +172,7 @@ export interface BehaviorSettingsPatch {
   grounding?: Record<string, unknown>;
   followUp?: Record<string, unknown>;
   firstTurnGuard?: Record<string, unknown>;
+  objectionGuard?: Record<string, unknown>;
   handoff?: Record<string, unknown>;
   takeover?: Record<string, unknown>;
   sendImage?: Record<string, unknown>;
