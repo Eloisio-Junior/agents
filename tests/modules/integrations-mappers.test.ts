@@ -41,6 +41,7 @@ describe("asaas mapper", () => {
       currency: "BRL",
       status: "RECEIVED",
       summary: "Payment received",
+      metadata: { paymentId: "pay_123" },
     });
   });
 
@@ -81,8 +82,8 @@ describe("asaas mapper", () => {
       currency: "BRL",
       status: "RECEIVED",
     });
-    // Null paymentLink must not leave a metadata entry behind.
-    expect(ev.metadata).toBeUndefined();
+    // Null paymentLink is omitted, while the real payment id remains available for recovery.
+    expect(ev.metadata).toEqual({ paymentId: "pay_yuq2ko5t8vaioizq" });
   });
 
   test("externalReference null → externalId falls back to payment.id", () => {
@@ -108,12 +109,15 @@ describe("asaas mapper", () => {
     expect(ev.value).toBeUndefined();
   });
 
-  test("paymentLink string → carried as metadata.paymentLink", () => {
+  test("paymentLink string → carried with metadata.paymentId", () => {
     const ev = mapOk({
       event: "PAYMENT_RECEIVED",
       payment: { id: "pay_lnk", paymentLink: "link_abc" },
     });
-    expect(ev.metadata).toEqual({ paymentLink: "link_abc" });
+    expect(ev.metadata).toEqual({
+      paymentId: "pay_lnk",
+      paymentLink: "link_abc",
+    });
   });
 
   test("unmapped lifecycle event → unhandled", () => {

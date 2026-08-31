@@ -671,7 +671,7 @@ async function dispatchConversion(
   }
   const ref = await db.integrationExternalRef.findUnique({
     where: { tenantId_externalId: { tenantId, externalId } },
-    select: { threadId: true },
+    select: { id: true, threadId: true, metadata: true },
   });
   if (!ref) {
     logger.info(
@@ -683,6 +683,26 @@ async function dispatchConversion(
   const value = typeof payload.value === "number" ? payload.value : null;
   const currency = asString(payload.currency) ?? null;
   const occurredAt = asString(payload.occurredAt);
+  const inboundMetadata =
+    payload.metadata && typeof payload.metadata === "object"
+      ? (payload.metadata as Record<string, unknown>)
+      : {};
+  const paymentId = asString(inboundMetadata.paymentId);
+  if (source === "ASAAS" && paymentId) {
+    const storedMetadata =
+      ref.metadata && typeof ref.metadata === "object"
+        ? (ref.metadata as Record<string, unknown>)
+        : {};
+    await db.integrationExternalRef.update({
+      where: { id: ref.id },
+      data: {
+        metadata: {
+          ...storedMetadata,
+          paymentId,
+        } as Prisma.InputJsonValue,
+      },
+    });
+  }
   const result = await db.conversionEvent.createMany({
     data: [
       {

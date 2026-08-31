@@ -83,10 +83,13 @@ const asaasMapper: InboundMapper = {
       externalId: payment.externalReference ?? payment.id,
       dedupeKey: `${event}:${payment.id}`,
       status: payment.status ?? undefined,
-      // Carry the link id for the correlation contingency + observability (never the raw payload).
-      ...(payment.paymentLink
-        ? { metadata: { paymentLink: payment.paymentLink } }
-        : {}),
+      // Preserve the provider's real charge id so a later status check can query the payment,
+      // rather than merely asking whether its reusable payment link is still active. The inbound
+      // receptor merges this bounded projection into the already-correlated external ref.
+      metadata: {
+        paymentId: payment.id,
+        ...(payment.paymentLink ? { paymentLink: payment.paymentLink } : {}),
+      },
     };
     if (ASAAS_CONVERSION_EVENTS.has(event)) {
       return {

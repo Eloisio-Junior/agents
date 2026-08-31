@@ -472,6 +472,10 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
     expect(conv).not.toBeNull();
     expect(conv?.value?.toString()).toBe("250.5");
     expect(conv?.currency).toBe("BRL");
+    const ref = await suDb.integrationExternalRef.findUniqueOrThrow({
+      where: { tenantId_externalId: { tenantId, externalId: "pay_123" } },
+    });
+    expect(ref.metadata).toEqual({ paymentId: "pay_123" });
   });
 
   test("notifies the customer on a confirmed payment (default on), on the SAME thread (no bleed)", async () => {
@@ -835,7 +839,11 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
       expect(delivery.status).toBe("PENDING");
       const payload = delivery.payload as Record<string, unknown>;
       expect(payload.status).toBe(c.status);
-      if (c.metadata) expect(payload.metadata).toEqual(c.metadata);
+      expect(payload.metadata).toMatchObject({ paymentId: c.payment.id });
+      if (c.metadata)
+        expect(payload.metadata).toMatchObject(
+          c.metadata as Record<string, unknown>,
+        );
     });
   }
 

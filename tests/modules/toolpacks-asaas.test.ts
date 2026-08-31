@@ -488,6 +488,64 @@ describe.skipIf(!dbUp)("asaas toolpack — correlation ref persistence", () => {
     expect(mapped.event.externalId).toBe(externalReference);
   });
 
+  test("status without an id recovers the latest payment from this integration and thread", async () => {
+    const threadId = `${tenantId}:1:status-recovery`;
+    await suDb.integrationExternalRef.createMany({
+      data: [
+        {
+          tenantId,
+          integrationInstanceId: instanceId,
+          externalId: randomBytes(16).toString("hex"),
+          threadId,
+          kind: "asaas_payment",
+          metadata: { paymentLinkId: "plink_older" },
+          createdAt: new Date("2026-08-30T12:00:00Z"),
+        },
+        {
+          tenantId,
+          integrationInstanceId: instanceId,
+          externalId: randomBytes(16).toString("hex"),
+          threadId,
+          kind: "asaas_payment",
+          metadata: { paymentLinkId: "plink_latest" },
+          createdAt: new Date("2026-08-30T13:00:00Z"),
+        },
+        {
+          tenantId,
+          integrationInstanceId: instanceId,
+          externalId: randomBytes(16).toString("hex"),
+          threadId: `${tenantId}:1:another-thread`,
+          kind: "asaas_payment",
+          metadata: { paymentLinkId: "plink_foreign_thread" },
+          createdAt: new Date("2026-08-30T14:00:00Z"),
+        },
+      ],
+    });
+    const { impl, calls } = stubFetch(200, {
+      id: "plink_latest",
+      active: true,
+      value: 300,
+      billingType: "UNDEFINED",
+      chargeType: "DETACHED",
+    });
+    const tool = asaasToolpack.build(
+      sel({
+        instanceId,
+        enabledTools: ["asaas_payment_status"],
+        config: { environment: "sandbox" },
+      }),
+      baseCtx({ tenantId, base: appDb, threadId, fetchImpl: impl }),
+    )[0];
+
+    const out = (await tool?.invoke({})) as string;
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe(
+      "https://api-sandbox.asaas.com/v3/paymentLinks/plink_latest",
+    );
+    expect(out).toContain("plink_latest");
+  });
+
   test("an operator's config.paymentLink cannot clobber the correlation token", async () => {
     const { impl, calls } = stubFetch(200, {
       id: "plink_43",

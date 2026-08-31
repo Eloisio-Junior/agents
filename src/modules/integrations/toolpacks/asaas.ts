@@ -567,6 +567,44 @@ function buildStatusTool(
         (linkId && looksLikeUrl(linkId))
       )
         return guidance;
+      // The create tools persist the provider id against this exact integration + conversation.
+      // Recover it server-side when the model no longer has the original tool result in context:
+      // correlation is tenant/thread-scoped data, never something the model should reconstruct.
+      if (!paymentId && !linkId && ctx.base) {
+        try {
+          const refs = await runScopedOn(ctx.base, sysCtx(ctx.tenantId), (db) =>
+            db.integrationExternalRef.findMany({
+              where: {
+                tenantId: ctx.tenantId,
+                integrationInstanceId: sel.instanceId,
+                threadId: ctx.threadId,
+                kind: "asaas_payment",
+              },
+              orderBy: { createdAt: "desc" },
+              take: 20,
+              select: { metadata: true },
+            }),
+          );
+          for (const ref of refs) {
+            const metadata = ref.metadata as Record<string, unknown>;
+            const storedPaymentId = metadata.paymentId;
+            const storedLinkId = metadata.paymentLinkId;
+            if (typeof storedPaymentId === "string" && storedPaymentId.trim()) {
+              paymentId = storedPaymentId.trim();
+              break;
+            }
+            if (typeof storedLinkId === "string" && storedLinkId.trim()) {
+              linkId = storedLinkId.trim();
+              break;
+            }
+          }
+        } catch (err) {
+          logger.warn(
+            { err, integrationInstanceId: sel.instanceId },
+            "asaas: failed to recover payment id for thread",
+          );
+        }
+      }
       if (!paymentId && !linkId) return guidance;
       // Path-interpolated ids are URL-encoded; the origin stays the fixed constant above.
       // When both arrive, the payment wins: its status is the terminal fact (a link stays
@@ -613,7 +651,7 @@ function buildStatusTool(
     {
       name: "asaas_payment_status",
       description:
-        "Check the status of an Asaas payment. Pass paymentId (pay_..., returned by asaas_create_pix_charge) OR paymentLinkId (returned by asaas_payment_link_create); never the invoice URL or its slug. Payment status is PENDING/RECEIVED/CONFIRMED/OVERDUE/REFUNDED.",
+        "Check the status of an Asaas payment. Omit both ids to recover the latest payment created by this Asaas integration in this conversation. Otherwise pass paymentId (pay_..., returned by asaas_create_pix_charge) OR paymentLinkId (returned by asaas_payment_link_create); never the invoice URL or its slug. Payment status is PENDING/RECEIVED/CONFIRMED/OVERDUE/REFUNDED.",
       schema: PAYMENT_STATUS_SCHEMA,
     },
   );
