@@ -24,10 +24,12 @@ function includesPattern(text: string, patterns: readonly string[]): boolean {
 }
 
 export function decideObjectionGuard(
-  config: ObjectionGuardConfig,
+  config: ObjectionGuardConfig | undefined,
   customerText: string,
 ): ObjectionGuardDecision {
-  if (!config.enabled) return "allow";
+  // Older callers and narrow test fixtures can omit newly introduced settings. Missing config is
+  // the same as the feature's opt-in default: disabled.
+  if (!config?.enabled) return "allow";
   const text = normalize(customerText);
   if (!text) return "allow";
   if (includesPattern(text, config.definitiveRefusalPatterns)) return "allow";
@@ -41,7 +43,7 @@ const BLOCKED_MESSAGE =
 
 export function applyObjectionGuard(params: {
   tools: StructuredToolInterface[];
-  config: ObjectionGuardConfig;
+  config: ObjectionGuardConfig | undefined;
   customerText: string;
   onBlocked?: () => void;
 }): StructuredToolInterface[] {
