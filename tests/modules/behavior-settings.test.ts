@@ -50,6 +50,29 @@ describe("behavior-settings — the merge stores every block it owns", () => {
   });
 });
 
+describe("behavior-settings — firstTurnGuard", () => {
+  test("is opt-in and normalizes a configured literal prefix", () => {
+    expect(BEHAVIOR_SETTINGS_KEYS).toContain("firstTurnGuard");
+    expect(readBehaviorSettings({}).firstTurnGuard).toEqual({
+      enabled: false,
+      prefix: "",
+    });
+    const next = mergeBehaviorSettings(
+      {},
+      {
+        firstTurnGuard: {
+          enabled: true,
+          prefix: "  Apresentação oficial.  ",
+        },
+      },
+    );
+    expect(next.firstTurnGuard).toEqual({
+      enabled: true,
+      prefix: "Apresentação oficial.",
+    });
+  });
+});
+
 // vision is part of the shared behavior surface (so it is settable via the MCP agent_settings_set
 // partial-merge path, like stt/tts). These cover the wiring without a DB.
 describe("behavior-settings — vision", () => {
