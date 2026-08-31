@@ -8,7 +8,6 @@ import { readAttributeContextConfig } from "@/modules/chatwoot/attributes";
 import { readContactAuthConfig } from "@/modules/contact-auth/settings";
 import { readDebounceConfig } from "@/modules/debounce/settings";
 import { readFirstTurnGuardConfig } from "@/modules/first-turn/settings";
-import { readObjectionGuardConfig } from "@/modules/objection-guard/settings";
 import {
   readObservabilityConfig,
   storableObservability,
@@ -22,6 +21,7 @@ import {
 import { readSendImageConfig } from "@/modules/images/settings";
 import { readKanbanConfig } from "@/modules/kanban/settings";
 import { readMemoryConfig } from "@/modules/memory/settings";
+import { readObjectionGuardConfig } from "@/modules/objection-guard/settings";
 import { readServiceWindowConfig } from "@/modules/service-window/service";
 import { readSplitConfig } from "@/modules/split/service";
 import { readSttConfig } from "@/modules/stt/settings";

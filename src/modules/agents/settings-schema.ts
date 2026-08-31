@@ -15,16 +15,16 @@ import {
 import { REDIRECT_DELAY_UNITS } from "@/modules/channel-redirect/service";
 import { FIRST_TURN_PREFIX_MAX } from "@/modules/first-turn/settings";
 import {
-  OBJECTION_GUARD_PATTERN_MAX,
-  OBJECTION_GUARD_PATTERNS_MAX,
-} from "@/modules/objection-guard/settings";
-import {
   FULL_DETAIL_MAX_HOURS,
   parseIsoInstant,
 } from "@/modules/flowlog/settings";
 import { FOLLOW_UP_DELAY_UNITS } from "@/modules/followups/settings";
 import { GUARDRAIL_ACTIONS } from "@/modules/guardrails/settings";
 import { HANDOFF_MODES } from "@/modules/handoff/settings";
+import {
+  OBJECTION_GUARD_PATTERN_MAX,
+  OBJECTION_GUARD_PATTERNS_MAX,
+} from "@/modules/objection-guard/settings";
 import { STT_PROVIDER_NAMES } from "@/modules/stt/providers";
 import { LANG_RE } from "@/modules/stt/settings";
 import { TTS_PROVIDER_NAMES } from "@/modules/tts/providers";
