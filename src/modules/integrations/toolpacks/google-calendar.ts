@@ -587,6 +587,19 @@ function projectEvent(ev: Record<string, unknown>, timeZone: string) {
   };
 }
 
+function projectListedEvent(ev: Record<string, unknown>, timeZone: string) {
+  const projected = projectEvent(ev, timeZone);
+  const label = (value: string | null): string | null => {
+    if (!value || ALL_DAY_RE.test(value)) return value;
+    return `${value.replace("T", " ").replace(/[+-]\d{2}:\d{2}$/, "")} (${timeZone})`;
+  };
+  return {
+    ...projected,
+    start: label(projected.start),
+    end: label(projected.end),
+  };
+}
+
 // Tool input schemas (single source for both the runtime tool and the UI arg specs). Risk is
 // declared in GCAL_TOOL_SPECS: reads (list/freeBusy) are low, writing events is medium.
 const LIST_EVENTS_SCHEMA = z.object({
@@ -745,7 +758,7 @@ function buildListEventsTool(
         );
       }
       return JSON.stringify(
-        owned.map((event) => projectEvent(event, timeZone)),
+        owned.map((event) => projectListedEvent(event, timeZone)),
       );
     },
     {

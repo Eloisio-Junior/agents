@@ -950,8 +950,8 @@ describe("google calendar toolpack — list + availability", () => {
       {
         id: "a",
         summary: "One",
-        start: "2026-06-20T10:00:00-03:00",
-        end: "2026-06-20T11:00:00-03:00",
+        start: "2026-06-20 10:00:00 (America/Sao_Paulo)",
+        end: "2026-06-20 11:00:00 (America/Sao_Paulo)",
         htmlLink: undefined,
       },
       {
@@ -983,8 +983,8 @@ describe("google calendar toolpack — list + availability", () => {
     )?.invoke({})) as string;
     expect(JSON.parse(out)).toMatchObject([
       {
-        start: "2026-09-03T14:00:00-03:00",
-        end: "2026-09-03T15:00:00-03:00",
+        start: "2026-09-03 14:00:00 (America/Sao_Paulo)",
+        end: "2026-09-03 15:00:00 (America/Sao_Paulo)",
       },
     ]);
   });
