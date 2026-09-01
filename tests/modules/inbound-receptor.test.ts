@@ -547,6 +547,9 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
     expect(paymentNudge?.instructions).toContain(
       "payment was already received/confirmed",
     );
+    expect(
+      (nudges[0]?.nudge as { literalReply?: string } | undefined)?.literalReply,
+    ).toBe("Recebemos a confirmação do pagamento de R$ 100,00.");
 
     // The conversion is still recorded (durable barrier) and the delivery ends PROCESSED.
     const conv = await suDb.conversionEvent.findFirst({

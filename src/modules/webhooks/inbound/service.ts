@@ -399,6 +399,19 @@ function buildNudge(
   const currency = asString(payload.currency) ?? null;
   const confirmedPayment =
     source === "ASAAS" && (status === "RECEIVED" || status === "CONFIRMED");
+  const confirmedPaymentReply = (() => {
+    if (!confirmedPayment) return undefined;
+    if (value == null) return "Recebemos a confirmação do pagamento.";
+    try {
+      const amount = new Intl.NumberFormat("pt-BR", {
+        style: "currency",
+        currency: currency ?? "BRL",
+      }).format(value);
+      return `Recebemos a confirmação do pagamento de ${amount}.`;
+    } catch {
+      return "Recebemos a confirmação do pagamento.";
+    }
+  })();
   return {
     source,
     kind: "agent_nudge",
@@ -407,6 +420,7 @@ function buildNudge(
     value,
     currency,
     summary: asString(payload.summary) ?? null,
+    ...(confirmedPaymentReply ? { literalReply: confirmedPaymentReply } : {}),
     ...(confirmedPayment
       ? {
           instructions:

@@ -99,6 +99,10 @@ export interface AgentNudge {
   // never appended to the instructions lane (which is trusted operator/code text).
   refs?: Record<string, string | null | undefined>;
   instructions?: string;
+  // NOTE: Trusted code-owned customer text for events whose meaning must not be expanded by the
+  // model. The graph still runs for ownership, service-window and moderation gates, but this value
+  // replaces the generated prose at the delivery boundary. Never populate it from provider input.
+  literalReply?: string;
   // For a follow-up sequence: the 1-based step that fired. Surfaced on the conversation timeline
   // ("Follow-up N enviado") and in the flow log. Undefined for non-sequenced nudges (inbound events).
   step?: number;
@@ -322,6 +326,21 @@ export function renderNudge(
     parts.push("", "Operator guidance for this follow-up:", n.instructions);
   }
   return parts.join("\n");
+}
+
+export function resolveNudgeReply(
+  nudge: AgentNudge,
+  generatedReply: string,
+): { silent: boolean; reply: string } {
+  const literal = nudge.literalReply?.trim();
+  if (literal) return { silent: false, reply: literal };
+  const silent = isNudgeSilent(generatedReply);
+  return {
+    silent,
+    reply: silent
+      ? ""
+      : generatedReply.split(FOLLOWUP_SKIP_SENTINEL).join("").trim(),
+  };
 }
 
 export async function runAgentNudge(
@@ -1379,10 +1398,7 @@ export async function runAgentNudge(
   // Silence via the explicit sentinel / narrated-emptiness guard (never post that), else strip any
   // stray sentinel occurrence from a real reply so it can't leak into the customer message.
   const replyRaw = lastAssistantText(result.messages);
-  const silent = isNudgeSilent(replyRaw);
-  const reply = silent
-    ? ""
-    : replyRaw.split(FOLLOWUP_SKIP_SENTINEL).join("").trim();
+  const { silent, reply } = resolveNudgeReply(params.nudge, replyRaw);
 
   // 5. Re-check ownership at post time (a human may have taken over during model execution). Needed
   // for BOTH the customer message AND the deterministic post-actions. The live-gated path re-probes

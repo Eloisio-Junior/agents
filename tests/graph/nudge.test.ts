@@ -26,6 +26,7 @@ import {
   OUTSIDE_WINDOW_NOTE_PREFIX,
   parseThreadId,
   renderNudge,
+  resolveNudgeReply,
   runAgentNudge,
 } from "@/graph/nudge";
 import { claimIngestWrite, releaseIngestWrite } from "@/graph/thread-claim";
@@ -103,6 +104,23 @@ describe("isNudgeSilent", () => {
     expect(
       isNudgeSilent("Oi! Vi que seu pagamento venceu, posso ajudar?"),
     ).toBe(false);
+  });
+});
+
+describe("resolveNudgeReply", () => {
+  test("a trusted literal payment reply replaces model expansion", () => {
+    expect(
+      resolveNudgeReply(
+        {
+          source: "ASAAS",
+          literalReply: "Recebemos a confirmação do pagamento de R$ 300,00.",
+        },
+        "O pagamento foi recebido e sua consulta está confirmada.",
+      ),
+    ).toEqual({
+      silent: false,
+      reply: "Recebemos a confirmação do pagamento de R$ 300,00.",
+    });
   });
 });
 
