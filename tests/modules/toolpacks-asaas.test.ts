@@ -102,6 +102,31 @@ describe("asaas toolpack — allowlist (fail-closed)", () => {
   });
 });
 
+describe("asaas payment-link handoff wording", () => {
+  test("keeps payment separate from appointment confirmation", async () => {
+    const { impl } = stubFetch(200, {
+      id: "plink_wording",
+      url: "https://sandbox.asaas.com/i/wording",
+    });
+    const tool = asaasToolpack.build(
+      sel({
+        enabledTools: ["asaas_payment_link_create"],
+        config: { environment: "sandbox" },
+      }),
+      baseCtx({
+        fetchImpl: impl,
+        base: {
+          integrationExternalRef: { create: async () => ({}) },
+        } as unknown as PrismaClient,
+      }),
+    )[0];
+    const out = (await tool?.invoke({ value: 300 })) as string;
+    expect(out).toContain("https://sandbox.asaas.com/i/wording");
+    expect(out).toContain('Never say "para confirmar"');
+    expect(out).toContain("payment confirms the appointment");
+  });
+});
+
 describe("asaas toolpack — environment is bound to config, never an arg", () => {
   function statusTool(config: Record<string, unknown>, ctx: ToolpackCtx) {
     const tools = asaasToolpack.build(

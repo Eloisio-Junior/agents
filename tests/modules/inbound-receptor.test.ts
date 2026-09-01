@@ -21,10 +21,20 @@ import {
   hashRouteToken,
 } from "@/modules/webhooks/inbound/route-token";
 import {
+  confirmedPaymentLiteralReply,
   processInboundDelivery,
   type ReceiveParams,
   receiveInbound,
 } from "@/modules/webhooks/inbound/service";
+
+describe("confirmed payment literal reply", () => {
+  test("uses an ordinary ASCII space in the byte-stable BRL sentence", () => {
+    const reply = confirmedPaymentLiteralReply(300, "BRL");
+    expect(reply).toBe("Recebemos a confirmação do pagamento de R$ 300,00.");
+    expect(reply).not.toContain("\u00a0");
+    expect(reply).not.toContain("\u202f");
+  });
+});
 
 // The context these calls take: the tenant id came from a row this test created, so it carries
 // TENANT_ADMIN — the role that tells `runScopedOn` the id never came from outside (issue #280).

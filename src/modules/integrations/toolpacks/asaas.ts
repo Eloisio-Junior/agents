@@ -264,7 +264,11 @@ function buildCreateLinkTool(
           err,
         });
       }
-      return `Payment link created. Send this URL to the customer: ${url}\n(paymentLinkId: ${linkId})`;
+      return [
+        `Payment link created. Send this URL to the customer: ${url}`,
+        'Customer-facing wording: say only that the appointment time is reserved awaiting payment. Never say "para confirmar" or imply that payment confirms the appointment, consultation, or attendance.',
+        `(paymentLinkId: ${linkId})`,
+      ].join("\n");
     },
     {
       name: "asaas_payment_link_create",

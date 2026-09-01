@@ -384,6 +384,26 @@ export interface ProcessParams {
   deps?: ProcessDeps;
 }
 
+export function confirmedPaymentLiteralReply(
+  value: number | null,
+  currency: string | null,
+): string {
+  if (value == null) return "Recebemos a confirmação do pagamento.";
+  try {
+    const amount = new Intl.NumberFormat("pt-BR", {
+      style: "currency",
+      currency: currency ?? "BRL",
+    })
+      .format(value)
+      // NOTE: Intl legitimately emits NBSP/NNBSP between the symbol and amount. This reply is a
+      // byte-stable customer contract, so visually identical non-ASCII spaces are not equivalent.
+      .replace(/[\u00a0\u202f]/g, " ");
+    return `Recebemos a confirmação do pagamento de ${amount}.`;
+  } catch {
+    return "Recebemos a confirmação do pagamento.";
+  }
+}
+
 function buildNudge(
   payload: Record<string, unknown>,
   source: string,
@@ -402,19 +422,9 @@ function buildNudge(
   // provider's secondary `payment.status` may use another value for a manually received cash
   // payment, so it cannot downgrade that authoritative event back to model-written prose.
   const confirmedPayment = source === "ASAAS" && confirmedPaymentEvent;
-  const confirmedPaymentReply = (() => {
-    if (!confirmedPayment) return undefined;
-    if (value == null) return "Recebemos a confirmação do pagamento.";
-    try {
-      const amount = new Intl.NumberFormat("pt-BR", {
-        style: "currency",
-        currency: currency ?? "BRL",
-      }).format(value);
-      return `Recebemos a confirmação do pagamento de ${amount}.`;
-    } catch {
-      return "Recebemos a confirmação do pagamento.";
-    }
-  })();
+  const confirmedPaymentReply = confirmedPayment
+    ? confirmedPaymentLiteralReply(value, currency)
+    : undefined;
   return {
     source,
     kind: "agent_nudge",
