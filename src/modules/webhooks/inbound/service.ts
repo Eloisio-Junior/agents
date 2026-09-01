@@ -393,12 +393,15 @@ function buildNudge(
   // distinct deliveries would otherwise describe themselves identically and the second, refused by
   // the spend ceiling inside the first's window, would lose its flow line and its alert.
   deliveryId: bigint,
+  confirmedPaymentEvent = false,
 ): AgentNudge {
   const status = asString(payload.status) ?? null;
   const value = typeof payload.value === "number" ? payload.value : null;
   const currency = asString(payload.currency) ?? null;
-  const confirmedPayment =
-    source === "ASAAS" && (status === "RECEIVED" || status === "CONFIRMED");
+  // NOTE: The mapper already classified PAYMENT_RECEIVED/PAYMENT_CONFIRMED as a conversion. The
+  // provider's secondary `payment.status` may use another value for a manually received cash
+  // payment, so it cannot downgrade that authoritative event back to model-written prose.
+  const confirmedPayment = source === "ASAAS" && confirmedPaymentEvent;
   const confirmedPaymentReply = (() => {
     if (!confirmedPayment) return undefined;
     if (value == null) return "Recebemos a confirmação do pagamento.";
@@ -566,7 +569,7 @@ export async function processInboundDelivery(
           return {
             kind: "nudge",
             threadId: corr.threadId,
-            nudge: buildNudge(payload, source, params.deliveryId),
+            nudge: buildNudge(payload, source, params.deliveryId, true),
           };
         }
         await markProcessed();

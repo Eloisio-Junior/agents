@@ -502,7 +502,9 @@ describe.skipIf(!dbUp)("inbound receptor", () => {
       payment: {
         id: "pay_n1",
         value: 100,
-        status: "RECEIVED",
+        // The conversion event is authoritative even when a manual cash receipt uses a provider
+        // status outside the two ordinary card/PIX values.
+        status: "RECEIVED_IN_CASH",
         externalReference: "corr_notify",
       },
     });

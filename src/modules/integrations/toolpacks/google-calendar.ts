@@ -1096,10 +1096,25 @@ function buildCheckAvailabilityTool(
       // NOTE: A list of bookable start times (start/end ISO + a human label), each tagged with the calendar
       // that can take it. Empty ⇒ nothing free in range. `coveredUntil` appears only when the entry
       // ceiling stopped the search early, and is the timeMin to continue from.
+      const outputTimeZone = schedule?.timezone ?? timeZone;
       return JSON.stringify({
-        slots: slots.slots,
-        timeZone: schedule?.timezone ?? timeZone,
-        ...(slots.coveredUntil ? { coveredUntil: slots.coveredUntil } : {}),
+        // NOTE: Keep machine values as valid ISO instants, but render them with the business
+        // timezone's explicit offset. UTC values beside local labels led models to copy the UTC
+        // wall-clock digits and append -03:00, moving São Paulo bookings three hours ahead.
+        slots: slots.slots.map((slot) => ({
+          ...slot,
+          start: instantInTimeZone(slot.start, outputTimeZone),
+          end: instantInTimeZone(slot.end, outputTimeZone),
+        })),
+        timeZone: outputTimeZone,
+        ...(slots.coveredUntil
+          ? {
+              coveredUntil: instantInTimeZone(
+                slots.coveredUntil,
+                outputTimeZone,
+              ),
+            }
+          : {}),
         ...(unreadable.length > 0 ? { unavailableCalendars: unreadable } : {}),
       });
     },

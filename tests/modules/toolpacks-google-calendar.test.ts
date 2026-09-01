@@ -1047,6 +1047,8 @@ describe("google calendar toolpack — list + availability", () => {
     ]);
     expect(parsed.timeZone).toBe(TZ);
     expect(parsed.slots[0]?.label).toContain("09:00");
+    expect(parsed.slots[0]?.start).toBe("2099-06-22T09:00:00-03:00");
+    expect(parsed.slots[0]?.end).toBe("2099-06-22T10:00:00-03:00");
   });
 
   test("a date exception on the schedule removes that day's slots entirely (issue #129)", async () => {
